@@ -159,3 +159,98 @@ def test_resolver_handles_hyphenated_station_name():
     assert s.station is not None
     assert s.station.icao == "KHOU"
     assert s.provenance is SettlementProvenance.RESOLVER
+
+
+def _fixture_contract(city_slug: str, metric: Metric, bracket: Bracket) -> ParsedContract:
+    return ParsedContract(
+        market_ticker="X",
+        event_ticker="Y",
+        city_slug=city_slug,
+        metric=metric,
+        market_date=date(2026, 5, 27),
+        bracket=bracket,
+    )
+
+
+def test_fixture_lowhouston_lte68_resolves_via_cli_product():
+    """KXLOWHOUSTON LOW market: same CLIHOU mention as the HIGH market.
+    Validates that LOW/HIGH markets resolve identically — matchers are
+    metric-agnostic."""
+    rules = (FIXTURES / "rules_KXLOWHOUSTON_26MAY27_LTE68.txt").read_text()
+    contract = _fixture_contract("HOUSTON", Metric.LOW, Bracket(BracketKind.LTE, lo=None, hi=68.0))
+    s = resolve_settlement(_market(rules), contract)
+    assert s.station is not None and s.station.icao == "KHOU"
+    assert s.provenance is SettlementProvenance.RESOLVER
+    assert "CLIHOU" in s.notes[0]
+
+
+def test_fixture_austin_resolves_via_token_match():
+    """Registry: 'Austin-Bergstrom'. Rules text: 'Austin Bergstrom'.
+    Token matcher must treat the hyphen as a word separator."""
+    rules = (FIXTURES / "rules_KXHIGHAUSTIN_26MAY27_LTE80.txt").read_text()
+    contract = _fixture_contract("AUSTIN", Metric.HIGH, Bracket(BracketKind.LTE, lo=None, hi=80.0))
+    s = resolve_settlement(_market(rules), contract)
+    assert s.station is not None and s.station.icao == "KAUS"
+    assert s.provenance is SettlementProvenance.RESOLVER
+
+
+def test_fixture_miami_resolves_via_token_match():
+    """Registry: 'Miami International'. Rules text: 'Miami International Airport'.
+    Generic-suffix stripping makes the registry token set {'miami'}, which
+    sits inside the rules-text token set."""
+    rules = (FIXTURES / "rules_KXHIGHMIAMI_26MAY27_B89-90.txt").read_text()
+    contract = _fixture_contract("MIAMI", Metric.HIGH, Bracket(BracketKind.BETWEEN, lo=89.0, hi=90.0))
+    s = resolve_settlement(_market(rules), contract)
+    assert s.station is not None and s.station.icao == "KMIA"
+    assert s.provenance is SettlementProvenance.RESOLVER
+
+
+def test_fixture_chicago_resolves_to_midway_not_ohare():
+    """Kalshi's Chicago market settles at KMDW (Midway), not KORD (O'Hare).
+    Registry now reflects that and the token matcher picks KMDW.
+
+    Regression check: if someone reverts CHICAGO back to KORD, this fails
+    and the test message tells them exactly why."""
+    rules = (FIXTURES / "rules_KXHIGHCHICAGO_26MAY27_B81-82.txt").read_text()
+    contract = _fixture_contract("CHICAGO", Metric.HIGH, Bracket(BracketKind.BETWEEN, lo=81.0, hi=82.0))
+    s = resolve_settlement(_market(rules), contract)
+    assert s.station is not None
+    assert s.station.icao == "KMDW", (
+        f"Chicago market resolved to {s.station.icao}; Kalshi rules text says 'Chicago Midway'"
+    )
+    assert s.provenance is SettlementProvenance.RESOLVER
+
+
+def test_fixture_la_resolves_despite_airport_vs_international():
+    """Registry: 'Los Angeles International'. Rules text: 'Los Angeles Airport'.
+    Both contain 'los angeles' after suffix-stripping."""
+    rules = (FIXTURES / "rules_KXHIGHLA_26MAY27_B66-67.txt").read_text()
+    contract = _fixture_contract("LA", Metric.HIGH, Bracket(BracketKind.BETWEEN, lo=66.0, hi=67.0))
+    s = resolve_settlement(_market(rules), contract)
+    assert s.station is not None and s.station.icao == "KLAX"
+    assert s.provenance is SettlementProvenance.RESOLVER
+
+
+def test_fixture_nyc_resolves_despite_token_order_swap():
+    """Registry: 'New York Central Park'. Rules text: 'Central Park, New York'.
+    Substring matching would fail here — token-set matching is required."""
+    rules = (FIXTURES / "rules_KXHIGHNYC_26MAY27_B81-82.txt").read_text()
+    contract = _fixture_contract("NYC", Metric.HIGH, Bracket(BracketKind.BETWEEN, lo=81.0, hi=82.0))
+    s = resolve_settlement(_market(rules), contract)
+    assert s.station is not None and s.station.icao == "KNYC"
+    assert s.provenance is SettlementProvenance.RESOLVER
+
+
+def test_fixture_lasvegas_resolves_via_cli_product():
+    """Las Vegas LOW market. The rules text names CLILAS explicitly, the
+    same pattern as Houston's CLIHOU mention. Confirms the CLI-product
+    matcher is city-agnostic.
+
+    Also exercises a freshly-added registry entry (KLAS / CLILAS)."""
+    rules = (FIXTURES / "rules_KXLOWLASVEGAS_26MAY27_B59-60.txt").read_text()
+    contract = _fixture_contract("LASVEGAS", Metric.LOW, Bracket(BracketKind.BETWEEN, lo=59.0, hi=60.0))
+    s = resolve_settlement(_market(rules), contract)
+    assert s.station is not None and s.station.icao == "KLAS"
+    assert s.station.cli_product == "CLILAS"
+    assert s.provenance is SettlementProvenance.RESOLVER
+    assert "CLILAS" in s.notes[0]

@@ -105,47 +105,76 @@ def _find_station_by_icao(rules_text: str) -> Optional[Station]:
 
 
 def _normalize(text: str) -> str:
-    """Lowercase + collapse hyphens/underscores/slashes to single spaces.
+    """Lowercase + replace any non-alphanumeric character with a single space.
 
-    Real rules text writes "Houston-Hobby, TX" while our registry stores
-    "Houston Hobby Airport". Normalize both before substring matching.
+    This deliberately collapses ALL punctuation (commas, periods, apostrophes,
+    hyphens, parens) so that:
+      - "Houston-Hobby, TX"      -> "houston hobby tx"
+      - "Central Park, New York" -> "central park new york"
+      - "O'Hare"                 -> "o hare"
+
+    The token-set matcher above relies on the resulting whitespace-split
+    yielding clean word tokens.
     """
     text = text.lower()
-    text = re.sub(r"[\-_/]+", " ", text)
-    text = re.sub(r"\s+", " ", text)
-    return text
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return text.strip()
+
+
+_GENERIC_SUFFIXES = re.compile(
+    r"\b(airport|international|intercontinental|national|regional|municipal)\b",
+    re.IGNORECASE,
+)
+
+
+def _name_tokens(name: str) -> frozenset[str]:
+    """Split a station name into a token set, dropping generic suffixes.
+
+    Token-set matching beats substring matching for names that appear in any
+    word order across sources — e.g. registry "New York Central Park" vs
+    rules text "Central Park, New York" share all tokens but neither is a
+    substring of the other.
+    """
+    norm = _normalize(_GENERIC_SUFFIXES.sub(" ", name))
+    return frozenset(t for t in norm.split() if t)
 
 
 def _find_station_by_name(rules_text: str) -> Optional[Station]:
+    """Match a registered station against the rules text.
+
+    For each station, compute the *token set* of its name (with generic
+    suffixes like "Airport" / "International" stripped). The station matches
+    if every token appears in the rules text as a separated word. Among
+    matches, prefer the one with the most tokens (most specific).
+
+    City-slug fallback (city_slug as a whole-word) wins only when the token
+    matcher finds nothing — slugs alone are weaker evidence than a multi-
+    token station name.
+    """
     if not rules_text:
         return None
     norm_text = _normalize(rules_text)
-    # Prefer the longest match — "houston hobby airport" should beat
-    # "houston" when both exist in the text. Match against both the full
-    # registry name and just the city portion (registry name minus the
-    # trailing " Airport" / " International" / etc).
+    text_tokens = set(norm_text.split())
+
     best: Optional[tuple[int, Station]] = None
     for station in _all_stations():
-        norm_name = _normalize(station.name)
-        # Try full name and a "short" form (drop trailing generic suffixes).
-        short_name = re.sub(
-            r"\s+(airport|international|intercontinental|national|regional|municipal)$",
-            "",
-            norm_name,
-        )
-        candidates = {norm_name, short_name}
-        for cand in candidates:
-            if cand and cand in norm_text:
-                score = len(cand)
-                if best is None or score > best[0]:
-                    best = (score, station)
-        # Also match city slug as a separated word.
+        tokens = _name_tokens(station.name)
+        if not tokens:
+            continue
+        if not tokens.issubset(text_tokens):
+            continue
+        score = len(tokens)
+        if best is None or score > best[0]:
+            best = (score, station)
+    if best is not None:
+        return best[1]
+
+    # Weaker fallback: a city slug appearing as a separated word.
+    for station in _all_stations():
         slug_pattern = rf"\b{re.escape(_normalize(station.city_slug))}\b"
         if re.search(slug_pattern, norm_text):
-            score = len(station.city_slug)
-            if best is None or score > best[0]:
-                best = (score, station)
-    return best[1] if best else None
+            return station
+    return None
 
 
 def _extract_area(rules_text: str) -> str:

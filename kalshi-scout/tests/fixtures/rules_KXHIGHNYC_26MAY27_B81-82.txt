@@ -1,0 +1,5 @@
+If the highest temperature recorded in Central Park, New York for May 27, 2026 as reported by the National Weather Service's Climatological Report (Daily), is between 81-82°, then the market resolves to Yes. Outcome verified from NWS Climatological Report.
+
+Not all weather data is the same. While checking a source like AccuWeather or Google Weather may help guide your decision, the official and final value used to determine this market is the highest temperature as reported by the corresponding NWS Climatological Report (Daily) linked in the rules above. Preliminary NWS reporting and measurement methods may be subject to underlying rounding and conversion nuances. Traders should exercise caution when interpreting preliminary NWS data.
+
+Note: this event is mutually exclusive.

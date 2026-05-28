@@ -1,0 +1,7 @@
+If the minimum temperature recorded at Las Vegas for May 27, 2026, is between 59-60° fahrenheit according to the National Weather Service's Climatological Report (Daily), then the market resolves to Yes. Outcome verified from NWS Climatological Report Las Vegas.
+
+Data for CLILAS can be found by clicking the following URL: https://www.weather.gov/wrh/climate?wfo=vef, navigating to the "Observed Weather" tab, and choosing the location "Las Vegas, NV" with Daily Climate Report selected. Please use the latest version of the data for the desired date, keeping in mind that different cities update their reports at different frequencies.
+
+Not all weather data is the same. While checking a source like AccuWeather or Google Weather may help guide your decision, the official and final value used to determine this market is the maximum/minimum temperature as reported by the corresponding NWS Climatological Report (Daily) linked in the rules above. Preliminary NWS reporting and measurement methods may be subject to underlying rounding and conversion nuances. Traders should exercise caution when interpreting preliminary NWS data.
+
+Note: this event is mutually exclusive.

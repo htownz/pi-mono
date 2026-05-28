@@ -64,9 +64,18 @@ _STATIONS: dict[str, Station] = {
             longitude=-73.7789,
         ),
         Station(
+            icao="KMDW",
+            name="Chicago Midway",
+            city_slug="CHICAGO",
+            tz="America/Chicago",
+            cli_product="CLIMDW",
+            latitude=41.7868,
+            longitude=-87.7522,
+        ),
+        Station(
             icao="KORD",
             name="Chicago O'Hare",
-            city_slug="CHICAGO",
+            city_slug="CHICAGOORD",
             tz="America/Chicago",
             cli_product="CLIORD",
             latitude=41.9786,
@@ -152,6 +161,15 @@ _STATIONS: dict[str, Station] = {
             cli_product="CLIBOS",
             latitude=42.3656,
             longitude=-71.0096,
+        ),
+        Station(
+            icao="KLAS",
+            name="Las Vegas Harry Reid",
+            city_slug="LASVEGAS",
+            tz="America/Los_Angeles",
+            cli_product="CLILAS",
+            latitude=36.0840,
+            longitude=-115.1537,
         ),
     ]
 }
