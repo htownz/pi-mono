@@ -9,7 +9,7 @@ better than the NWS. It looks for markets where the **settlement question has
 already been answered** by the official station and the orderbook hasn't
 caught up.
 
-## What this version (V0.7) does
+## What this version (V0.5 + V0.6 + V0.7) does
 
 - **Crawls** every open Kalshi temperature event under known series prefixes
   (`KXHIGH*`, `KXLOW*`, `KXTEMP*`) without authentication.
@@ -48,9 +48,18 @@ caught up.
 - **Replay verifier** (V0.7): `replay <snapshot_id>` re-runs the engine
   against a snapshot's stored inputs and asserts state + grade match. CI-
   friendly (non-zero exit on drift).
+- **Regime classifier** (V0.5): one of `CLEAR_AND_DRY`, `RAIN_COOLED`,
+  `MARINE_LAYER`, `COLD_FRONT_NEAR`, `CALM_HUMID_RADIATIONAL`, `UNKNOWN`
+  per station per evaluation. Notes-only — does not auto-shift fair_prob
+  or grade until backtest evidence supports calibrated weights (invariant
+  I9). The reasoning string is appended to every evaluation in the event.
+- **Orderbook depth** (V0.6): `evaluate --depth N` fetches each contract's
+  orderbook and computes the average fill price for N contracts on the
+  natural trade side, with a partial-fill flag. Confirms that A+/A edges
+  are actually fillable before you act on them.
 
 What it deliberately does *not* do yet: trade execution, alert delivery,
-orderbook depth modeling.
+regime-shifted grade ladder (V0.8).
 
 See `AGENTS.md` for the engineering invariants every change must respect.
 
@@ -204,22 +213,20 @@ trade.
 
 ## Roadmap
 
-Current: **V0.7** (universe scanner + settlement-source resolver +
-cross-bracket coherence + snapshot store + backtester + replay verifier).
-Next slices, in order:
+Current: **V0.7 + V0.5 + V0.6** — universe scanner, settlement-source
+resolver, cross-bracket coherence, snapshot store, backtester, replay
+verifier, regime classifier, orderbook depth. Next:
 
-- **V0.5** forecast engine: cloud/precip/front regime detection, better
-  remaining-extreme bounds.
-- **V0.6** orderbook depth: use full `/orderbook` to estimate fill quality,
-  not just top-of-book ask.
-- **V0.8** alert delivery: webhook / push when a contract transitions into
-  A+/A or a high-grade B+. Activates deferred invariant D3 (backtest-tuned
-  grade thresholds).
+- **V0.8** alert delivery + backtest-tuned grade thresholds: webhook / push
+  when a contract transitions into A+/A; replace the magic-number grade
+  cutoffs in `ranker.py` with values calibrated against stored history.
+  Activates deferred invariant D3. Also threads `regime` into a calibrated
+  fair-probability adjustment.
 
 ## Testing
 
 ```bash
-pytest                              # 68 tests, all offline
+pytest                              # 93 tests, all offline
 ```
 
 The state machine, ranker, parser, resolver, coherence pass, snapshot

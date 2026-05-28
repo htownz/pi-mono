@@ -32,8 +32,10 @@ from kalshi_scout.models import (
     StationState,
 )
 from kalshi_scout.nws import NwsClient
+from kalshi_scout.orderbook import parse_orderbook
 from kalshi_scout.parser import parse_market
 from kalshi_scout.ranker import grade, sort_key
+from kalshi_scout.regime import classify_regime
 from kalshi_scout.resolver import resolve_settlement
 from kalshi_scout.state import build_station_state, classify, fair_probability
 from kalshi_scout.stations import all_cities, get_station
@@ -93,6 +95,17 @@ def _evaluate_event(
     except Exception:
         forecast = []
 
+    # V0.5: classify the regime once per station. Notes-only signal — does
+    # not modify fair_prob or grade per invariant I9 (no signal moves the
+    # ladder without backtest evidence). Future slice can multiply the
+    # forecast residual buffer by a regime-specific factor.
+    regime_reading = classify_regime(
+        station=station,
+        forecast=forecast or None,
+        recent_obs=station_state.observations,
+        now_utc=now_utc,
+    )
+
     evals: list[ContractEvaluation] = []
     for contract, market in parsed:
         settlement = resolve_settlement(market, contract)
@@ -126,6 +139,11 @@ def _evaluate_event(
             eval_.notes.append("settlement: registry fallback (not pinned in rules text)")
         else:
             eval_.notes.append(f"settlement: {settlement.station.icao} via resolver")
+        # Regime annotation — same string for every contract in this event.
+        eval_.notes.append(
+            f"regime: {regime_reading.regime.value}"
+            + (f" ({regime_reading.reasoning[0]})" if regime_reading.reasoning else "")
+        )
         evals.append(eval_)
 
         if station_state_sink is not None:
@@ -328,11 +346,20 @@ def scan(city: Optional[str], limit: Optional[int], min_grade: str,
 @click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of tables.")
 @click.option("--store", "store_path", type=click.Path(), default=None,
               help="Persist this evaluation to a SQLite snapshot store.")
-def evaluate(event_or_market: str, as_json: bool, store_path: Optional[str]) -> None:
+@click.option("--depth", type=int, default=0,
+              help="Fetch orderbook per contract and show fillable price at "
+                   "this contract size (e.g. --depth 100). 0 disables.")
+def evaluate(event_or_market: str, as_json: bool,
+             store_path: Optional[str], depth: int) -> None:
     """Evaluate a single Kalshi event or market ticker.
 
     Accepts either an event ticker (e.g. KXLOWHOUSTON-26MAY28) which evaluates
     all contracts in the event, or a single market ticker.
+
+    With --depth N, fetches each contract's orderbook and computes the average
+    fill price for N contracts on the natural trade side (Yes if state is
+    LOCKED_YES or fair>=0.5, else No). Useful for confirming a stale-price
+    A+/A edge is actually fillable.
     """
     sink: dict[str, dict] = {}
     scanned_at = datetime.now(timezone.utc)
@@ -355,6 +382,31 @@ def evaluate(event_or_market: str, as_json: bool, store_path: Optional[str]) -> 
                 markets=list(kclient.iter_markets(event_ticker=event_or_market)),
             )
         evals = _evaluate_event(nclient, event, station_state_sink=sink)
+
+        # V0.6: optional orderbook depth fetch. We do this per-contract here
+        # rather than inside _evaluate_event because depth requires an extra
+        # API call per market — opt-in only.
+        if depth > 0:
+            for e in evals:
+                try:
+                    raw_book = kclient.get_orderbook(e.market.ticker)
+                except Exception as exc:
+                    e.notes.append(f"depth: fetch failed ({exc})")
+                    continue
+                book = parse_orderbook(raw_book, market_ticker=e.market.ticker)
+                fair_mid = (e.fair_prob_low + e.fair_prob_high) / 2.0
+                side = "yes" if (e.state == ContractState.LOCKED_YES or fair_mid >= 0.5) else "no"
+                quote = book.fillable_at_size(side, depth)
+                if quote is None:
+                    e.notes.append(f"depth: no {side} liquidity")
+                    continue
+                edge = quote.edge_against(fair_mid)
+                partial = " (partial)" if quote.partial else ""
+                e.notes.append(
+                    f"depth: {quote.filled_size}/{depth} {side} @ avg "
+                    f"{quote.avg_price_cents:.1f}c (worst {quote.worst_price_cents}c){partial}; "
+                    f"edge {edge * 100:+.1f}c"
+                )
 
     if store_path and evals:
         with SnapshotStore(store_path) as store:
