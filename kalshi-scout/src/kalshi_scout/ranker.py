@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+from kalshi_scout.config import RankerConfig
 from kalshi_scout.models import (
     ContractEvaluation,
     ContractState,
@@ -57,6 +58,7 @@ def grade(
     reason: str,
     fair_lo: float,
     fair_hi: float,
+    config: Optional[RankerConfig] = None,
 ) -> ContractEvaluation:
     yes_ask = _yes_ask_cents(market)
     no_ask = _no_ask_cents(market)
@@ -77,7 +79,7 @@ def grade(
     if market.open_interest < 50:
         notes.append(f"low open interest ({market.open_interest})")
 
-    g = _grade_value(state, edge_yes, edge_no, spread, notes)
+    g = _grade_value(state, edge_yes, edge_no, spread, notes, config)
 
     return ContractEvaluation(
         contract=contract,
@@ -101,45 +103,51 @@ def _grade_value(
     edge_no: Optional[float],
     spread: Optional[int],
     notes: list[str],
+    config: Optional[RankerConfig] = None,
 ) -> str:
-    """Apply the ladder. Best edge across Yes/No sides is what matters."""
+    """Apply the grade ladder. Cutoffs come from `config` when supplied;
+    otherwise the V0.8 defaults in `config.DEFAULT_*` are used."""
+    cfg = config or RankerConfig.default()
     best_edge = max(filter(lambda x: x is not None, [edge_yes, edge_no]), default=None)
     wide_spread = spread is not None and spread >= 10
 
     if state is ContractState.LOCKED_YES:
-        # Yes is the right side. Larger edge means more stale.
+        t = cfg.locked_yes
         if edge_yes is None:
             return "F"
-        if edge_yes >= 0.08:
+        if edge_yes >= t.high_cutoff:
             return "A+" if not wide_spread else "A"
-        if edge_yes >= 0.03:
+        if edge_yes >= t.low_cutoff:
             return "A" if not wide_spread else "B+"
         return "B"
 
     if state is ContractState.DEAD_NO:
+        t = cfg.dead_no
         if edge_no is None:
             return "F"
-        if edge_no >= 0.08:
+        if edge_no >= t.high_cutoff:
             return "A+" if not wide_spread else "A"
-        if edge_no >= 0.03:
+        if edge_no >= t.low_cutoff:
             return "A" if not wide_spread else "B+"
         return "B"
 
     if state is ContractState.BRACKET_HIT_VULNERABLE:
+        t = cfg.bracket_hit
         if best_edge is None:
             return "D"
-        if best_edge >= 0.12:
+        if best_edge >= t.high_cutoff:
             return "B+" if not wide_spread else "B"
-        if best_edge >= 0.05:
+        if best_edge >= t.low_cutoff:
             return "B"
         return "C"
 
     # NOT_REACHED / FORECAST_DEPENDENT
+    t = cfg.forecast_dependent
     if best_edge is None:
         return "D"
-    if best_edge >= 0.12:
+    if best_edge >= t.high_cutoff:
         return "B"
-    if best_edge >= 0.05:
+    if best_edge >= t.low_cutoff:
         return "C"
     return "D"
 

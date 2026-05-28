@@ -69,6 +69,8 @@ CREATE TABLE IF NOT EXISTS snapshots (
     cli_product TEXT,
     source_provenance TEXT NOT NULL,
 
+    regime TEXT,
+
     running_max_f REAL,
     running_min_f REAL,
     cli_report_date TEXT,
@@ -140,6 +142,7 @@ class SnapshotRow:
     station_icao: Optional[str]
     cli_product: Optional[str]
     source_provenance: str
+    regime: Optional[str]
     running_max_f: Optional[float]
     running_min_f: Optional[float]
     cli_report_date: Optional[date]
@@ -253,6 +256,13 @@ class SnapshotStore:
 
     def _init_schema(self) -> None:
         self._conn.executescript(_SCHEMA)
+        # V0.9 migration: add `regime` column to pre-existing snapshots table
+        # if it isn't there yet. SQLite's CREATE TABLE IF NOT EXISTS only
+        # creates fresh tables; it does not add columns to existing ones.
+        cur = self._conn.execute("PRAGMA table_info(snapshots)")
+        cols = {row["name"] for row in cur.fetchall()}
+        if "regime" not in cols:
+            self._conn.execute("ALTER TABLE snapshots ADD COLUMN regime TEXT")
         cur = self._conn.execute(
             "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('version', ?)",
             (str(SCHEMA_VERSION),),
@@ -299,6 +309,7 @@ class SnapshotStore:
                 e.contract.bracket.kind.value, e.contract.bracket.lo, e.contract.bracket.hi,
                 ss.get("station_icao"), ss.get("cli_product"),
                 ss.get("source_provenance", "registry"),
+                ss.get("regime"),
                 ss.get("running_max_f"), ss.get("running_min_f"),
                 _iso_date(ss["cli_report_date"]) if ss.get("cli_report_date") else None,
                 ss.get("cli_max_f"), ss.get("cli_min_f"),
@@ -315,13 +326,14 @@ class SnapshotStore:
                     market_ticker, event_ticker, city_slug, metric, market_date,
                     bracket_kind, bracket_lo, bracket_hi,
                     station_icao, cli_product, source_provenance,
+                    regime,
                     running_max_f, running_min_f,
                     cli_report_date, cli_max_f, cli_min_f,
                     state, reason, fair_prob_low, fair_prob_high,
                     yes_bid, yes_ask, no_bid, no_ask, last_price,
                     volume, open_interest,
                     edge_yes, edge_no, grade, notes_json
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 rows,
             )
@@ -641,6 +653,7 @@ def _row_to_snapshot(row: sqlite3.Row) -> SnapshotRow:
         station_icao=row["station_icao"],
         cli_product=row["cli_product"],
         source_provenance=row["source_provenance"],
+        regime=row["regime"] if "regime" in row.keys() else None,
         running_max_f=row["running_max_f"],
         running_min_f=row["running_min_f"],
         cli_report_date=_parse_date(row["cli_report_date"]),

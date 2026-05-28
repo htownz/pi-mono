@@ -17,6 +17,7 @@ from rich.table import Table
 
 from kalshi_scout.coherence import enforce_coherence
 from kalshi_scout.calibrate import calibrate as run_calibrate, report_to_dict
+from kalshi_scout.config import RankerConfig
 from kalshi_scout.kalshi import KalshiClient, iter_temperature_events
 from kalshi_scout.models import (
     Bracket,
@@ -45,6 +46,7 @@ from kalshi_scout.parser import parse_market
 from kalshi_scout.ranker import grade, sort_key
 from kalshi_scout.regime import classify_regime
 from kalshi_scout.resolver import resolve_settlement
+from kalshi_scout.tuning import derive_config
 from kalshi_scout.state import build_station_state, classify, fair_probability
 from kalshi_scout.stations import all_cities, get_station
 from kalshi_scout.store import (
@@ -55,6 +57,46 @@ from kalshi_scout.store import (
 )
 
 console = Console()
+
+
+def _print_tuning_report(report, written_to: str) -> None:
+    """Render a TuningReport (from tuning.derive_config) for the operator."""
+    console.print(f"[bold]Tuned RankerConfig written to {written_to}[/bold]")
+    tier_table = Table(title="Tier thresholds", header_style="bold cyan")
+    tier_table.add_column("State")
+    tier_table.add_column("Grade", justify="center")
+    tier_table.add_column("N settled", justify="right")
+    tier_table.add_column("Default", justify="right")
+    tier_table.add_column("Suggested", justify="right")
+    tier_table.add_column("Applied", justify="center")
+    tier_table.add_column("Note")
+    for t in report.tiers:
+        applied_str = "[green]yes[/green]" if t.applied else "[dim]no[/dim]"
+        tier_table.add_row(
+            t.state, t.grade, str(t.n_settled),
+            f"{t.default_cutoff:.3f}", f"{t.suggested_cutoff:.3f}",
+            applied_str, t.note,
+        )
+    console.print(tier_table)
+
+    if not report.regimes:
+        console.print("[dim]no regime-shift candidates in history[/dim]")
+        return
+    reg_table = Table(title="Regime shifts", header_style="bold cyan")
+    reg_table.add_column("Regime")
+    reg_table.add_column("Metric")
+    reg_table.add_column("Bracket")
+    reg_table.add_column("N", justify="right")
+    reg_table.add_column("Avg bias", justify="right")
+    reg_table.add_column("Applied", justify="center")
+    reg_table.add_column("Note")
+    for r in report.regimes:
+        applied_str = "[green]yes[/green]" if r.applied else "[dim]no[/dim]"
+        reg_table.add_row(
+            r.regime, r.metric, r.bracket_kind, str(r.n_settled),
+            f"{r.avg_bias:+.3f}", applied_str, r.note,
+        )
+    console.print(reg_table)
 
 
 def _build_sinks(specs: tuple[str, ...]) -> list[AlertSink]:
@@ -85,6 +127,7 @@ def _evaluate_event(
     event: KalshiEvent,
     now_utc: Optional[datetime] = None,
     station_state_sink: Optional[dict[str, dict]] = None,
+    config: Optional[RankerConfig] = None,
 ) -> list[ContractEvaluation]:
     """Evaluate every market in a single event. Returns evaluations sorted by grade.
 
@@ -162,8 +205,10 @@ def _evaluate_event(
             state,
             local_forecast or None,
             now_utc=now_utc,
+            regime=regime_reading.regime.value,
+            config=config,
         )
-        eval_ = grade(contract, market, state, reason, fair_lo, fair_hi)
+        eval_ = grade(contract, market, state, reason, fair_lo, fair_hi, config=config)
         if not local_state.cli_matches_market_date:
             eval_.notes.append("no matching CLI yet (preliminary obs only)")
         if settlement.provenance is SettlementProvenance.REGISTRY:
@@ -182,6 +227,7 @@ def _evaluate_event(
                 "station_icao": settlement.station.icao if settlement.station else None,
                 "cli_product": settlement.station.cli_product if settlement.station else None,
                 "source_provenance": settlement.provenance.value,
+                "regime": regime_reading.regime.value,
                 "running_max_f": local_state.running_max_f,
                 "running_min_f": local_state.running_min_f,
                 "cli_report_date": local_state.cli_report_date,
@@ -305,9 +351,12 @@ def main() -> None:
                    "May be passed multiple times. Requires --store.")
 @click.option("--notify-min-grade", default="A",
               help="Only fire alerts at this grade or better (default A).")
+@click.option("--config", "config_path", type=click.Path(exists=True), default=None,
+              help="Load a calibrated RankerConfig (from `calibrate --apply`).")
 def scan(city: Optional[str], limit: Optional[int], min_grade: str,
          as_json: bool, store_path: Optional[str],
-         notify_specs: tuple[str, ...], notify_min_grade: str) -> None:
+         notify_specs: tuple[str, ...], notify_min_grade: str,
+         config_path: Optional[str]) -> None:
     """Crawl all open Kalshi temperature events and rank every contract.
 
     This is the universe scanner. It pulls every open event under known
@@ -324,6 +373,14 @@ def scan(city: Optional[str], limit: Optional[int], min_grade: str,
 
     if notify_specs and not store_path:
         raise click.BadParameter("--notify requires --store (alerts read prior grades from snapshots)")
+
+    ranker_config = RankerConfig.load_json(config_path) if config_path else None
+    if ranker_config is not None:
+        console.print(
+            f"[dim]loaded ranker config from {config_path} "
+            f"(generated_at={ranker_config.generated_at.isoformat()}, "
+            f"based_on={ranker_config.based_on_snapshots} snapshots)[/dim]"
+        )
 
     store = SnapshotStore(store_path) if store_path else None
     dispatcher: Optional[AlertDispatcher] = None
@@ -342,7 +399,11 @@ def scan(city: Optional[str], limit: Optional[int], min_grade: str,
         for event in iter_temperature_events(kclient):
             if city and city.upper() not in event.event_ticker.upper():
                 continue
-            evals = _evaluate_event(nclient, event, station_state_sink=sink)
+            evals = _evaluate_event(
+                nclient, event,
+                station_state_sink=sink,
+                config=ranker_config,
+            )
             if not evals:
                 continue
             persistable.extend(evals)
@@ -402,8 +463,11 @@ def scan(city: Optional[str], limit: Optional[int], min_grade: str,
 @click.option("--depth", type=int, default=0,
               help="Fetch orderbook per contract and show fillable price at "
                    "this contract size (e.g. --depth 100). 0 disables.")
+@click.option("--config", "config_path", type=click.Path(exists=True), default=None,
+              help="Load a calibrated RankerConfig (from `calibrate --apply`).")
 def evaluate(event_or_market: str, as_json: bool,
-             store_path: Optional[str], depth: int) -> None:
+             store_path: Optional[str], depth: int,
+             config_path: Optional[str]) -> None:
     """Evaluate a single Kalshi event or market ticker.
 
     Accepts either an event ticker (e.g. KXLOWHOUSTON-26MAY28) which evaluates
@@ -416,6 +480,7 @@ def evaluate(event_or_market: str, as_json: bool,
     """
     sink: dict[str, dict] = {}
     scanned_at = datetime.now(timezone.utc)
+    ranker_config = RankerConfig.load_json(config_path) if config_path else None
     with KalshiClient() as kclient, NwsClient() as nclient:
         if "-T" in event_or_market or "-B" in event_or_market.split("-")[-1].upper():
             market = kclient.get_market(event_or_market)
@@ -434,7 +499,11 @@ def evaluate(event_or_market: str, as_json: bool,
                 sub_title="",
                 markets=list(kclient.iter_markets(event_ticker=event_or_market)),
             )
-        evals = _evaluate_event(nclient, event, station_state_sink=sink)
+        evals = _evaluate_event(
+            nclient, event,
+            station_state_sink=sink,
+            config=ranker_config,
+        )
 
         # V0.6: optional orderbook depth fetch. We do this per-contract here
         # rather than inside _evaluate_event because depth requires an extra
@@ -722,19 +791,30 @@ def backtest(store_path: str, min_grade: str, since: Optional[str]) -> None:
 @click.option("--since", default=None,
               help="Only include snapshots scanned after this date (YYYY-MM-DD).")
 @click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of a table.")
-def calibrate(store_path: str, since: Optional[str], as_json: bool) -> None:
+@click.option("--apply", "apply_path", type=click.Path(), default=None,
+              help="Derive a RankerConfig from history and write it to PATH. "
+                   "Tiers/regimes below the per-bucket sample-size threshold "
+                   "fall back to defaults (invariant I9). Without --apply this "
+                   "command is observability-only.")
+def calibrate(store_path: str, since: Optional[str], as_json: bool,
+              apply_path: Optional[str]) -> None:
     """Realized hit-rate / P&L per grade tier from stored history.
 
-    Reads snapshots + settlements, computes per-grade statistics. This is
-    the observability slice — it tells you whether the magic-number cutoffs
-    in ranker.py are calibrated to reality. It does NOT auto-shift those
-    cutoffs (invariant I9 — V0.9 closes that loop with stable history).
+    Without --apply: prints the observability report and exits.
+    With --apply PATH: also derives a RankerConfig from history and writes
+    it to PATH. The written config respects invariant I9 — any tier with
+    N < MIN_N_PER_TIER or regime with N < MIN_N_PER_REGIME keeps the
+    default value; only buckets with enough samples are tuned.
     """
     since_dt = (
         datetime.fromisoformat(since).replace(tzinfo=timezone.utc) if since else None
     )
     with SnapshotStore(store_path) as store:
         report = run_calibrate(store, since=since_dt)
+        if apply_path:
+            cfg, tuning_report = derive_config(store, since=since_dt)
+            cfg.save_json(apply_path)
+            _print_tuning_report(tuning_report, apply_path)
 
     if as_json:
         click.echo(json.dumps(report_to_dict(report), indent=2))

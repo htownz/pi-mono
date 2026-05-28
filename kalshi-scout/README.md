@@ -9,7 +9,7 @@ better than the NWS. It looks for markets where the **settlement question has
 already been answered** by the official station and the orderbook hasn't
 caught up.
 
-## What this version (V0.5 + V0.6 + V0.7 + V0.8) does
+## What this version (V0.5 → V0.9) does
 
 - **Crawls** every open Kalshi temperature event under known series prefixes
   (`KXHIGH*`, `KXLOW*`, `KXTEMP*`) without authentication.
@@ -64,12 +64,19 @@ caught up.
   invariant I8, alerts require `--store` so they're replayable.
 - **Calibration report** (V0.8): `kalshi-scout calibrate --store db.sqlite`
   prints realized hit rate, average / total P&L, sample N, and median
-  edge per grade tier from stored history. **Observability only** in this
-  slice — does not auto-shift `ranker.py` cutoffs (V0.9 closes that loop
-  with stable history per invariant I9).
+  edge per grade tier from stored history.
+- **Auto-tuned ranker config** (V0.9): `kalshi-scout calibrate --apply
+  config.json` derives per-(state, grade) edge cutoffs from stored history.
+  Tiers with N < MIN_N_PER_TIER fall back to defaults (invariant I10).
+  Pass `--config config.json` to `scan` / `evaluate` / `watch` to use it.
+- **Regime-shifted fair_probability** (V0.9): the same `--apply` step also
+  derives per-(regime, metric, bracket-kind) shift coefficients from
+  realized history. Applied only to non-deterministic states
+  (BRACKET_HIT_VULNERABLE / FORECAST_DEPENDENT / NOT_REACHED); LOCKED_YES
+  and DEAD_NO are settlement-conclusive and never shifted. Shifts are
+  clamped to ±20%.
 
-What it deliberately does *not* do yet: trade execution; auto-tuned
-ranker cutoffs (V0.9); regime-shifted fair_probability (V0.9).
+What it deliberately does *not* do yet: trade execution.
 
 See `AGENTS.md` for the engineering invariants every change must respect.
 
@@ -162,6 +169,19 @@ kalshi-scout calibrate --store scout.db
 kalshi-scout calibrate --store scout.db --since 2026-05-01 --json
 ```
 
+### Auto-tuned config — V0.9
+
+```bash
+# Derive a config from stored history (sample-size gated per invariant I10)
+kalshi-scout calibrate --store scout.db --apply config.json
+
+# Use it for future scans (custom cutoffs + regime shifts)
+kalshi-scout scan --store scout.db --config config.json --notify stdout
+
+# Verify the tuning was applied to a snapshot
+kalshi-scout snapshots --store scout.db --min-grade A
+```
+
 ### `cities` — what the scout settles against
 
 ```bash
@@ -246,20 +266,16 @@ trade.
 
 ## Roadmap
 
-Current: **V0.8 (+ V0.3 → V0.7)** — universe scanner, settlement-source
+Current: **V0.9 (+ V0.3 → V0.8)** — universe scanner, settlement-source
 resolver, cross-bracket coherence, snapshot store, backtester, replay
 verifier, regime classifier, orderbook depth, alert delivery, calibration
-report. Next:
-
-- **V0.9** auto-tuned ranker + regime-shifted fair_probability: once stored
-  history is statistically meaningful, replace the magic-number cutoffs in
-  `ranker.py` with calibration-derived values, and thread each regime's
-  observed bias into `fair_probability`. Activates deferred invariant D3.
+report, auto-tuned ranker + regime-shifted fair_probability. All ten hard
+invariants (I1-I10) active; no deferred invariants remaining.
 
 ## Testing
 
 ```bash
-pytest                              # 114 tests, all offline
+pytest                              # 140 tests, all offline
 ```
 
 The state machine, ranker, parser, resolver, coherence pass, snapshot

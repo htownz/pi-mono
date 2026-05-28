@@ -86,14 +86,26 @@ column showing it would have been profitable (or at least non-degrading) on
 historical settled markets. Author intuition is not evidence. Use
 `kalshi-scout backtest` against a stored history; add the result to the PR.
 
+### I10. Grade thresholds + regime shifts come from calibration (active since V0.9)
+
+The cutoffs in `ranker.py` are now parameterized via `RankerConfig` and
+derived from stored history by `tuning.derive_config()`. The defaults in
+`config.py` exactly preserve the V0.3-V0.8 magic numbers — runtime behavior
+without a config file is unchanged. When you have meaningful history, run
+`kalshi-scout calibrate --apply config.json` and pass `--config config.json`
+to `scan` / `evaluate` / `watch`.
+
+Sample-size gates (enforced in `tuning.py`):
+  - Tier threshold tuning requires N >= MIN_N_PER_TIER (30) settled snapshots
+  - Regime shift application requires N >= MIN_N_PER_REGIME (20)
+Below those thresholds the bucket falls back to defaults and the tuning
+report flags it `applied=False`. Never bypass the gate.
+
 ---
 
-## Deferred invariants (activate when the named milestone ships)
+## Deferred invariants
 
-These describe the long-term identity. They become enforced on the listed
-milestone.
-
-### D3. All grade thresholds derived from backtest (activates with V0.8)
+(None currently. All hard invariants I1-I10 are active.)
 
 The magic numbers in `ranker.py` (`>= 0.08` for A+, `>= 0.03` for A, etc.) get
 replaced with values tuned from realized outcomes. The current numbers are
