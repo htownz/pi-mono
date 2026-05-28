@@ -33,24 +33,36 @@ from kalshi_scout.stations import get_station
 
 # Station lookups by various signals -------------------------------------------
 
+# Kalshi's rules text often names the CLI product directly (e.g. "Data for
+# CLIHOU can be found by..."). This is the strongest signal — the CLI is
+# literally the settlement document. Look for the 6-character form CLI<XYZ>
+# anywhere in the text.
+_CLI_PRODUCT_RE = re.compile(r"\bCLI[A-Z]{3}\b")
+
 # ICAO codes are stable 4-letter US identifiers starting with K. Look for them
 # in the rules text directly — rules sometimes say "(KHOU)" parenthetically.
 _ICAO_RE = re.compile(r"\bK[A-Z]{3}\b")
 
-# Match an explicit station name reference. Each registry station can be
-# referenced by its `name` substring (e.g. "Houston Hobby Airport") or just
-# the city-specific portion ("Hobby Airport").
+# NWS Weather Forecast Office codes (e.g. "wfo=hgx" → Houston/Galveston).
+# Used as a weak auxiliary signal — narrows the region but doesn't pin a
+# specific station, since one WFO can serve multiple climate sites.
+_WFO_RE = re.compile(r"\bwfo[=\s:]+([a-z]{3})\b", re.IGNORECASE)
+
 _AGENCY_RE = re.compile(
     r"(National Weather Service|Met Office|Australian Bureau of Meteorology|Environment Canada)",
     re.IGNORECASE,
 )
 
-# Areas as they appear in templated rules. The rulebook template substitutes
-# `<area>` with a human description; we extract the chunk between "in" and
-# the next operator phrase.
-_AREA_RE = re.compile(
-    r"temperature\s+in\s+(?P<area>.+?)(?=\s+(?:be\s+|in\s+|on\s+|during\s+|between\s+|above\s+|below\s+|at\s+(?:least|most)\s+|exactly\s+))",
-    re.IGNORECASE | re.DOTALL,
+# Areas in real Kalshi rules text appear in several shapes:
+#   "temperature in <area> be ..."           (template form)
+#   "temperature recorded at <area> for ..." (live form, May 2026)
+#   "temperature at <area> on ..."           (variant)
+_AREA_PATTERNS = (
+    re.compile(
+        r"temperature\s+(?:recorded\s+(?:at|in)|measured\s+(?:at|in)|at|in)\s+"
+        r"(?P<area>[A-Z][A-Za-z .,'\-/]+?)\s+(?:for|on|during|between|be\b)",
+        re.IGNORECASE,
+    ),
 )
 
 
@@ -65,6 +77,22 @@ def _all_stations() -> list[Station]:
     return out
 
 
+def _find_station_by_cli_product(rules_text: str) -> Optional[Station]:
+    """Highest-trust match: the CLI product ID is the settlement document.
+
+    Real Kalshi rules text frequently contains a literal "Data for CLIHOU can
+    be found..." — when that's present, settlement is unambiguous.
+    """
+    candidates = _CLI_PRODUCT_RE.findall(rules_text or "")
+    if not candidates:
+        return None
+    cli_set = {c.upper() for c in candidates}
+    for station in _all_stations():
+        if station.cli_product.upper() in cli_set:
+            return station
+    return None
+
+
 def _find_station_by_icao(rules_text: str) -> Optional[Station]:
     candidates = _ICAO_RE.findall(rules_text or "")
     if not candidates:
@@ -76,22 +104,44 @@ def _find_station_by_icao(rules_text: str) -> Optional[Station]:
     return None
 
 
+def _normalize(text: str) -> str:
+    """Lowercase + collapse hyphens/underscores/slashes to single spaces.
+
+    Real rules text writes "Houston-Hobby, TX" while our registry stores
+    "Houston Hobby Airport". Normalize both before substring matching.
+    """
+    text = text.lower()
+    text = re.sub(r"[\-_/]+", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
 def _find_station_by_name(rules_text: str) -> Optional[Station]:
-    text = (rules_text or "").lower()
-    if not text:
+    if not rules_text:
         return None
-    # Prefer the longest match — "Houston Hobby Airport" should beat
-    # "Houston" when both exist in the text.
+    norm_text = _normalize(rules_text)
+    # Prefer the longest match — "houston hobby airport" should beat
+    # "houston" when both exist in the text. Match against both the full
+    # registry name and just the city portion (registry name minus the
+    # trailing " Airport" / " International" / etc).
     best: Optional[tuple[int, Station]] = None
     for station in _all_stations():
-        name = station.name.lower()
-        if name in text:
-            score = len(name)
-            if best is None or score > best[0]:
-                best = (score, station)
-        # Also try city slug — case-insensitive, separated word.
-        slug_pattern = rf"\b{re.escape(station.city_slug.lower())}\b"
-        if re.search(slug_pattern, text):
+        norm_name = _normalize(station.name)
+        # Try full name and a "short" form (drop trailing generic suffixes).
+        short_name = re.sub(
+            r"\s+(airport|international|intercontinental|national|regional|municipal)$",
+            "",
+            norm_name,
+        )
+        candidates = {norm_name, short_name}
+        for cand in candidates:
+            if cand and cand in norm_text:
+                score = len(cand)
+                if best is None or score > best[0]:
+                    best = (score, station)
+        # Also match city slug as a separated word.
+        slug_pattern = rf"\b{re.escape(_normalize(station.city_slug))}\b"
+        if re.search(slug_pattern, norm_text):
             score = len(station.city_slug)
             if best is None or score > best[0]:
                 best = (score, station)
@@ -101,10 +151,11 @@ def _find_station_by_name(rules_text: str) -> Optional[Station]:
 def _extract_area(rules_text: str) -> str:
     if not rules_text:
         return ""
-    m = _AREA_RE.search(rules_text)
-    if not m:
-        return ""
-    return m.group("area").strip().rstrip(".,;")
+    for pattern in _AREA_PATTERNS:
+        m = pattern.search(rules_text)
+        if m:
+            return m.group("area").strip().rstrip(".,;")
+    return ""
 
 
 def _extract_agency(rules_text: str) -> str:
@@ -123,10 +174,14 @@ def resolve_settlement(
     """Return a Settlement for the market.
 
     Resolution order (each fallback is tagged in the result):
-      1. Rules text mentions an ICAO we know about.
-      2. Rules text mentions a registered station name or city slug.
-      3. Contract's parsed city_slug maps to a registered station.
-      4. UNVERIFIED — engine must grade F per invariant I4.
+      1. Rules text names a CLI product (e.g. "CLIHOU"). Strongest signal:
+         the CLI is literally the settlement document.
+      2. Rules text mentions a known ICAO (e.g. "KHOU").
+      3. Rules text mentions a registered station name or city slug
+         (hyphen/whitespace-tolerant).
+      4. Contract's parsed city_slug maps to a registered station
+         (REGISTRY fallback, tagged as lower trust).
+      5. UNVERIFIED — engine must grade F per invariant I4.
     """
     rules_primary = market.raw.get("rules_primary", "") or ""
     rules_secondary = market.raw.get("rules_secondary", "") or ""
@@ -135,6 +190,16 @@ def resolve_settlement(
     area = _extract_area(rules_text) or (contract.city_slug if contract else "")
     agency = _extract_agency(rules_text)
     notes: list[str] = []
+
+    station = _find_station_by_cli_product(rules_text)
+    if station is not None:
+        return Settlement(
+            station=station,
+            source_agency=agency,
+            area_description=area or station.name,
+            provenance=SettlementProvenance.RESOLVER,
+            notes=(f"matched CLI product {station.cli_product} in rules text",),
+        )
 
     station = _find_station_by_icao(rules_text)
     if station is not None:

@@ -1,11 +1,12 @@
 """Unit tests for the V0.4 settlement-source resolver.
 
-Rules-text fixtures are synthesized from the GLOBALTEMPERATURE template; when
-real Kalshi `rules_primary` text becomes available, drop it in `fixtures/`
-and add a passthrough test that loads the real string.
+Rules-text fixtures live under `tests/fixtures/`. The May 27, 2026 Houston
+high-temp fixture is real Kalshi rules text (verified visually); tests that
+exercise it are the authoritative regression check.
 """
 
 from datetime import date
+from pathlib import Path
 
 from kalshi_scout.models import (
     Bracket,
@@ -16,6 +17,8 @@ from kalshi_scout.models import (
     SettlementProvenance,
 )
 from kalshi_scout.resolver import resolve_settlement
+
+FIXTURES = Path(__file__).parent / "fixtures"
 
 
 def _market(rules_primary: str = "", ticker: str = "KXLOWHOUSTON-26MAY28-LTE70") -> KalshiMarket:
@@ -113,3 +116,46 @@ def test_resolver_rejects_unknown_icao():
     # Falls through to registry; TIMBUKTU not registered, so UNVERIFIED.
     assert s.station is None
     assert s.provenance is SettlementProvenance.UNVERIFIED
+
+
+# -- Real Kalshi rules-text fixtures --------------------------------------------
+
+def test_resolver_houston_may27_fixture_cli_product_match():
+    """Verified against real Kalshi rules text for KXHIGHHOUSTON-26MAY27-B79-80.
+
+    The rules name CLIHOU directly: "Data for CLIHOU can be found by clicking
+    the following URL..." That's the highest-trust signal and should win
+    against any weaker matches (station name, WFO code, bare city).
+    """
+    rules = (FIXTURES / "rules_KXHIGHHOUSTON_26MAY27_B79-80.txt").read_text()
+    market = _market(rules, ticker="KXHIGHHOUSTON-26MAY27-B79-80")
+    contract = ParsedContract(
+        market_ticker=market.ticker,
+        event_ticker="KXHIGHHOUSTON-26MAY27",
+        city_slug="HOUSTON",
+        metric=Metric.HIGH,
+        market_date=date(2026, 5, 27),
+        bracket=Bracket(BracketKind.BETWEEN, lo=79.0, hi=80.0),
+    )
+    s = resolve_settlement(market, contract)
+    assert s.station is not None
+    assert s.station.icao == "KHOU"
+    assert s.station.cli_product == "CLIHOU"
+    assert s.provenance is SettlementProvenance.RESOLVER
+    assert "CLIHOU" in s.notes[0]
+    # Area extractor should pick up "Houston" from "recorded at Houston for ...".
+    assert "houston" in s.area_description.lower()
+
+
+def test_resolver_handles_hyphenated_station_name():
+    """The same fixture mentions 'Houston-Hobby' (hyphenated). The name
+    matcher must be hyphen-tolerant so it still resolves correctly even
+    without a CLI product in the text."""
+    rules = (
+        "Outcome verified from NWS Climatological Report Houston. "
+        "Location: Houston-Hobby, TX with Daily Climate Report selected."
+    )
+    s = resolve_settlement(_market(rules), _contract())
+    assert s.station is not None
+    assert s.station.icao == "KHOU"
+    assert s.provenance is SettlementProvenance.RESOLVER
