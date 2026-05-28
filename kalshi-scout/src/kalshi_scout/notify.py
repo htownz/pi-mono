@@ -94,12 +94,43 @@ class StdoutSink:
 
 
 class JsonlSink:
-    """Appends one JSON-encoded alert per line to a file. Append-only."""
-    def __init__(self, path: Path | str):
+    """Appends one JSON-encoded alert per line to a file.
+
+    Size-based rotation: when the current file exceeds `max_bytes`, it's
+    renamed to `<path>.1`, `<path>.1` shifts to `<path>.2`, etc., up to
+    `backup_count` historical files. The newest writes always land in the
+    base path so external tail-followers don't need to chase renames.
+    """
+    def __init__(
+        self,
+        path: Path | str,
+        max_bytes: int = 10 * 1024 * 1024,  # 10 MB
+        backup_count: int = 5,
+    ):
         self.path = Path(path)
+        self.max_bytes = max_bytes
+        self.backup_count = backup_count
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
+    def _maybe_rotate(self) -> None:
+        if self.max_bytes <= 0 or not self.path.exists():
+            return
+        if self.path.stat().st_size < self.max_bytes:
+            return
+        # Shift older backups up: .4 -> .5, .3 -> .4, ..., .1 -> .2
+        for i in range(self.backup_count, 0, -1):
+            src = self.path.with_suffix(self.path.suffix + f".{i}")
+            if i == self.backup_count and src.exists():
+                src.unlink()
+                continue
+            dst = self.path.with_suffix(self.path.suffix + f".{i + 1}")
+            if src.exists():
+                src.replace(dst)
+        # Current -> .1
+        self.path.replace(self.path.with_suffix(self.path.suffix + ".1"))
+
     def emit(self, alert: Alert) -> None:
+        self._maybe_rotate()
         with self.path.open("a") as f:
             f.write(json.dumps(alert.to_json_dict()) + "\n")
 

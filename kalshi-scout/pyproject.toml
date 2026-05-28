@@ -17,6 +17,8 @@ dependencies = [
     "python-dateutil>=2.9",
     "PyYAML>=6.0",
     "rich>=13.7",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
 ]
 
 [project.optional-dependencies]

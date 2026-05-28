@@ -116,6 +116,21 @@ CREATE TABLE IF NOT EXISTS settlements (
 
 CREATE INDEX IF NOT EXISTS idx_settlements_event ON settlements(event_ticker);
 CREATE INDEX IF NOT EXISTS idx_settlements_market_date ON settlements(market_date);
+
+CREATE TABLE IF NOT EXISTS positions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    market_ticker TEXT NOT NULL,
+    event_ticker TEXT NOT NULL,
+    side TEXT NOT NULL,                  -- 'yes' or 'no'
+    size_contracts INTEGER NOT NULL,
+    avg_price_cents INTEGER NOT NULL,
+    opened_at_utc TEXT NOT NULL,
+    closed_at_utc TEXT,                  -- NULL while open
+    notes TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_positions_open ON positions(closed_at_utc, market_ticker);
+CREATE INDEX IF NOT EXISTS idx_positions_event ON positions(event_ticker);
 """
 
 
@@ -179,6 +194,34 @@ class SettlementRow:
     cli_value_f: float
     resolved_yes: bool
     settled_at_utc: datetime
+
+
+@dataclass(frozen=True)
+class PositionRow:
+    """An open or closed position. Manually tracked — we don't (yet) read
+    trades from Kalshi's authenticated API."""
+    id: int
+    market_ticker: str
+    event_ticker: str
+    side: str                 # 'yes' or 'no'
+    size_contracts: int
+    avg_price_cents: int
+    opened_at_utc: datetime
+    closed_at_utc: Optional[datetime]
+    notes: str
+
+    @property
+    def is_open(self) -> bool:
+        return self.closed_at_utc is None
+
+    @property
+    def cost_basis_cents(self) -> int:
+        return self.size_contracts * self.avg_price_cents
+
+    @property
+    def max_loss_cents(self) -> int:
+        """If this side loses, we forfeit price_paid_cents per contract."""
+        return self.cost_basis_cents
 
 
 @dataclass(frozen=True)
@@ -417,6 +460,53 @@ class SnapshotStore:
         )
         row = cur.fetchone()
         return _row_to_settlement(row) if row else None
+
+    # -- Position writes/reads -----------------------------------------------
+
+    def add_position(
+        self,
+        market_ticker: str,
+        event_ticker: str,
+        side: str,
+        size_contracts: int,
+        avg_price_cents: int,
+        opened_at: Optional[datetime] = None,
+        notes: str = "",
+    ) -> int:
+        if side not in ("yes", "no"):
+            raise ValueError(f"side must be 'yes' or 'no', got {side!r}")
+        if size_contracts <= 0 or avg_price_cents <= 0 or avg_price_cents >= 100:
+            raise ValueError("size_contracts > 0 and 0 < avg_price_cents < 100 required")
+        opened_at = opened_at or datetime.now(timezone.utc)
+        with self._txn() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO positions (
+                    market_ticker, event_ticker, side, size_contracts,
+                    avg_price_cents, opened_at_utc, closed_at_utc, notes
+                ) VALUES (?,?,?,?,?,?,NULL,?)
+                """,
+                (market_ticker, event_ticker, side, size_contracts,
+                 avg_price_cents, _iso_utc(opened_at), notes),
+            )
+            return cur.lastrowid
+
+    def close_position(self, position_id: int, closed_at: Optional[datetime] = None) -> bool:
+        closed_at = closed_at or datetime.now(timezone.utc)
+        with self._txn() as conn:
+            cur = conn.execute(
+                "UPDATE positions SET closed_at_utc = ? WHERE id = ? AND closed_at_utc IS NULL",
+                (_iso_utc(closed_at), position_id),
+            )
+            return cur.rowcount > 0
+
+    def query_positions(self, open_only: bool = True) -> list[PositionRow]:
+        sql = "SELECT * FROM positions"
+        if open_only:
+            sql += " WHERE closed_at_utc IS NULL"
+        sql += " ORDER BY opened_at_utc DESC"
+        cur = self._conn.execute(sql)
+        return [_row_to_position(r) for r in cur.fetchall()]
 
     def query_settlements(
         self,
@@ -670,6 +760,20 @@ def _row_to_snapshot(row: sqlite3.Row) -> SnapshotRow:
         edge_yes=row["edge_yes"], edge_no=row["edge_no"],
         grade=row["grade"],
         notes=json.loads(row["notes_json"]),
+    )
+
+
+def _row_to_position(row: sqlite3.Row) -> PositionRow:
+    return PositionRow(
+        id=row["id"],
+        market_ticker=row["market_ticker"],
+        event_ticker=row["event_ticker"],
+        side=row["side"],
+        size_contracts=row["size_contracts"],
+        avg_price_cents=row["avg_price_cents"],
+        opened_at_utc=_parse_utc(row["opened_at_utc"]),
+        closed_at_utc=_parse_utc(row["closed_at_utc"]) if row["closed_at_utc"] else None,
+        notes=row["notes"] or "",
     )
 
 

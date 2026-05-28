@@ -42,6 +42,7 @@ from kalshi_scout.notify import (
 )
 from kalshi_scout.nws import NwsClient
 from kalshi_scout.orderbook import parse_orderbook
+from kalshi_scout.risk import aggregate_risk
 from kalshi_scout.parser import parse_market
 from kalshi_scout.ranker import grade, sort_key
 from kalshi_scout.regime import classify_regime
@@ -886,6 +887,268 @@ def replay(store_path: str, snapshot_id: int) -> None:
         console.print(f"  reason: {result.drift_reason}")
     if not result.matches:
         sys.exit(1)
+
+
+# -- V1.0 operational commands ----------------------------------------------
+
+@main.command()
+@click.option("--store", "store_path", required=True, type=click.Path())
+@click.option("--interval", type=int, default=300,
+              help="Seconds between scans.")
+@click.option("--min-grade", default="C",
+              help="Skip results worse than this grade.")
+@click.option("--notify", "notify_specs", multiple=True,
+              help="Alert sink spec: 'stdout', 'jsonl:/path.jsonl', or 'webhook:https://...'.")
+@click.option("--notify-min-grade", default="A",
+              help="Only fire alerts at this grade or better.")
+@click.option("--config", "config_path", type=click.Path(exists=True), default=None,
+              help="Load a calibrated RankerConfig.")
+@click.option("--once", is_flag=True,
+              help="Run a single scan and exit (useful for cron).")
+def serve(store_path: str, interval: int, min_grade: str,
+          notify_specs: tuple[str, ...], notify_min_grade: str,
+          config_path: Optional[str], once: bool) -> None:
+    """Run the universe scanner on a loop.
+
+    Equivalent to running `scan --store ... --notify ...` in a `while sleep`
+    loop, but with proper signal handling, structured logs to stderr, and
+    automatic config / sink wiring.
+
+    For cron: pass --once to run a single scan and exit.
+    """
+    import logging
+    import signal as _signal
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+    )
+    log = logging.getLogger("kalshi-scout")
+
+    grade_order = ["A+", "A", "B+", "B", "C", "D", "F"]
+    if min_grade not in grade_order:
+        raise click.BadParameter(f"min-grade must be one of {grade_order}")
+    cutoff = grade_order.index(min_grade)
+    ranker_config = RankerConfig.load_json(config_path) if config_path else None
+
+    stop = {"flag": False}
+    def _handle_signal(signum, _frame):
+        log.info(f"received signal {signum}; finishing current scan then exiting")
+        stop["flag"] = True
+    _signal.signal(_signal.SIGINT, _handle_signal)
+    _signal.signal(_signal.SIGTERM, _handle_signal)
+
+    sinks = _build_sinks(notify_specs) if notify_specs else []
+    iteration = 0
+    while not stop["flag"]:
+        iteration += 1
+        scan_started = datetime.now(timezone.utc)
+        log.info(f"scan iteration {iteration} starting")
+        try:
+            sink_map: dict[str, dict] = {}
+            persistable: list[ContractEvaluation] = []
+            with KalshiClient() as kclient, NwsClient() as nclient:
+                for event in iter_temperature_events(kclient):
+                    evals = _evaluate_event(
+                        nclient, event,
+                        station_state_sink=sink_map,
+                        config=ranker_config,
+                    )
+                    if not evals:
+                        continue
+                    persistable.extend(evals)
+
+            store = SnapshotStore(store_path)
+            try:
+                fired: list = []
+                if sinks:
+                    dispatcher = AlertDispatcher(
+                        sinks=sinks, store=store, min_grade=notify_min_grade
+                    )
+                    fired = dispatcher.dispatch(persistable, now_utc=scan_started)
+                if persistable:
+                    store.record_scan(
+                        evaluations=persistable,
+                        scanned_at=scan_started,
+                        station_state_map=sink_map,
+                    )
+                log.info(
+                    f"scan {iteration}: persisted {len(persistable)} snapshots, "
+                    f"fired {len(fired)} alerts"
+                )
+            finally:
+                store.close()
+        except Exception as exc:
+            log.exception(f"scan iteration {iteration} failed: {exc}")
+
+        if once or stop["flag"]:
+            break
+        log.info(f"sleeping {interval}s until next scan")
+        # Sleep in 1-second slices so SIGTERM is responsive.
+        for _ in range(interval):
+            if stop["flag"]:
+                break
+            time.sleep(1)
+
+
+@main.command()
+@click.option("--store", "store_path", required=True, type=click.Path())
+@click.option("--host", default="127.0.0.1")
+@click.option("--port", type=int, default=8080)
+def dashboard(store_path: str, host: str, port: int) -> None:
+    """Start the FastAPI dashboard reading scout.db.
+
+    Default binds to 127.0.0.1 so it isn't exposed without an explicit
+    --host 0.0.0.0. The dashboard is read-only; never writes to the store.
+    """
+    import uvicorn
+    from kalshi_scout.server import create_app
+    app = create_app(store_path)
+    console.print(
+        f"[bold green]kalshi-scout dashboard[/bold green] -> http://{host}:{port}"
+    )
+    uvicorn.run(app, host=host, port=port, log_level="info")
+
+
+@main.group()
+def positions() -> None:
+    """Manage manually-tracked open positions (for risk aggregation)."""
+
+
+@positions.command("add")
+@click.option("--store", "store_path", required=True, type=click.Path())
+@click.argument("market_ticker")
+@click.option("--side", required=True, type=click.Choice(["yes", "no"]))
+@click.option("--size", required=True, type=int, help="Number of contracts.")
+@click.option("--price", required=True, type=int, help="Average fill price in cents (1..99).")
+@click.option("--event", "event_ticker", default=None,
+              help="Event ticker (auto-derived from market_ticker if omitted).")
+@click.option("--note", default="", help="Free-text note.")
+def positions_add(store_path: str, market_ticker: str, side: str,
+                  size: int, price: int, event_ticker: Optional[str],
+                  note: str) -> None:
+    """Record a new open position."""
+    derived_event = event_ticker or market_ticker.rsplit("-", 1)[0]
+    with SnapshotStore(store_path) as store:
+        pid = store.add_position(
+            market_ticker=market_ticker,
+            event_ticker=derived_event,
+            side=side, size_contracts=size, avg_price_cents=price,
+            notes=note,
+        )
+    console.print(f"[green]added position id={pid}[/green]: {market_ticker} {side} {size}@{price}c")
+
+
+@positions.command("close")
+@click.option("--store", "store_path", required=True, type=click.Path())
+@click.argument("position_id", type=int)
+def positions_close(store_path: str, position_id: int) -> None:
+    """Mark a position closed (no longer in risk aggregation)."""
+    with SnapshotStore(store_path) as store:
+        ok = store.close_position(position_id)
+    if ok:
+        console.print(f"[green]closed position {position_id}[/green]")
+    else:
+        console.print(f"[yellow]position {position_id} not found or already closed[/yellow]")
+
+
+@positions.command("list")
+@click.option("--store", "store_path", required=True, type=click.Path())
+@click.option("--all", "show_all", is_flag=True, help="Include closed positions.")
+def positions_list(store_path: str, show_all: bool) -> None:
+    """List positions (default: open only)."""
+    with SnapshotStore(store_path) as store:
+        rows = store.query_positions(open_only=not show_all)
+    if not rows:
+        console.print("[dim]no positions[/dim]")
+        return
+    table = Table(header_style="bold cyan")
+    table.add_column("ID", justify="right")
+    table.add_column("Market")
+    table.add_column("Side")
+    table.add_column("Size", justify="right")
+    table.add_column("Price", justify="right")
+    table.add_column("Cost", justify="right")
+    table.add_column("Opened")
+    table.add_column("Closed")
+    for r in rows:
+        table.add_row(
+            str(r.id), r.market_ticker, r.side, str(r.size_contracts),
+            f"{r.avg_price_cents}c", f"${r.cost_basis_cents / 100:.2f}",
+            r.opened_at_utc.strftime("%m-%d %H:%M"),
+            r.closed_at_utc.strftime("%m-%d %H:%M") if r.closed_at_utc else "—",
+        )
+    console.print(table)
+
+
+@main.command()
+@click.option("--store", "store_path", required=True, type=click.Path())
+@click.option("--json", "as_json", is_flag=True)
+def risk(store_path: str, as_json: bool) -> None:
+    """Pre-flight risk aggregation across open positions.
+
+    Buckets exposure by city / market_date / regime / event, and flags
+    event collisions (Yes positions across multiple brackets of the same
+    event, which guarantee partial loss).
+    """
+    with SnapshotStore(store_path) as store:
+        report = aggregate_risk(store)
+
+    if as_json:
+        click.echo(json.dumps({
+            "total_open_positions": report.total_open_positions,
+            "total_open_contracts": report.total_open_contracts,
+            "total_max_loss_cents": report.total_max_loss_cents,
+            "collisions": [
+                {"event": c.event_ticker,
+                 "yes_positions": len(c.yes_positions),
+                 "guaranteed_loss_cents": c.guaranteed_loss_cents}
+                for c in report.event_collisions
+            ],
+        }, indent=2))
+        return
+
+    if report.total_open_positions == 0:
+        console.print("[dim]no open positions tracked[/dim]")
+        return
+
+    console.print(
+        f"[bold]{report.total_open_positions}[/bold] open positions / "
+        f"[bold]{report.total_open_contracts}[/bold] contracts / "
+        f"[bold]${report.total_max_loss_dollars:.2f}[/bold] max loss"
+    )
+
+    if report.event_collisions:
+        coll_table = Table(title="⚠ Event collisions", header_style="bold red")
+        coll_table.add_column("Event")
+        coll_table.add_column("Yes positions", justify="right")
+        coll_table.add_column("Cost basis", justify="right")
+        coll_table.add_column("Guaranteed loss", justify="right")
+        for c in report.event_collisions:
+            coll_table.add_row(
+                c.event_ticker, str(len(c.yes_positions)),
+                f"${c.total_max_loss_cents / 100:.2f}",
+                f"[red]${c.guaranteed_loss_cents / 100:.2f}[/red]",
+            )
+        console.print(coll_table)
+
+    for title, bucket in (
+        ("By city", report.by_city),
+        ("By market date", report.by_market_date),
+        ("By regime", report.by_regime),
+    ):
+        t = Table(title=title, header_style="bold cyan")
+        t.add_column("Key")
+        t.add_column("Positions", justify="right")
+        t.add_column("Contracts", justify="right")
+        t.add_column("Max loss", justify="right")
+        for k, b in sorted(bucket.items(), key=lambda kv: -kv[1].total_max_loss_cents):
+            t.add_row(
+                k, str(b.n_positions), str(b.total_contracts),
+                f"${b.total_max_loss_dollars:.2f}",
+            )
+        console.print(t)
 
 
 if __name__ == "__main__":

@@ -9,7 +9,7 @@ better than the NWS. It looks for markets where the **settlement question has
 already been answered** by the official station and the orderbook hasn't
 caught up.
 
-## What this version (V0.5 → V0.9) does
+## What this version (V0.5 → V1.0) does
 
 - **Crawls** every open Kalshi temperature event under known series prefixes
   (`KXHIGH*`, `KXLOW*`, `KXTEMP*`) without authentication.
@@ -75,8 +75,23 @@ caught up.
   (BRACKET_HIT_VULNERABLE / FORECAST_DEPENDENT / NOT_REACHED); LOCKED_YES
   and DEAD_NO are settlement-conclusive and never shifted. Shifts are
   clamped to ±20%.
+- **Daemon mode** (V1.0): `kalshi-scout serve` runs the scanner on a loop
+  with SIGTERM-safe shutdown, structured logs to stderr, and rotating
+  JSONL alerts. `--once` for cron.
+- **FastAPI dashboard** (V1.0): `kalshi-scout dashboard` serves a
+  read-only HTML view at :8080 — alerts feed, current state per market,
+  calibration table, full risk report. Auto-refreshes every 30s.
+- **Position tracking + pre-flight risk** (V1.0): `positions add/list/close`
+  records manually-tracked positions. `risk` aggregates open exposure by
+  city / market date / regime / event and explicitly flags **event
+  collisions** (holding Yes on multiple brackets of the same event
+  guarantees partial loss).
+- **Containerized deploy** (V1.0): `Dockerfile`, `docker-compose.yml` (scout
+  + dashboard sharing a volume), and `fly.toml` for one-command fly.io
+  deploys.
 
-What it deliberately does *not* do yet: trade execution.
+What it deliberately does *not* do yet: trade execution (Kalshi
+authenticated API); ML regime classifier.
 
 See `AGENTS.md` for the engineering invariants every change must respect.
 
@@ -182,6 +197,39 @@ kalshi-scout scan --store scout.db --config config.json --notify stdout
 kalshi-scout snapshots --store scout.db --min-grade A
 ```
 
+### Daemon + dashboard + risk — V1.0
+
+```bash
+# Run the scanner as a daemon (every 5 minutes, alerts to stdout + JSONL)
+kalshi-scout serve --store scout.db --interval 300 \
+    --notify stdout --notify jsonl:./alerts.jsonl --notify-min-grade A
+
+# Single scan via cron
+kalshi-scout serve --store scout.db --once --notify stdout
+
+# Read-only HTML dashboard at http://127.0.0.1:8080
+kalshi-scout dashboard --store scout.db
+
+# Manually track an open position
+kalshi-scout positions add --store scout.db --side yes \
+    --size 100 --price 71 KXHIGHHOUSTON-26MAY27-B79-80
+kalshi-scout positions list --store scout.db
+kalshi-scout positions close --store scout.db 1
+
+# Pre-flight risk: bucketed exposure + event-collision flags
+kalshi-scout risk --store scout.db
+```
+
+### Deploy
+
+```bash
+# Local: docker compose brings up scout daemon + dashboard sharing /data
+docker compose up -d
+
+# fly.io: one-command after `fly volumes create scout_data`
+fly deploy
+```
+
 ### `cities` — what the scout settles against
 
 ```bash
@@ -266,16 +314,17 @@ trade.
 
 ## Roadmap
 
-Current: **V0.9 (+ V0.3 → V0.8)** — universe scanner, settlement-source
+Current: **V1.0 (+ V0.3 → V0.9)** — universe scanner, settlement-source
 resolver, cross-bracket coherence, snapshot store, backtester, replay
 verifier, regime classifier, orderbook depth, alert delivery, calibration
-report, auto-tuned ranker + regime-shifted fair_probability. All ten hard
-invariants (I1-I10) active; no deferred invariants remaining.
+report, auto-tuned ranker + regime-shifted fair_probability, daemon mode,
+FastAPI dashboard, position tracking, pre-flight risk aggregation,
+containerized deploy. All ten hard invariants (I1-I10) active.
 
 ## Testing
 
 ```bash
-pytest                              # 140 tests, all offline
+pytest                              # 164 tests, all offline
 ```
 
 The state machine, ranker, parser, resolver, coherence pass, snapshot
