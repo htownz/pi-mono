@@ -71,25 +71,27 @@ same event are automatically demoted to `DEAD_NO` in the same evaluation pass.
 Contracts in one event are mutually exclusive by Kalshi's rules; the engine
 must reflect that without waiting for the orderbook to catch up.
 
+### I8. No alert the engine can't replay from stored state (active since V0.7)
+
+Every alert / grade decision must be a pure function of stored snapshots.
+Live-only logic (e.g. consulting an observation the snapshot store did not
+record) is a bug. The `replay` command + `tests/test_store.py` enforce this:
+a snapshot whose stored inputs would produce a different grade under the
+current engine fails the replay check. CI-wireable.
+
+### I9. Every signal must be backtestable (active since V0.7)
+
+A new edge category, state, or grade threshold must ship with a backtest
+column showing it would have been profitable (or at least non-degrading) on
+historical settled markets. Author intuition is not evidence. Use
+`kalshi-scout backtest` against a stored history; add the result to the PR.
+
 ---
 
 ## Deferred invariants (activate when the named milestone ships)
 
 These describe the long-term identity. They become enforced on the listed
 milestone.
-
-### D1. No alert the engine can't replay from stored state (activates with V0.7)
-
-Once persistence lands, every alert / grade decision must be a pure function
-of stored snapshots. Live-only logic (e.g. reading a non-persisted observation
-inside `_evaluate_event`) becomes a bug. This is what turns the scout from
-"vibes engine" into "research desk."
-
-### D2. Every signal must be backtestable (activates with V0.7)
-
-A new edge category, state, or grade threshold cannot ship without a backtest
-column showing it would have been profitable (or at least non-degrading) on
-historical settled markets. Author intuition is not evidence.
 
 ### D3. All grade thresholds derived from backtest (activates with V0.8)
 

@@ -9,7 +9,7 @@ better than the NWS. It looks for markets where the **settlement question has
 already been answered** by the official station and the orderbook hasn't
 caught up.
 
-## What this version (V0.4) does
+## What this version (V0.7) does
 
 - **Crawls** every open Kalshi temperature event under known series prefixes
   (`KXHIGH*`, `KXLOW*`, `KXTEMP*`) without authentication.
@@ -33,9 +33,24 @@ caught up.
 - **Grades** each contract A+ → F based on settlement-conclusiveness, edge
   vs. tradable price (Yes ask or derived No ask), and spread / liquidity.
 - **Outputs** a ranked opportunity board (rich table or JSON).
+- **Snapshot store** (V0.7): every scan/evaluate run can persist to a SQLite
+  database (`--store path.db`). Every contract evaluation becomes one row
+  capturing engine inputs (station identity, running max/min, CLI values,
+  market price) AND outputs (state, fair-prob, grade). The store is what
+  activates invariants D1 (replayability) and D2 (backtestability).
+- **Settlement backfill** (V0.7): `backfill-settlements --date YYYY-MM-DD`
+  pulls the day's CLI report per stored station and joins to snapshots,
+  writing one `SettlementRow` per market (resolved_yes computed from
+  `bracket.contains(cli_value)`).
+- **Backtester** (V0.7): `backtest --grade A --since YYYY-MM-DD` joins
+  snapshots ↔ settlements, computes side (Yes if LOCKED_YES or fair≥0.5,
+  else No), assumes fill at the recorded ask, reports hit rate + total P&L.
+- **Replay verifier** (V0.7): `replay <snapshot_id>` re-runs the engine
+  against a snapshot's stored inputs and asserts state + grade match. CI-
+  friendly (non-zero exit on drift).
 
-What it deliberately does *not* do yet: trade execution, persistence /
-backtesting, alert delivery, orderbook depth modeling. See "Roadmap" below.
+What it deliberately does *not* do yet: trade execution, alert delivery,
+orderbook depth modeling.
 
 See `AGENTS.md` for the engineering invariants every change must respect.
 
@@ -85,6 +100,25 @@ kalshi-scout watch KXLOWHOUSTON-26MAY28 --interval 300 --min-grade B
 
 `watch` only prints when a contract's state *changes* — so the table you see
 is the news, not the noise.
+
+### `snapshots` / `backfill-settlements` / `backtest` / `replay` — V0.7
+
+```bash
+# Persist every scan to ./scout.db
+kalshi-scout scan --store scout.db --min-grade C
+
+# Inspect what scan recorded
+kalshi-scout snapshots --store scout.db --market-date 2026-05-27 --min-grade A
+
+# After CLI is published for a settled day, derive realized outcomes
+kalshi-scout backfill-settlements --store scout.db --date 2026-05-27
+
+# Backtest every A+/A alert that has a known settlement
+kalshi-scout backtest --store scout.db --min-grade A --since 2026-05-01
+
+# Verify a single alert is replayable (CI-friendly: exits non-zero on drift)
+kalshi-scout replay --store scout.db 42
+```
 
 ### `cities` — what the scout settles against
 
@@ -170,16 +204,14 @@ trade.
 
 ## Roadmap
 
-Current: **V0.4** (universe scanner + settlement-source resolver +
-cross-bracket coherence). Next slices, in order:
+Current: **V0.7** (universe scanner + settlement-source resolver +
+cross-bracket coherence + snapshot store + backtester + replay verifier).
+Next slices, in order:
 
 - **V0.5** forecast engine: cloud/precip/front regime detection, better
   remaining-extreme bounds.
 - **V0.6** orderbook depth: use full `/orderbook` to estimate fill quality,
   not just top-of-book ask.
-- **V0.7** snapshot store + backtester: SQLite-backed observations of every
-  scan, settled outcomes joined from CLI, `kalshi-scout backtest` command.
-  Activates deferred invariants D1 and D2.
 - **V0.8** alert delivery: webhook / push when a contract transitions into
   A+/A or a high-grade B+. Activates deferred invariant D3 (backtest-tuned
   grade thresholds).
@@ -187,10 +219,11 @@ cross-bracket coherence). Next slices, in order:
 ## Testing
 
 ```bash
-pytest                              # 45 tests, all offline
+pytest                              # 68 tests, all offline
 ```
 
-The state machine, ranker, parser, resolver, and coherence pass have no
-network dependencies — every test runs against synthetic fixtures. The
-Kalshi and NWS clients are covered by the type system and exercised at
-runtime; integration tests will land with V0.7.
+The state machine, ranker, parser, resolver, coherence pass, snapshot
+store, settlement derivation, backtester, and replay verifier all have
+zero network dependencies — every test runs against synthetic fixtures or
+temporary SQLite databases. The Kalshi and NWS clients are covered by the
+type system and exercised at runtime.
