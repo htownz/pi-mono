@@ -38,7 +38,7 @@ def test_below_threshold_via_title():
     m = _market("KXHIGHHOUSTON-26MAY27-T78", yes_sub_title="78° or below")
     p = parse_market(m)
     assert p is not None
-    assert p.bracket.kind is BracketKind.BELOW
+    assert p.bracket.kind is BracketKind.LTE
     assert p.bracket.hi == 78.0
     assert p.bracket.lo is None
 
@@ -47,7 +47,7 @@ def test_above_threshold_via_title():
     m = _market("KXHIGHHOUSTON-26MAY27-T85", yes_sub_title="85° or above")
     p = parse_market(m)
     assert p is not None
-    assert p.bracket.kind is BracketKind.ABOVE
+    assert p.bracket.kind is BracketKind.GTE
     assert p.bracket.lo == 85.0
     assert p.bracket.hi is None
 
@@ -88,3 +88,43 @@ def test_date_parsing_year():
     assert p is not None
     assert p.market_date == date(2026, 12, 31)
     assert p.city_slug == "NYC"
+
+
+def test_at_least_phrasing_maps_to_gte():
+    m = _market("KXHIGHHOUSTON-26MAY27-T80", yes_sub_title="at least 80°")
+    p = parse_market(m)
+    assert p is not None
+    assert p.bracket.kind is BracketKind.GTE
+    assert p.bracket.lo == 80.0
+
+
+def test_at_most_phrasing_maps_to_lte():
+    m = _market("KXLOWHOUSTON-26MAY28-T75", yes_sub_title="at most 75°")
+    p = parse_market(m)
+    assert p is not None
+    assert p.bracket.kind is BracketKind.LTE
+    assert p.bracket.hi == 75.0
+
+
+def test_strict_above_phrasing_maps_to_gt():
+    m = _market("KXHIGHHOUSTON-26MAY27-T80", yes_sub_title="above 80°")
+    p = parse_market(m)
+    assert p is not None
+    assert p.bracket.kind is BracketKind.GT
+    assert p.bracket.lo == 80.0
+
+
+def test_strict_below_phrasing_maps_to_lt():
+    m = _market("KXLOWHOUSTON-26MAY28-T75", yes_sub_title="below 75°")
+    p = parse_market(m)
+    assert p is not None
+    assert p.bracket.kind is BracketKind.LT
+    assert p.bracket.hi == 75.0
+
+
+def test_exactly_phrasing_maps_to_eq():
+    m = _market("KXHIGHHOUSTON-26MAY27-T80", yes_sub_title="exactly 80°")
+    p = parse_market(m)
+    assert p is not None
+    assert p.bracket.kind is BracketKind.EQ
+    assert p.bracket.lo == 80.0

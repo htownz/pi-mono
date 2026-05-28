@@ -51,7 +51,7 @@ def test_locked_yes_with_stale_price_grades_A_plus():
 
 def test_dead_no_grades_A_when_no_side_cheap():
     """Spec: high already at 79 → '78 or below' is dead → buy No."""
-    c = _contract(bracket=Bracket(BracketKind.BELOW, lo=None, hi=78.0))
+    c = _contract(bracket=Bracket(BracketKind.LTE, lo=None, hi=78.0))
     m = _market(yes_ask=15, yes_bid=14, no_ask=85, no_bid=84)
     e = grade(c, m, ContractState.DEAD_NO, "max 79 > 78", fair_lo=0.0, fair_hi=0.02)
     # No-side edge: 1 - 0.01 - 0.85 = 0.14 → A+/A

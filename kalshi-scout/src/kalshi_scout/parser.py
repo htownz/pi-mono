@@ -55,12 +55,30 @@ _BETWEEN_TITLE = re.compile(
     rf"(?P<lo>-?\d+(?:\.\d+)?){_DEGREE}\s*(?:to|[–-])\s*(?P<hi>-?\d+(?:\.\d+)?){_DEGREE}",
     re.IGNORECASE,
 )
-_BELOW_TITLE = re.compile(
-    rf"(?P<t>-?\d+(?:\.\d+)?){_DEGREE}\s*or\s*(?:below|under|less)",
+# "X° or below" / "at most X°" -> LTE (inclusive of X)
+_LTE_TITLE = re.compile(
+    rf"(?:(?P<t1>-?\d+(?:\.\d+)?){_DEGREE}\s*or\s*(?:below|under|less)|"
+    rf"at\s*most\s*(?P<t2>-?\d+(?:\.\d+)?){_DEGREE})",
     re.IGNORECASE,
 )
-_ABOVE_TITLE = re.compile(
-    rf"(?P<t>-?\d+(?:\.\d+)?){_DEGREE}\s*or\s*(?:above|over|higher|more)",
+# "X° or above" / "at least X°" -> GTE (inclusive of X)
+_GTE_TITLE = re.compile(
+    rf"(?:(?P<t1>-?\d+(?:\.\d+)?){_DEGREE}\s*or\s*(?:above|over|higher|more)|"
+    rf"at\s*least\s*(?P<t2>-?\d+(?:\.\d+)?){_DEGREE})",
+    re.IGNORECASE,
+)
+# "above X°" without "or" -> GT (strict)
+_GT_TITLE = re.compile(
+    rf"^\s*above\s+(?P<t>-?\d+(?:\.\d+)?){_DEGREE}\s*$",
+    re.IGNORECASE,
+)
+# "below X°" without "or" -> LT (strict)
+_LT_TITLE = re.compile(
+    rf"^\s*below\s+(?P<t>-?\d+(?:\.\d+)?){_DEGREE}\s*$",
+    re.IGNORECASE,
+)
+_EQ_TITLE = re.compile(
+    rf"exactly\s+(?P<t>-?\d+(?:\.\d+)?){_DEGREE}",
     re.IGNORECASE,
 )
 
@@ -85,7 +103,12 @@ def _parse_date_token(tok: str) -> Optional[date]:
 
 
 def _bracket_from_title(yes_sub_title: str) -> Optional[Bracket]:
-    """Best-effort parse of Kalshi's `yes_sub_title` shapes."""
+    """Best-effort parse of Kalshi's `yes_sub_title` shapes.
+
+    Order matters: BETWEEN before LTE/GTE so "70 to 75°" doesn't get caught by
+    a stray "above" elsewhere. Strict GT/LT only match titles starting with
+    "above"/"below" *without* "or" (the colloquial-with-or form is GTE/LTE).
+    """
     if not yes_sub_title:
         return None
     text = yes_sub_title.strip()
@@ -96,14 +119,26 @@ def _bracket_from_title(yes_sub_title: str) -> Optional[Bracket]:
         if lo > hi:
             lo, hi = hi, lo
         return Bracket(BracketKind.BETWEEN, lo, hi)
-    m = _BELOW_TITLE.search(text)
+    m = _LTE_TITLE.search(text)
+    if m:
+        t = float(m.group("t1") or m.group("t2"))
+        return Bracket(BracketKind.LTE, lo=None, hi=t)
+    m = _GTE_TITLE.search(text)
+    if m:
+        t = float(m.group("t1") or m.group("t2"))
+        return Bracket(BracketKind.GTE, lo=t, hi=None)
+    m = _EQ_TITLE.search(text)
     if m:
         t = float(m.group("t"))
-        return Bracket(BracketKind.BELOW, lo=None, hi=t)
-    m = _ABOVE_TITLE.search(text)
+        return Bracket(BracketKind.EQ, lo=t, hi=None)
+    m = _GT_TITLE.search(text)
     if m:
         t = float(m.group("t"))
-        return Bracket(BracketKind.ABOVE, lo=t, hi=None)
+        return Bracket(BracketKind.GT, lo=t, hi=None)
+    m = _LT_TITLE.search(text)
+    if m:
+        t = float(m.group("t"))
+        return Bracket(BracketKind.LT, lo=None, hi=t)
     return None
 
 
@@ -123,13 +158,8 @@ def _bracket_from_suffix(suffix: str, yes_sub_title: str) -> Optional[Bracket]:
         return Bracket(BracketKind.BETWEEN, lo, hi)
     m = _THRESHOLD_SUFFIX.match(suffix)
     if m:
-        t = float(m.group("t"))
-        title = (yes_sub_title or "").lower()
-        if "above" in title or "or more" in title or "or over" in title or "higher" in title:
-            return Bracket(BracketKind.ABOVE, lo=t, hi=None)
-        if "below" in title or "under" in title or "or less" in title:
-            return Bracket(BracketKind.BELOW, lo=None, hi=t)
-        # Last resort: try parsing the title independently
+        # The T<n> ticker suffix alone cannot disambiguate operator direction
+        # (above vs below, strict vs inclusive). Always defer to the title.
         return _bracket_from_title(yes_sub_title)
     return None
 

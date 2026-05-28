@@ -9,24 +9,35 @@ better than the NWS. It looks for markets where the **settlement question has
 already been answered** by the official station and the orderbook hasn't
 caught up.
 
-## What this version (v0.3) does
+## What this version (V0.4) does
 
 - **Crawls** every open Kalshi temperature event under known series prefixes
   (`KXHIGH*`, `KXLOW*`, `KXTEMP*`) without authentication.
 - **Parses** each market ticker + `yes_sub_title` into a structured contract:
-  city, metric (HIGH/LOW), market date, and bracket (above/below/between).
+  city, metric (HIGH/LOW), market date, and bracket — six operators matching
+  Kalshi's GLOBALTEMPERATURE rulebook (`GT`/`LT`/`GTE`/`LTE`/`EQ`/`BETWEEN`).
+- **Resolves the settlement source** (V0.4): parses each market's
+  `rules_primary` text to extract the official NWS station; falls back to the
+  hand registry only as a tagged lower-trust signal; refuses to grade
+  (`F`) when neither produces a verified source (invariant I4).
 - **Pulls** NWS station observations for the market's local-day window, the
   station's hourly forecast, and the latest CLI product. Discards the CLI if
-  its report date doesn't match the market date (one of the v0.2 traps).
+  its report date doesn't match the market date.
 - **Classifies** each contract's state via a deterministic state machine:
   `LOCKED_YES` / `DEAD_NO` / `BRACKET_HIT_VULNERABLE` / `NOT_REACHED` /
   `FORECAST_DEPENDENT`.
+- **Cross-bracket coherence** (V0.4 / invariant I7): when any sibling in an
+  event is `LOCKED_YES`, all others are automatically demoted to `DEAD_NO`.
+  Flags overpriced (sum > 105c) and underpriced (sum < 95c) books across
+  the event.
 - **Grades** each contract A+ → F based on settlement-conclusiveness, edge
   vs. tradable price (Yes ask or derived No ask), and spread / liquidity.
 - **Outputs** a ranked opportunity board (rich table or JSON).
 
 What it deliberately does *not* do yet: trade execution, persistence /
-backtesting, alert delivery, fancy forecast models. See "Roadmap" below.
+backtesting, alert delivery, orderbook depth modeling. See "Roadmap" below.
+
+See `AGENTS.md` for the engineering invariants every change must respect.
 
 ## Install
 
@@ -87,31 +98,37 @@ grade.** Settlement-source mismatch is the worst-case error.
 
 ## The model
 
-### Three contract shapes
+### Six contract shapes (matching Kalshi's GLOBALTEMPERATURE rulebook)
 
-```
-above(t)        settlement >= t        suffix: T<t>   title: "<t>° or above"
-below(t)        settlement <= t        suffix: T<t>   title: "<t>° or below"
-between(lo,hi)  lo <= settlement <= hi suffix: B<lo>-<hi>
-```
+| `BracketKind` | Operator | Rulebook word | Typical title             |
+|---------------|----------|---------------|---------------------------|
+| `GT`          | `>`      | "above"       | "above 80°"               |
+| `LT`          | `<`      | "below"       | "below 75°"               |
+| `GTE`         | `≥`      | "at least"    | "85° or above"            |
+| `LTE`         | `≤`      | "at most"     | "78° or below"            |
+| `EQ`          | `=` (1dp)| "exactly"     | "exactly 80°"             |
+| `BETWEEN`     | `[lo,hi]`| "between"     | "79° to 80°"              |
 
 The parser refuses to guess direction for a `T<n>` ticker without title
 disambiguation (returns `None`) — silent skip beats wrong settlement.
+The naming distinguishes Kalshi's *colloquial* English ("X or below" =
+inclusive `≤` = `LTE`) from the *rulebook strict operator* ("below X" = `<` =
+`LT`). See `AGENTS.md` invariant I6.
 
 ### State machine (the engine)
 
 | Metric | Bracket   | Observation                          | State                       |
 |--------|-----------|--------------------------------------|-----------------------------|
-| HIGH   | above(t)  | running_max ≥ t                      | `LOCKED_YES`                |
-| HIGH   | above(t)  | running_max < t                      | `NOT_REACHED`               |
-| HIGH   | below(t)  | running_max > t                      | `DEAD_NO`                   |
-| HIGH   | below(t)  | running_max ≤ t                      | `FORECAST_DEPENDENT`        |
+| HIGH   | GTE(t)    | running_max ≥ t                      | `LOCKED_YES`                |
+| HIGH   | GTE(t)    | running_max < t                      | `NOT_REACHED`               |
+| HIGH   | LTE(t)    | running_max > t                      | `DEAD_NO`                   |
+| HIGH   | LTE(t)    | running_max ≤ t                      | `FORECAST_DEPENDENT`        |
 | HIGH   | btwn(l,h) | running_max > h                      | `DEAD_NO`                   |
 | HIGH   | btwn(l,h) | l ≤ running_max ≤ h                  | `BRACKET_HIT_VULNERABLE`    |
 | HIGH   | btwn(l,h) | running_max < l                      | `NOT_REACHED`               |
-| LOW    | below(t)  | running_min ≤ t                      | `LOCKED_YES` (low can't undo)|
-| LOW    | below(t)  | running_min > t                      | `FORECAST_DEPENDENT`        |
-| LOW    | above(t)  | running_min < t                      | `DEAD_NO`                   |
+| LOW    | LTE(t)    | running_min ≤ t                      | `LOCKED_YES` (low can't undo)|
+| LOW    | LTE(t)    | running_min > t                      | `FORECAST_DEPENDENT`        |
+| LOW    | GTE(t)    | running_min < t                      | `DEAD_NO`                   |
 | LOW    | btwn(l,h) | running_min < l                      | `DEAD_NO`                   |
 | LOW    | btwn(l,h) | l ≤ running_min ≤ h                  | `BRACKET_HIT_VULNERABLE`    |
 | LOW    | btwn(l,h) | running_min > h                      | `NOT_REACHED`               |
@@ -153,25 +170,27 @@ trade.
 
 ## Roadmap
 
-This is V0.3 (universe scanner skeleton). Next slices, in order:
+Current: **V0.4** (universe scanner + settlement-source resolver +
+cross-bracket coherence). Next slices, in order:
 
-- **V0.4** station/source resolver: confirm each market's actual settlement
-  station from Kalshi's rules rather than the hand-curated map.
 - **V0.5** forecast engine: cloud/precip/front regime detection, better
   remaining-extreme bounds.
 - **V0.6** orderbook depth: use full `/orderbook` to estimate fill quality,
   not just top-of-book ask.
-- **V0.7** backtester: SQLite-backed snapshot store + settlement matcher.
+- **V0.7** snapshot store + backtester: SQLite-backed observations of every
+  scan, settled outcomes joined from CLI, `kalshi-scout backtest` command.
+  Activates deferred invariants D1 and D2.
 - **V0.8** alert delivery: webhook / push when a contract transitions into
-  A+/A or a high-grade B+.
+  A+/A or a high-grade B+. Activates deferred invariant D3 (backtest-tuned
+  grade thresholds).
 
 ## Testing
 
 ```bash
-pytest                              # 27 tests, all offline
+pytest                              # 45 tests, all offline
 ```
 
-The state machine and ranker have no network dependencies — every test runs
-against synthetic `StationState` objects. The Kalshi and NWS clients are
-covered by the type system and exercised at runtime; integration tests will
-land with V0.7.
+The state machine, ranker, parser, resolver, and coherence pass have no
+network dependencies — every test runs against synthetic fixtures. The
+Kalshi and NWS clients are covered by the type system and exercised at
+runtime; integration tests will land with V0.7.

@@ -97,24 +97,48 @@ def build_station_state(
 
 
 def _high_state(bracket: Bracket, running_max: Optional[float]) -> tuple[ContractState, str]:
-    """Classify a HIGH-temp contract given the running max so far."""
+    """Classify a HIGH-temp contract given the running max so far.
+
+    Highs can only go up during the day's heating phase; once `running_max`
+    crosses an "above"-side threshold, that side is settlement-locked. The
+    "below"-side cannot be settlement-locked from the high alone (the day's
+    final max could still climb), but once running_max exceeds the upper
+    threshold, the below-side is dead.
+    """
     if running_max is None:
         return ContractState.FORECAST_DEPENDENT, "no station obs yet"
 
-    if bracket.kind is BracketKind.ABOVE:
-        # "T or above" wins if max >= T.
+    k = bracket.kind
+    if k is BracketKind.GTE:
         assert bracket.lo is not None
         if running_max >= bracket.lo:
             return ContractState.LOCKED_YES, f"observed max {running_max:g} ≥ {bracket.lo:g}"
         return ContractState.NOT_REACHED, f"observed max {running_max:g} < {bracket.lo:g}, needs more heating"
 
-    if bracket.kind is BracketKind.BELOW:
-        # "T or below" wins if max < T (Kalshi strikes use < on the BELOW side).
-        # If running_max already meets/exceeds T, this contract is dead.
+    if k is BracketKind.GT:
+        assert bracket.lo is not None
+        if running_max > bracket.lo:
+            return ContractState.LOCKED_YES, f"observed max {running_max:g} > {bracket.lo:g}"
+        return ContractState.NOT_REACHED, f"observed max {running_max:g} ≤ {bracket.lo:g}, strictly above strike"
+
+    if k is BracketKind.LTE:
         assert bracket.hi is not None
         if running_max > bracket.hi:
             return ContractState.DEAD_NO, f"observed max {running_max:g} > {bracket.hi:g}, cannot recover"
         return ContractState.FORECAST_DEPENDENT, f"observed max {running_max:g} ≤ {bracket.hi:g}, but day not over"
+
+    if k is BracketKind.LT:
+        assert bracket.hi is not None
+        if running_max >= bracket.hi:
+            return ContractState.DEAD_NO, f"observed max {running_max:g} ≥ {bracket.hi:g}, strictly-below side dead"
+        return ContractState.FORECAST_DEPENDENT, f"observed max {running_max:g} < {bracket.hi:g}, but day not over"
+
+    if k is BracketKind.EQ:
+        # "Exactly X" on a HIGH: dead once max > X; otherwise still in play.
+        assert bracket.lo is not None
+        if running_max > bracket.lo:
+            return ContractState.DEAD_NO, f"observed max {running_max:g} > {bracket.lo:g}, cannot settle exactly"
+        return ContractState.FORECAST_DEPENDENT, f"observed max {running_max:g} ≤ {bracket.lo:g}, still possible to settle exactly"
 
     # BETWEEN
     assert bracket.lo is not None and bracket.hi is not None
@@ -129,23 +153,44 @@ def _high_state(bracket: Bracket, running_max: Optional[float]) -> tuple[Contrac
 
 
 def _low_state(bracket: Bracket, running_min: Optional[float]) -> tuple[ContractState, str]:
-    """Classify a LOW-temp contract given the running min so far."""
+    """Classify a LOW-temp contract given the running min so far.
+
+    Mirror of `_high_state`: a minimum can't un-happen, so once running_min
+    crosses a "below"-side threshold, that side is settlement-locked.
+    """
     if running_min is None:
         return ContractState.FORECAST_DEPENDENT, "no station obs yet"
 
-    if bracket.kind is BracketKind.BELOW:
-        # "T or below" wins if min <= T (low cannot un-happen).
+    k = bracket.kind
+    if k is BracketKind.LTE:
         assert bracket.hi is not None
         if running_min <= bracket.hi:
             return ContractState.LOCKED_YES, f"observed min {running_min:g} ≤ {bracket.hi:g}"
         return ContractState.FORECAST_DEPENDENT, f"observed min {running_min:g} > {bracket.hi:g}, still cooling potential"
 
-    if bracket.kind is BracketKind.ABOVE:
-        # "T or above" wins if min >= T; if min already fell below T, dead.
+    if k is BracketKind.LT:
+        assert bracket.hi is not None
+        if running_min < bracket.hi:
+            return ContractState.LOCKED_YES, f"observed min {running_min:g} < {bracket.hi:g}"
+        return ContractState.FORECAST_DEPENDENT, f"observed min {running_min:g} ≥ {bracket.hi:g}, needs more cooling"
+
+    if k is BracketKind.GTE:
         assert bracket.lo is not None
         if running_min < bracket.lo:
             return ContractState.DEAD_NO, f"observed min {running_min:g} < {bracket.lo:g}, cannot recover"
         return ContractState.FORECAST_DEPENDENT, f"observed min {running_min:g} ≥ {bracket.lo:g} so far; more cooling risk"
+
+    if k is BracketKind.GT:
+        assert bracket.lo is not None
+        if running_min <= bracket.lo:
+            return ContractState.DEAD_NO, f"observed min {running_min:g} ≤ {bracket.lo:g}, strictly-above side dead"
+        return ContractState.FORECAST_DEPENDENT, f"observed min {running_min:g} > {bracket.lo:g} so far; more cooling risk"
+
+    if k is BracketKind.EQ:
+        assert bracket.lo is not None
+        if running_min < bracket.lo:
+            return ContractState.DEAD_NO, f"observed min {running_min:g} < {bracket.lo:g}, cannot settle exactly"
+        return ContractState.FORECAST_DEPENDENT, f"observed min {running_min:g} ≥ {bracket.lo:g}, still possible to settle exactly"
 
     # BETWEEN
     assert bracket.lo is not None and bracket.hi is not None
@@ -216,8 +261,8 @@ def fair_probability(
     bracket = contract.bracket
 
     if state is ContractState.BRACKET_HIT_VULNERABLE:
-        # Already in the bracket; need to estimate prob the path escapes by
-        # day's end. Use forecast envelope for the escape side.
+        # Already in the bracket (only BETWEEN kinds reach this state); need
+        # to estimate prob the path escapes by day's end.
         if forecast is None:
             return 0.45, 0.85
         f_lo, f_hi = _remaining_extrema_from_forecast(contract.metric, forecast, station_state, now_utc)
@@ -263,14 +308,24 @@ def _bracket_overlap_prob(bracket: Bracket, proj_lo: float, proj_hi: float) -> t
     if proj_hi <= proj_lo:
         proj_hi = proj_lo + 1.0
     span = proj_hi - proj_lo
-    if bracket.kind is BracketKind.ABOVE:
+    k = bracket.kind
+    if k in (BracketKind.GTE, BracketKind.GT):
         assert bracket.lo is not None
         overlap = max(0.0, proj_hi - bracket.lo)
         center = min(1.0, overlap / span)
-    elif bracket.kind is BracketKind.BELOW:
+    elif k in (BracketKind.LTE, BracketKind.LT):
         assert bracket.hi is not None
         overlap = max(0.0, bracket.hi - proj_lo)
         center = min(1.0, overlap / span)
+    elif k is BracketKind.EQ:
+        # Very narrow target — probability concentrated near a single value.
+        assert bracket.lo is not None
+        target = bracket.lo
+        if proj_lo <= target <= proj_hi:
+            # Treat a 1°-wide window around target as the favorable region.
+            center = min(1.0, 1.0 / span)
+        else:
+            center = 0.0
     else:
         assert bracket.lo is not None and bracket.hi is not None
         lo = max(proj_lo, bracket.lo)

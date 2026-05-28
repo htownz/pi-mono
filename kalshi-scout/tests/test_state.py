@@ -52,26 +52,26 @@ def _contract(metric, bracket, market_date=date(2026, 5, 27)):
 # -- HIGH temperature ----------------------------------------------------------
 
 def test_high_above_locked_yes_when_max_reaches_strike():
-    c = _contract(Metric.HIGH, Bracket(BracketKind.ABOVE, lo=85.0, hi=None))
+    c = _contract(Metric.HIGH, Bracket(BracketKind.GTE, lo=85.0, hi=None))
     state, _ = classify(c, _state(running_max=86.0))
     assert state is ContractState.LOCKED_YES
 
 
 def test_high_above_not_reached_when_max_below_strike():
-    c = _contract(Metric.HIGH, Bracket(BracketKind.ABOVE, lo=85.0, hi=None))
+    c = _contract(Metric.HIGH, Bracket(BracketKind.GTE, lo=85.0, hi=None))
     state, _ = classify(c, _state(running_max=80.0))
     assert state is ContractState.NOT_REACHED
 
 
 def test_high_below_dead_no_when_max_exceeds_strike():
     """The classic 'already-killed' scenario from the spec."""
-    c = _contract(Metric.HIGH, Bracket(BracketKind.BELOW, lo=None, hi=78.0))
+    c = _contract(Metric.HIGH, Bracket(BracketKind.LTE, lo=None, hi=78.0))
     state, _ = classify(c, _state(running_max=79.0))
     assert state is ContractState.DEAD_NO
 
 
 def test_high_below_still_alive_when_max_at_strike():
-    c = _contract(Metric.HIGH, Bracket(BracketKind.BELOW, lo=None, hi=78.0))
+    c = _contract(Metric.HIGH, Bracket(BracketKind.LTE, lo=None, hi=78.0))
     state, _ = classify(c, _state(running_max=78.0))
     assert state is ContractState.FORECAST_DEPENDENT
 
@@ -100,19 +100,19 @@ def test_high_between_not_reached_when_max_below():
 
 def test_low_below_locked_yes_when_min_drops_to_strike():
     """Spec quote: 'a minimum cannot be undone by later warming.'"""
-    c = _contract(Metric.LOW, Bracket(BracketKind.BELOW, lo=None, hi=70.0))
+    c = _contract(Metric.LOW, Bracket(BracketKind.LTE, lo=None, hi=70.0))
     state, _ = classify(c, _state(running_min=70.0))
     assert state is ContractState.LOCKED_YES
 
 
 def test_low_below_still_alive_when_min_above_strike():
-    c = _contract(Metric.LOW, Bracket(BracketKind.BELOW, lo=None, hi=70.0))
+    c = _contract(Metric.LOW, Bracket(BracketKind.LTE, lo=None, hi=70.0))
     state, _ = classify(c, _state(running_min=72.0))
     assert state is ContractState.FORECAST_DEPENDENT
 
 
 def test_low_above_dead_when_min_drops_below():
-    c = _contract(Metric.LOW, Bracket(BracketKind.ABOVE, lo=74.0, hi=None))
+    c = _contract(Metric.LOW, Bracket(BracketKind.GTE, lo=74.0, hi=None))
     state, _ = classify(c, _state(running_min=72.0))
     assert state is ContractState.DEAD_NO
 

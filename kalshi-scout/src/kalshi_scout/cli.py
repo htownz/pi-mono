@@ -15,6 +15,7 @@ import click
 from rich.console import Console
 from rich.table import Table
 
+from kalshi_scout.coherence import enforce_coherence
 from kalshi_scout.kalshi import KalshiClient, iter_temperature_events
 from kalshi_scout.models import (
     ContractEvaluation,
@@ -22,12 +23,15 @@ from kalshi_scout.models import (
     KalshiEvent,
     KalshiMarket,
     ParsedContract,
+    Settlement,
+    SettlementProvenance,
     Station,
     StationState,
 )
 from kalshi_scout.nws import NwsClient
 from kalshi_scout.parser import parse_market
 from kalshi_scout.ranker import grade, sort_key
+from kalshi_scout.resolver import resolve_settlement
 from kalshi_scout.state import build_station_state, classify, fair_probability
 from kalshi_scout.stations import all_cities, get_station
 
@@ -50,23 +54,23 @@ def _evaluate_event(
     if not parsed:
         return []
 
-    # All markets in one event share the same city/date/metric, so build the
-    # station state once.
-    first_contract, _ = parsed[0]
-    station = get_station(first_contract.city_slug)
-    if station is None:
+    # All markets in one event share the same city/date/metric. The resolver
+    # consults the rules text for each market individually (markets *can* in
+    # principle pin different stations, though same-event ones usually don't).
+    # We use the first market's settlement to build StationState, but every
+    # market is graded against its own resolved station — if any differs,
+    # that market is independently re-evaluated.
+    first_contract, first_market = parsed[0]
+    first_settlement = resolve_settlement(first_market, first_contract)
+
+    if first_settlement.station is None:
+        # Invariant I4: refuse to grade without a verified settlement source.
         return [
-            grade(
-                contract=p,
-                market=m,
-                state=ContractState.FORECAST_DEPENDENT,
-                reason=f"no station registered for city {first_contract.city_slug}",
-                fair_lo=0.25,
-                fair_hi=0.75,
-            )
+            _make_unverified_eval(p, m, first_settlement)
             for p, m in parsed
         ]
 
+    station = first_settlement.station
     station_state = build_station_state(nws, station, first_contract.market_date, now_utc=now_utc)
     try:
         forecast = nws.hourly_forecast(station)
@@ -75,26 +79,67 @@ def _evaluate_event(
 
     evals: list[ContractEvaluation] = []
     for contract, market in parsed:
-        state, reason = classify(contract, station_state)
+        settlement = resolve_settlement(market, contract)
+        if settlement.station is None:
+            evals.append(_make_unverified_eval(contract, market, settlement))
+            continue
+        if settlement.station.icao != station.icao:
+            # Per-market station override — build its own StationState.
+            local_state = build_station_state(nws, settlement.station, contract.market_date, now_utc=now_utc)
+            local_forecast: list = []
+            try:
+                local_forecast = nws.hourly_forecast(settlement.station)
+            except Exception:
+                local_forecast = []
+        else:
+            local_state = station_state
+            local_forecast = forecast
+
+        state, reason = classify(contract, local_state)
         fair_lo, fair_hi = fair_probability(
             contract,
-            station_state,
+            local_state,
             state,
-            forecast or None,
+            local_forecast or None,
             now_utc=now_utc,
         )
-        if not station_state.cli_matches_market_date:
-            # The official CLI for this date hasn't been issued yet — make
-            # that visible so a trader doesn't misread our running max/min as
-            # already-settled.
-            pass
         eval_ = grade(contract, market, state, reason, fair_lo, fair_hi)
-        if not station_state.cli_matches_market_date:
+        if not local_state.cli_matches_market_date:
             eval_.notes.append("no matching CLI yet (preliminary obs only)")
+        if settlement.provenance is SettlementProvenance.REGISTRY:
+            eval_.notes.append("settlement: registry fallback (not pinned in rules text)")
+        else:
+            eval_.notes.append(f"settlement: {settlement.station.icao} via resolver")
         evals.append(eval_)
 
+    # Cross-bracket coherence pass (invariant I7).
+    evals = enforce_coherence(evals)
     evals.sort(key=sort_key)
     return evals
+
+
+def _make_unverified_eval(
+    contract: ParsedContract,
+    market: KalshiMarket,
+    settlement: Settlement,
+) -> ContractEvaluation:
+    """Build an F-graded evaluation for a market with no verifiable source.
+
+    Per invariant I4, this is how we refuse to trade rather than guessing.
+    """
+    eval_ = grade(
+        contract=contract,
+        market=market,
+        state=ContractState.FORECAST_DEPENDENT,
+        reason=f"unverified settlement source ({settlement.area_description or 'unknown area'})",
+        fair_lo=0.25,
+        fair_hi=0.75,
+    )
+    eval_.grade = "F"
+    eval_.notes.append("invariant I4: settlement source not verified")
+    for note in settlement.notes:
+        eval_.notes.append(f"resolver: {note}")
+    return eval_
 
 
 def _eval_to_dict(e: ContractEvaluation, station: Optional[Station]) -> dict:

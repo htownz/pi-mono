@@ -34,37 +34,68 @@ class Metric(str, Enum):
 
 
 class BracketKind(str, Enum):
-    ABOVE = "above"   # settlement >= threshold
-    BELOW = "below"   # settlement < threshold (Kalshi labels it "or below" but uses < on the strike below)
-    BETWEEN = "between"  # lo <= settlement <= hi
+    """Matches Kalshi's GLOBALTEMPERATURE rulebook operators exactly.
+
+    See `AGENTS.md` invariant I6. The colloquial yes_sub_title shapes seen on
+    real Kalshi markets map as follows:
+
+        "X° or above"  -> GTE  (rulebook: "at least X")
+        "X° or below"  -> LTE  (rulebook: "at most X")
+        "above X°"     -> GT   (rulebook: "above X", strict)
+        "below X°"     -> LT   (rulebook: "below X", strict)
+        "lo°–hi°"      -> BETWEEN
+        "exactly X°"   -> EQ   (rulebook: equal to X rounded to 1dp)
+    """
+    GT = "gt"            # > threshold (rulebook "above")
+    LT = "lt"            # < threshold (rulebook "below")
+    GTE = "gte"          # >= threshold (rulebook "at least", colloquial "or above")
+    LTE = "lte"          # <= threshold (rulebook "at most", colloquial "or below")
+    EQ = "eq"            # == threshold rounded to 1dp (rulebook "exactly")
+    BETWEEN = "between"  # lo <= t <= hi inclusive both ends
 
 
 @dataclass(frozen=True)
 class Bracket:
     """A single Kalshi temperature contract bracket.
 
-    Semantics chosen to match Kalshi's stated rule that adjacent brackets do not
-    overlap; an integer-degree settlement falls in exactly one bracket.
+    For one-sided kinds (GT/LT/GTE/LTE/EQ) the threshold is stored in `lo` for
+    GT/GTE/EQ and in `hi` for LT/LTE — matching the conventional "lower bound
+    for above-side / upper bound for below-side" mental model.
     """
     kind: BracketKind
-    lo: Optional[float]  # inclusive lower bound, or None for BELOW
-    hi: Optional[float]  # inclusive upper bound, or None for ABOVE
+    lo: Optional[float]  # inclusive lower bound (or strict for GT)
+    hi: Optional[float]  # inclusive upper bound (or strict for LT)
 
     def contains(self, t: float) -> bool:
-        if self.kind is BracketKind.ABOVE:
+        if self.kind is BracketKind.GT:
+            assert self.lo is not None
+            return t > self.lo
+        if self.kind is BracketKind.GTE:
             assert self.lo is not None
             return t >= self.lo
-        if self.kind is BracketKind.BELOW:
+        if self.kind is BracketKind.LT:
+            assert self.hi is not None
+            return t < self.hi
+        if self.kind is BracketKind.LTE:
             assert self.hi is not None
             return t <= self.hi
+        if self.kind is BracketKind.EQ:
+            assert self.lo is not None
+            return round(t, 1) == round(self.lo, 1)
         assert self.lo is not None and self.hi is not None
         return self.lo <= t <= self.hi
 
     def label(self) -> str:
-        if self.kind is BracketKind.ABOVE:
+        if self.kind is BracketKind.GTE:
             return f"{self.lo:g}° or above"
-        if self.kind is BracketKind.BELOW:
+        if self.kind is BracketKind.LTE:
             return f"{self.hi:g}° or below"
+        if self.kind is BracketKind.GT:
+            return f"above {self.lo:g}°"
+        if self.kind is BracketKind.LT:
+            return f"below {self.hi:g}°"
+        if self.kind is BracketKind.EQ:
+            return f"exactly {self.lo:g}°"
         return f"{self.lo:g}–{self.hi:g}°"
 
 
@@ -78,6 +109,32 @@ class Station:
     cli_product: str        # NWS CLI product ID, e.g. "CLIHOU"
     latitude: float
     longitude: float
+
+
+class SettlementProvenance(str, Enum):
+    """Where the scout's settlement decision came from.
+
+    `RESOLVER` = parsed from the market's rules_primary text (authoritative).
+    `REGISTRY` = fell back to the hand-curated stations.py map (lower trust).
+    `UNVERIFIED` = neither produced a station — market must grade F.
+    """
+    RESOLVER = "resolver"
+    REGISTRY = "registry"
+    UNVERIFIED = "unverified"
+
+
+@dataclass(frozen=True)
+class Settlement:
+    """Per-market settlement metadata extracted from Kalshi's rules text.
+
+    This is the V0.4 resolver's output. It tells the engine exactly which
+    NWS station and CLI product define the contract's Expiration Value.
+    """
+    station: Optional[Station]
+    source_agency: str          # e.g. "National Weather Service"
+    area_description: str       # raw <area> substitution from rules text
+    provenance: SettlementProvenance
+    notes: tuple[str, ...] = ()
 
 
 @dataclass
