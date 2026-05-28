@@ -16,6 +16,7 @@ from rich.console import Console
 from rich.table import Table
 
 from kalshi_scout.coherence import enforce_coherence
+from kalshi_scout.calibrate import calibrate as run_calibrate, report_to_dict
 from kalshi_scout.kalshi import KalshiClient, iter_temperature_events
 from kalshi_scout.models import (
     Bracket,
@@ -30,6 +31,13 @@ from kalshi_scout.models import (
     SettlementProvenance,
     Station,
     StationState,
+)
+from kalshi_scout.notify import (
+    AlertDispatcher,
+    AlertSink,
+    JsonlSink,
+    StdoutSink,
+    WebhookSink,
 )
 from kalshi_scout.nws import NwsClient
 from kalshi_scout.orderbook import parse_orderbook
@@ -47,6 +55,29 @@ from kalshi_scout.store import (
 )
 
 console = Console()
+
+
+def _build_sinks(specs: tuple[str, ...]) -> list[AlertSink]:
+    """Parse --notify spec strings into sink instances.
+
+    Accepted forms:
+      stdout                       -> StdoutSink
+      jsonl:/abs/or/rel/path.jsonl -> JsonlSink(path)
+      webhook:https://example.com  -> WebhookSink(url)
+    """
+    sinks: list[AlertSink] = []
+    for spec in specs:
+        if spec == "stdout":
+            sinks.append(StdoutSink())
+        elif spec.startswith("jsonl:"):
+            sinks.append(JsonlSink(spec[len("jsonl:"):]))
+        elif spec.startswith("webhook:"):
+            sinks.append(WebhookSink(spec[len("webhook:"):]))
+        else:
+            raise click.BadParameter(
+                f"--notify spec '{spec}' not recognized; use stdout, jsonl:PATH, or webhook:URL"
+            )
+    return sinks
 
 
 def _evaluate_event(
@@ -269,8 +300,14 @@ def main() -> None:
 @click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of tables.")
 @click.option("--store", "store_path", type=click.Path(), default=None,
               help="Persist every evaluation to a SQLite snapshot store (path).")
+@click.option("--notify", "notify_specs", multiple=True,
+              help="Alert sink spec: 'stdout', 'jsonl:/path.jsonl', or 'webhook:https://...'. "
+                   "May be passed multiple times. Requires --store.")
+@click.option("--notify-min-grade", default="A",
+              help="Only fire alerts at this grade or better (default A).")
 def scan(city: Optional[str], limit: Optional[int], min_grade: str,
-         as_json: bool, store_path: Optional[str]) -> None:
+         as_json: bool, store_path: Optional[str],
+         notify_specs: tuple[str, ...], notify_min_grade: str) -> None:
     """Crawl all open Kalshi temperature events and rank every contract.
 
     This is the universe scanner. It pulls every open event under known
@@ -285,7 +322,14 @@ def scan(city: Optional[str], limit: Optional[int], min_grade: str,
         raise click.BadParameter(f"min-grade must be one of {grade_order}")
     cutoff = grade_order.index(min_grade)
 
+    if notify_specs and not store_path:
+        raise click.BadParameter("--notify requires --store (alerts read prior grades from snapshots)")
+
     store = SnapshotStore(store_path) if store_path else None
+    dispatcher: Optional[AlertDispatcher] = None
+    if notify_specs:
+        sinks = _build_sinks(notify_specs)
+        dispatcher = AlertDispatcher(sinks=sinks, store=store, min_grade=notify_min_grade)
     scan_id: Optional[str] = None
     scanned_at: Optional[datetime] = None
 
@@ -310,6 +354,13 @@ def scan(city: Optional[str], limit: Optional[int], min_grade: str,
             if limit is not None and count >= limit:
                 break
 
+    # Dispatch alerts BEFORE recording the scan so prior-grade lookup
+    # excludes the snapshots from this run (invariant I8: alerts are
+    # state-transition functions of the store).
+    fired_alerts: list = []
+    if dispatcher is not None and persistable:
+        fired_alerts = dispatcher.dispatch(persistable, now_utc=scanned_at)
+
     if store is not None and persistable:
         scan_id = store.record_scan(
             evaluations=persistable,
@@ -319,6 +370,8 @@ def scan(city: Optional[str], limit: Optional[int], min_grade: str,
         console.print(
             f"[dim]wrote {len(persistable)} snapshots to {store_path} (scan_id={scan_id})[/dim]"
         )
+        if fired_alerts:
+            console.print(f"[bold green]fired {len(fired_alerts)} alert(s)[/bold green]")
         store.close()
 
     if as_json:
@@ -662,6 +715,72 @@ def backtest(store_path: str, min_grade: str, since: Optional[str]) -> None:
         f"[bold]N={len(results)}  hit_rate={hit_rate:.1f}%  "
         f"avg_pnl={avg_pnl:+.1f}c  total_pnl={total_pnl:+d}c[/bold]"
     )
+
+
+@main.command()
+@click.option("--store", "store_path", required=True, type=click.Path())
+@click.option("--since", default=None,
+              help="Only include snapshots scanned after this date (YYYY-MM-DD).")
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of a table.")
+def calibrate(store_path: str, since: Optional[str], as_json: bool) -> None:
+    """Realized hit-rate / P&L per grade tier from stored history.
+
+    Reads snapshots + settlements, computes per-grade statistics. This is
+    the observability slice — it tells you whether the magic-number cutoffs
+    in ranker.py are calibrated to reality. It does NOT auto-shift those
+    cutoffs (invariant I9 — V0.9 closes that loop with stable history).
+    """
+    since_dt = (
+        datetime.fromisoformat(since).replace(tzinfo=timezone.utc) if since else None
+    )
+    with SnapshotStore(store_path) as store:
+        report = run_calibrate(store, since=since_dt)
+
+    if as_json:
+        click.echo(json.dumps(report_to_dict(report), indent=2))
+        return
+
+    if not report.has_any_data():
+        console.print(
+            f"[yellow]no settled snapshots yet "
+            f"({report.total_snapshots} total snapshots stored, "
+            f"{report.settled_snapshots} settled)[/yellow]"
+        )
+        console.print(
+            "[dim]Run `kalshi-scout backfill-settlements --date YYYY-MM-DD` after CLI publishes."
+            "[/dim]"
+        )
+        return
+
+    table = Table(
+        title=f"Calibration ({report.settled_snapshots} settled of "
+              f"{report.total_snapshots} total)",
+        header_style="bold cyan",
+    )
+    table.add_column("Grade", justify="center")
+    table.add_column("N", justify="right")
+    table.add_column("Markets", justify="right")
+    table.add_column("Wins", justify="right")
+    table.add_column("Hit rate", justify="right")
+    table.add_column("Avg P&L", justify="right")
+    table.add_column("Total P&L", justify="right")
+    table.add_column("Median edge", justify="right")
+    for tier in ["A+", "A", "B+", "B", "C", "D"]:
+        s = report.stats_by_grade[tier]
+        if s.n == 0:
+            table.add_row(tier, "0", "—", "—", "—", "—", "—",
+                          f"{s.median_edge:+.2f}" if s.median_edge is not None else "—")
+            continue
+        pnl_color = "green" if s.total_pnl_c > 0 else ("red" if s.total_pnl_c < 0 else "white")
+        table.add_row(
+            tier,
+            str(s.n), str(s.n_unique_markets), str(s.wins),
+            f"{s.hit_rate * 100:.1f}%",
+            f"{s.avg_pnl_c:+.1f}c",
+            f"[{pnl_color}]{s.total_pnl_c:+d}c[/{pnl_color}]",
+            f"{s.median_edge:+.2f}" if s.median_edge is not None else "—",
+        )
+    console.print(table)
 
 
 @main.command()

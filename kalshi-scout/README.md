@@ -9,7 +9,7 @@ better than the NWS. It looks for markets where the **settlement question has
 already been answered** by the official station and the orderbook hasn't
 caught up.
 
-## What this version (V0.5 + V0.6 + V0.7) does
+## What this version (V0.5 + V0.6 + V0.7 + V0.8) does
 
 - **Crawls** every open Kalshi temperature event under known series prefixes
   (`KXHIGH*`, `KXLOW*`, `KXTEMP*`) without authentication.
@@ -57,9 +57,19 @@ caught up.
   orderbook and computes the average fill price for N contracts on the
   natural trade side, with a partial-fill flag. Confirms that A+/A edges
   are actually fillable before you act on them.
+- **Alert delivery** (V0.8): `scan --notify stdout`, `--notify jsonl:path`,
+  `--notify webhook:URL`. Alerts fire on **grade-improvement transitions**
+  detected against the snapshot store — a market's first appearance at
+  the alert grade fires once; subsequent identical grades do not. Per
+  invariant I8, alerts require `--store` so they're replayable.
+- **Calibration report** (V0.8): `kalshi-scout calibrate --store db.sqlite`
+  prints realized hit rate, average / total P&L, sample N, and median
+  edge per grade tier from stored history. **Observability only** in this
+  slice — does not auto-shift `ranker.py` cutoffs (V0.9 closes that loop
+  with stable history per invariant I9).
 
-What it deliberately does *not* do yet: trade execution, alert delivery,
-regime-shifted grade ladder (V0.8).
+What it deliberately does *not* do yet: trade execution; auto-tuned
+ranker cutoffs (V0.9); regime-shifted fair_probability (V0.9).
 
 See `AGENTS.md` for the engineering invariants every change must respect.
 
@@ -127,6 +137,29 @@ kalshi-scout backtest --store scout.db --min-grade A --since 2026-05-01
 
 # Verify a single alert is replayable (CI-friendly: exits non-zero on drift)
 kalshi-scout replay --store scout.db 42
+```
+
+### Alerts on grade-improvement transitions — V0.8
+
+```bash
+# Alert to stdout when a contract first hits grade A or better
+kalshi-scout scan --store scout.db --notify stdout --notify-min-grade A
+
+# Append every alert to a JSONL feed (great for dashboards)
+kalshi-scout scan --store scout.db --notify jsonl:./alerts.jsonl
+
+# Webhook to Slack/Discord/ntfy.sh
+kalshi-scout scan --store scout.db --notify webhook:https://hooks.slack.com/services/...
+
+# Multiple sinks at once
+kalshi-scout scan --store scout.db \
+    --notify stdout \
+    --notify jsonl:./alerts.jsonl \
+    --notify webhook:https://example.com/scout
+
+# Realized stats per grade — observability for the magic-number cutoffs
+kalshi-scout calibrate --store scout.db
+kalshi-scout calibrate --store scout.db --since 2026-05-01 --json
 ```
 
 ### `cities` — what the scout settles against
@@ -213,20 +246,20 @@ trade.
 
 ## Roadmap
 
-Current: **V0.7 + V0.5 + V0.6** — universe scanner, settlement-source
+Current: **V0.8 (+ V0.3 → V0.7)** — universe scanner, settlement-source
 resolver, cross-bracket coherence, snapshot store, backtester, replay
-verifier, regime classifier, orderbook depth. Next:
+verifier, regime classifier, orderbook depth, alert delivery, calibration
+report. Next:
 
-- **V0.8** alert delivery + backtest-tuned grade thresholds: webhook / push
-  when a contract transitions into A+/A; replace the magic-number grade
-  cutoffs in `ranker.py` with values calibrated against stored history.
-  Activates deferred invariant D3. Also threads `regime` into a calibrated
-  fair-probability adjustment.
+- **V0.9** auto-tuned ranker + regime-shifted fair_probability: once stored
+  history is statistically meaningful, replace the magic-number cutoffs in
+  `ranker.py` with calibration-derived values, and thread each regime's
+  observed bias into `fair_probability`. Activates deferred invariant D3.
 
 ## Testing
 
 ```bash
-pytest                              # 93 tests, all offline
+pytest                              # 114 tests, all offline
 ```
 
 The state machine, ranker, parser, resolver, coherence pass, snapshot
