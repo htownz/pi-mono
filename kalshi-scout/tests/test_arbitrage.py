@@ -14,6 +14,7 @@ and the >2-bracket eligibility check.
 
 from kalshi_scout.arbitrage import (
     compute_event_arbitrage,
+    is_mutually_exclusive_event,
     rank_arbitrage_opportunities,
 )
 from kalshi_scout.models import KalshiEvent, KalshiMarket
@@ -192,7 +193,8 @@ def test_ranking_skips_non_mex_events_by_default():
         event_ticker="KXARTISTSTREAMSY-BEY26DEC31",
         series_ticker="KXARTISTSTREAMSY",
     )
-    # Without gating, this would show Σ yes_bids = 2340c >> 100c — fake +1880c edge.
+    # Without gating: Σ yes_bids = 2340c. no_basket gross = 2240c, fees = 30 × 2c = 60c,
+    # net = +2180c — a fake huge "arb" from a non-mutually-exclusive event.
     ranked = rank_arbitrage_opportunities([fake_arb])
     assert ranked == []
 
@@ -224,7 +226,6 @@ def test_require_mex_false_bypasses_gate_for_diagnostics():
 def test_mex_detection_derives_series_from_event_ticker():
     """Even if series_ticker is empty, derive it from the event_ticker
     prefix so weather events still pass the gate."""
-    from kalshi_scout.arbitrage import is_mutually_exclusive_event
     e = KalshiEvent(
         event_ticker="KXHIGHHOU-26MAY29", series_ticker="",
         title="", sub_title="", markets=[],

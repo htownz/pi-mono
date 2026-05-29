@@ -1183,12 +1183,16 @@ def arbitrage(fee_per_leg: int, min_edge: int, min_brackets: int,
     one-shot scan; it does not persist to the snapshot store. Wire into
     cron / `serve` once the math is validated against real prices.
     """
-    console.print(
+    # When --json is on, route human diagnostics (progress, warnings) to
+    # stderr so stdout stays a parseable JSON document for `| jq` consumers.
+    diag = Console(stderr=True) if as_json else console
+
+    diag.print(
         f"[dim]scanning all open Kalshi events "
         f"(fee={fee_per_leg}c/leg, min_edge={min_edge}c, min_brackets={min_brackets})...[/dim]"
     )
     def _progress(markets_seen: int, events_seen: int) -> None:
-        console.print(f"[dim]  {markets_seen} markets, {events_seen} events grouped...[/dim]")
+        diag.print(f"[dim]  {markets_seen} markets, {events_seen} events grouped...[/dim]")
 
     with KalshiClient() as kclient:
         events = list(iter_all_open_events(
@@ -1196,12 +1200,12 @@ def arbitrage(fee_per_leg: int, min_edge: int, min_brackets: int,
             on_progress=_progress, max_markets=max_markets,
         ))
 
-    console.print(f"[dim]{len(events)} multi-bracket events meet the bracket threshold[/dim]")
+    diag.print(f"[dim]{len(events)} multi-bracket events meet the bracket threshold[/dim]")
 
     if all_events:
-        console.print(
-            "[bold red]⚠ --all-events ON — most hits below are FALSE POSITIVES "
-            "from non-mutually-exclusive events. Do NOT trade.[/bold red]"
+        diag.print(
+            "[bold red]WARNING: --all-events ON — most hits below are FALSE "
+            "POSITIVES from non-mutually-exclusive events. Do NOT trade.[/bold red]"
         )
     arbs = rank_arbitrage_opportunities(
         events, fee_per_leg_cents=fee_per_leg, min_net_edge_cents=min_edge,
