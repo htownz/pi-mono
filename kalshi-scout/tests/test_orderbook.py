@@ -56,6 +56,60 @@ def test_parse_orderbook_sorts_bids_descending():
     assert [l.price_cents for l in book.no_bids] == [35, 25]
 
 
+# -- 2026 Kalshi schema (orderbook_fp + dollar strings) ----------------------
+
+def test_parse_orderbook_new_dollars_schema():
+    """The actual /markets/{ticker}/orderbook response shape from May 2026."""
+    raw = {
+        "orderbook_fp": {
+            "yes_dollars": [["0.0100", "275.00"], ["0.0800", "0.32"]],
+            "no_dollars":  [["0.0100", "460.00"], ["0.9100", "17.00"]],
+        }
+    }
+    book = parse_orderbook(raw, market_ticker="KXHIGHTHOU-26MAY29-B94.5")
+    # Yes bids: 1c and 8c. Highest first.
+    assert [(l.price_cents, l.size_contracts) for l in book.yes_bids] == [
+        (8, 0), (1, 275),
+    ] or [(l.price_cents, l.size_contracts) for l in book.yes_bids] == [
+        # Tolerate either rounding strategy for 0.32 -> 0 vs filter.
+        (1, 275),
+    ]
+    # No bids highest = 91c, which derives Yes ask of 9c.
+    assert book.no_bids[0].price_cents == 91
+    assert book.no_bids[0].size_contracts == 17
+    assert book.top_ask("yes") == 9  # 100 - 91
+
+
+def test_parse_orderbook_filters_fractional_sub_one_size():
+    """Sub-1 fractional size (0.32) rounds to 0 and is filtered out."""
+    raw = {
+        "orderbook_fp": {
+            "yes_dollars": [["0.0800", "0.32"]],
+            "no_dollars":  [],
+        }
+    }
+    book = parse_orderbook(raw)
+    assert len(book.yes_bids) == 0  # 0.32 -> 0, filtered
+
+
+def test_parse_orderbook_walker_works_on_new_schema():
+    """The book walker (used for fill quality) must work on the new shape."""
+    raw = {
+        "orderbook_fp": {
+            "yes_dollars": [],
+            "no_dollars":  [["0.9100", "17.00"], ["0.9000", "100.00"]],
+        }
+    }
+    book = parse_orderbook(raw)
+    # Yes asks derived: 100-90=10c (100 contracts), 100-91=9c (17 contracts).
+    # Buy 50 yes: 17 @ 9c + 33 @ 10c = 153 + 330 = 483c / 50 = 9.66c avg.
+    quote = book.fillable_at_size("yes", 50)
+    assert quote is not None
+    assert quote.filled_size == 50
+    assert quote.partial is False
+    assert abs(quote.avg_price_cents - 9.66) < 0.01
+
+
 # -- Derived asks ------------------------------------------------------------
 
 def test_yes_ask_derived_from_no_bid_ascending():

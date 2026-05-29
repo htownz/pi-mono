@@ -121,40 +121,56 @@ class FillQuote:
 def parse_orderbook(raw: dict, market_ticker: str = "") -> Orderbook:
     """Parse Kalshi /orderbook response into a typed Orderbook.
 
-    Kalshi's response shape:
-        {
-          "orderbook": {
-            "yes": [[price_cents, contracts], ...],   # bids
-            "no":  [[price_cents, contracts], ...]    # bids
-          }
-        }
+    Handles two response shapes:
 
-    Some responses wrap differently; we accept either the wrapped or
-    unwrapped form.
+      New (2026 schema, `_fp`/`_dollars` suffixes):
+        {"orderbook_fp": {"yes_dollars": [["0.0100", "275.00"], ...],
+                          "no_dollars":  [["0.0100", "460.00"], ...]}}
+        Prices are strings in dollars, sizes can be fractional strings.
+
+      Legacy:
+        {"orderbook": {"yes": [[price_cents, contracts], ...],
+                       "no":  [[price_cents, contracts], ...]}}
+
+    Either way, the `yes` list is yes BIDS (Yes asks derived as 100-no_bid),
+    and `no` is no BIDS. Levels with non-positive size or out-of-range
+    prices are filtered out.
     """
-    book = raw.get("orderbook") if isinstance(raw, dict) and "orderbook" in raw else raw
+    if not isinstance(raw, dict):
+        return Orderbook(market_ticker=market_ticker, yes_bids=(), no_bids=())
+
+    # Detect shape: prefer the new _fp wrapper, then the legacy wrapper,
+    # then assume the dict itself is the book.
+    book = raw.get("orderbook_fp") or raw.get("orderbook") or raw
     if not isinstance(book, dict):
         return Orderbook(market_ticker=market_ticker, yes_bids=(), no_bids=())
 
-    def _levels(side_key: str) -> tuple[OrderbookLevel, ...]:
-        raw_levels = book.get(side_key) or []
+    def _levels(legacy_key: str, dollars_key: str) -> tuple[OrderbookLevel, ...]:
+        use_dollars = dollars_key in book
+        raw_levels = book.get(dollars_key) if use_dollars else book.get(legacy_key)
+        raw_levels = raw_levels or []
         out: list[OrderbookLevel] = []
         for item in raw_levels:
-            if isinstance(item, (list, tuple)) and len(item) >= 2:
-                try:
+            if not (isinstance(item, (list, tuple)) and len(item) >= 2):
+                continue
+            try:
+                if use_dollars:
+                    price = int(round(float(item[0]) * 100))
+                    size = int(round(float(item[1])))
+                else:
                     price = int(item[0])
                     size = int(item[1])
-                except (TypeError, ValueError):
-                    continue
-                if size <= 0 or price <= 0 or price >= 100:
-                    continue
-                out.append(OrderbookLevel(price_cents=price, size_contracts=size))
-        # Sort bids descending (most aggressive / highest price first).
+            except (TypeError, ValueError):
+                continue
+            if size <= 0 or price <= 0 or price >= 100:
+                continue
+            out.append(OrderbookLevel(price_cents=price, size_contracts=size))
+        # Bids descending (most aggressive / highest price first).
         out.sort(key=lambda x: x.price_cents, reverse=True)
         return tuple(out)
 
     return Orderbook(
         market_ticker=market_ticker,
-        yes_bids=_levels("yes"),
-        no_bids=_levels("no"),
+        yes_bids=_levels("yes", "yes_dollars"),
+        no_bids=_levels("no", "no_dollars"),
     )

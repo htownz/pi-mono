@@ -34,6 +34,49 @@ def _parse_dt(value: Optional[str]) -> Optional[datetime]:
         return None
 
 
+def _dollars_to_cents(s) -> Optional[int]:
+    """Kalshi 2026 schema: prices come as strings in dollars, e.g. "0.0900".
+
+    Returns the integer cent equivalent (9), or None when the field is
+    missing or unparseable.
+    """
+    if s is None or s == "":
+        return None
+    try:
+        return int(round(float(s) * 100))
+    except (TypeError, ValueError):
+        return None
+
+
+def _price_field(d: dict, dollars_key: str, cents_key: str) -> Optional[int]:
+    """Read a price from either the new _dollars key or the legacy cents key."""
+    if dollars_key in d and d[dollars_key] is not None:
+        return _dollars_to_cents(d[dollars_key])
+    val = d.get(cents_key)
+    if val is None:
+        return None
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _int_field(d: dict, fp_key: str, int_key: str, default: int = 0) -> int:
+    """Read an integer that might come as fractional-float string or int."""
+    if fp_key in d and d[fp_key] is not None:
+        try:
+            return int(float(d[fp_key]))
+        except (TypeError, ValueError):
+            return default
+    val = d.get(int_key)
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return default
+
+
 def _market_from_dict(d: dict) -> KalshiMarket:
     return KalshiMarket(
         ticker=d["ticker"],
@@ -42,13 +85,13 @@ def _market_from_dict(d: dict) -> KalshiMarket:
         yes_sub_title=d.get("yes_sub_title", ""),
         status=d.get("status", ""),
         close_time=_parse_dt(d.get("close_time")),
-        yes_bid=d.get("yes_bid"),
-        yes_ask=d.get("yes_ask"),
-        no_bid=d.get("no_bid"),
-        no_ask=d.get("no_ask"),
-        last_price=d.get("last_price"),
-        volume=int(d.get("volume") or 0),
-        open_interest=int(d.get("open_interest") or 0),
+        yes_bid=_price_field(d, "yes_bid_dollars", "yes_bid"),
+        yes_ask=_price_field(d, "yes_ask_dollars", "yes_ask"),
+        no_bid=_price_field(d, "no_bid_dollars", "no_bid"),
+        no_ask=_price_field(d, "no_ask_dollars", "no_ask"),
+        last_price=_price_field(d, "last_price_dollars", "last_price"),
+        volume=_int_field(d, "volume_fp", "volume"),
+        open_interest=_int_field(d, "open_interest_fp", "open_interest"),
         raw=d,
     )
 
@@ -289,20 +332,36 @@ def derive_series_from_event_ticker(event_ticker: str) -> Optional[str]:
 
 
 def iter_temperature_events(client: KalshiClient, status: str = "open") -> Iterator[KalshiEvent]:
-    """Yield all currently-open Kalshi temperature events.
+    """Yield all currently-open Kalshi temperature events grouped from /markets.
 
-    Iterates the hardcoded TEMPERATURE_SERIES list and queries /events once
-    per series ticker. Kalshi's `series_ticker` query param is an exact
-    match, not a prefix — verified empirically: prefix queries return [].
+    We use /markets — not /events with nested markets — because Kalshi's
+    /events response returns simplified market objects without live prices
+    or `rules_primary`. The /markets endpoint returns the full market
+    schema (yes_ask_dollars, yes_bid_dollars, volume_fp, rules_primary, etc.).
+
+    Groups results by event_ticker. Series query is exact-match per
+    TEMPERATURE_SERIES entry.
     """
-    seen: set[str] = set()
+    seen_events: dict[str, KalshiEvent] = {}
+    order: list[str] = []
     for series_ticker in TEMPERATURE_SERIES:
         try:
-            for event in client.iter_events(series_ticker=series_ticker, status=status):
-                if event.event_ticker in seen:
+            for market in client.iter_markets(series_ticker=series_ticker, status=status):
+                event_ticker = market.event_ticker
+                if not event_ticker:
                     continue
-                seen.add(event.event_ticker)
-                yield event
+                if event_ticker not in seen_events:
+                    seen_events[event_ticker] = KalshiEvent(
+                        event_ticker=event_ticker,
+                        series_ticker=series_ticker,
+                        title="",
+                        sub_title="",
+                        markets=[],
+                    )
+                    order.append(event_ticker)
+                seen_events[event_ticker].markets.append(market)
         except httpx.HTTPStatusError:
             # Some historical series may have been retired; skip and continue.
             continue
+    for event_ticker in order:
+        yield seen_events[event_ticker]
