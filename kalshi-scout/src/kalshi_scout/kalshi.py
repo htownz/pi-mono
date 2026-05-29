@@ -334,6 +334,7 @@ def derive_series_from_event_ticker(event_ticker: str) -> Optional[str]:
 def iter_all_open_events(
     client: KalshiClient,
     min_brackets: int = 2,
+    on_progress=None,
 ) -> Iterator[KalshiEvent]:
     """Yield every open Kalshi event with `min_brackets` or more markets,
     regardless of category.
@@ -344,10 +345,19 @@ def iter_all_open_events(
 
     Pages through /markets without a series filter. With Kalshi's ~thousands
     of open markets this is ~15-25 pages = a 30-second pass.
+
+    `on_progress(markets_seen, events_seen)` is invoked every 200 markets
+    (one /markets page boundary) so a slow scan looks alive to the caller.
     """
     seen: dict[str, KalshiEvent] = {}
     order: list[str] = []
+    market_count = 0
+    last_progress_at = 0
     for market in client.iter_markets(status="open"):
+        market_count += 1
+        if on_progress is not None and market_count - last_progress_at >= 200:
+            on_progress(market_count, len(seen))
+            last_progress_at = market_count
         event_ticker = market.event_ticker
         if not event_ticker:
             continue
@@ -361,6 +371,8 @@ def iter_all_open_events(
             )
             order.append(event_ticker)
         seen[event_ticker].markets.append(market)
+    if on_progress is not None and market_count > last_progress_at:
+        on_progress(market_count, len(seen))
     for event_ticker in order:
         event = seen[event_ticker]
         if len(event.markets) >= min_brackets:

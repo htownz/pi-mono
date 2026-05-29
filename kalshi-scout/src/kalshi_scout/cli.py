@@ -1180,10 +1180,15 @@ def arbitrage(fee_per_leg: int, min_edge: int, min_brackets: int,
         f"[dim]scanning all open Kalshi events "
         f"(fee={fee_per_leg}c/leg, min_edge={min_edge}c, min_brackets={min_brackets})...[/dim]"
     )
-    with KalshiClient() as kclient:
-        events = list(iter_all_open_events(kclient, min_brackets=min_brackets))
+    def _progress(markets_seen: int, events_seen: int) -> None:
+        console.print(f"[dim]  {markets_seen} markets, {events_seen} events grouped...[/dim]")
 
-    console.print(f"[dim]{len(events)} multi-bracket events found[/dim]")
+    with KalshiClient() as kclient:
+        events = list(iter_all_open_events(
+            kclient, min_brackets=min_brackets, on_progress=_progress,
+        ))
+
+    console.print(f"[dim]{len(events)} multi-bracket events meet the bracket threshold[/dim]")
 
     arbs = rank_arbitrage_opportunities(
         events, fee_per_leg_cents=fee_per_leg, min_net_edge_cents=min_edge,
