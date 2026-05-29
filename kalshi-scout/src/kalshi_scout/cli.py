@@ -1163,9 +1163,14 @@ def risk(store_path: str, as_json: bool) -> None:
               help="Show top N opportunities.")
 @click.option("--max-markets", type=int, default=None,
               help="Stop crawling after this many markets (for fast partial scans).")
+@click.option("--all-events", "all_events", is_flag=True,
+              help="Diagnostic: include events whose brackets aren't verified "
+                   "mutually exclusive. Most hits will be FALSE POSITIVES. "
+                   "Do not trade off this output.")
 @click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of a table.")
 def arbitrage(fee_per_leg: int, min_edge: int, min_brackets: int,
-              limit: int, max_markets: Optional[int], as_json: bool) -> None:
+              limit: int, max_markets: Optional[int],
+              all_events: bool, as_json: bool) -> None:
     """Cross-bracket arbitrage scan across ALL open Kalshi events.
 
     Category-agnostic — works on weather, sports, politics, econ data, etc.
@@ -1193,8 +1198,14 @@ def arbitrage(fee_per_leg: int, min_edge: int, min_brackets: int,
 
     console.print(f"[dim]{len(events)} multi-bracket events meet the bracket threshold[/dim]")
 
+    if all_events:
+        console.print(
+            "[bold red]⚠ --all-events ON — most hits below are FALSE POSITIVES "
+            "from non-mutually-exclusive events. Do NOT trade.[/bold red]"
+        )
     arbs = rank_arbitrage_opportunities(
         events, fee_per_leg_cents=fee_per_leg, min_net_edge_cents=min_edge,
+        require_mex=not all_events,
     )
 
     if as_json:
