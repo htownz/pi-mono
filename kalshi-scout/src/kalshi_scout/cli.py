@@ -1161,9 +1161,11 @@ def risk(store_path: str, as_json: bool) -> None:
               help="Skip events with fewer than this many brackets (default 3).")
 @click.option("--limit", type=int, default=50,
               help="Show top N opportunities.")
+@click.option("--max-markets", type=int, default=None,
+              help="Stop crawling after this many markets (for fast partial scans).")
 @click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of a table.")
 def arbitrage(fee_per_leg: int, min_edge: int, min_brackets: int,
-              limit: int, as_json: bool) -> None:
+              limit: int, max_markets: Optional[int], as_json: bool) -> None:
     """Cross-bracket arbitrage scan across ALL open Kalshi events.
 
     Category-agnostic — works on weather, sports, politics, econ data, etc.
@@ -1185,7 +1187,8 @@ def arbitrage(fee_per_leg: int, min_edge: int, min_brackets: int,
 
     with KalshiClient() as kclient:
         events = list(iter_all_open_events(
-            kclient, min_brackets=min_brackets, on_progress=_progress,
+            kclient, min_brackets=min_brackets,
+            on_progress=_progress, max_markets=max_markets,
         ))
 
     console.print(f"[dim]{len(events)} multi-bracket events meet the bracket threshold[/dim]")

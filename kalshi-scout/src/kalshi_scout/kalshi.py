@@ -10,6 +10,7 @@ non-empty `cursor` string when more pages exist.
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 from typing import Iterator, Optional
 
@@ -108,19 +109,33 @@ def _event_from_dict(d: dict) -> KalshiEvent:
 
 
 class KalshiClient:
-    """Thin synchronous client over the public Kalshi REST API."""
+    """Thin synchronous client over the public Kalshi REST API.
+
+    Includes preemptive pacing (default 200ms between requests) and
+    automatic retry on HTTP 429 with honored Retry-After.
+    """
+
+    # Per-request pacing — Kalshi rate-limits unauthenticated calls
+    # aggressively. 200ms = ~5 req/sec, which seems to be under the wire.
+    DEFAULT_PACE_SECONDS = 0.2
+
+    # Backoff schedule for 429 retries (seconds).
+    DEFAULT_BACKOFFS = (2.0, 5.0, 15.0, 30.0)
 
     def __init__(
         self,
         base_url: str = DEFAULT_BASE_URL,
         timeout: httpx.Timeout = DEFAULT_TIMEOUT,
         client: Optional[httpx.Client] = None,
+        pace_seconds: float = DEFAULT_PACE_SECONDS,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self._client = client or httpx.Client(
             timeout=timeout,
             headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
         )
+        self.pace_seconds = pace_seconds
+        self._last_request_at: float = 0.0
 
     def close(self) -> None:
         self._client.close()
@@ -132,9 +147,30 @@ class KalshiClient:
         self.close()
 
     def _get(self, path: str, params: Optional[dict] = None) -> dict:
-        resp = self._client.get(f"{self.base_url}{path}", params=params)
-        resp.raise_for_status()
-        return resp.json()
+        url = f"{self.base_url}{path}"
+        for backoff in (*self.DEFAULT_BACKOFFS, None):
+            # Preemptive pacing: ensure at least pace_seconds elapsed since
+            # the previous request before firing the next one.
+            now = time.monotonic()
+            elapsed = now - self._last_request_at
+            if elapsed < self.pace_seconds:
+                time.sleep(self.pace_seconds - elapsed)
+            self._last_request_at = time.monotonic()
+
+            resp = self._client.get(url, params=params)
+            if resp.status_code == 429 and backoff is not None:
+                # Honor Retry-After if Kalshi sent it; else fall back to schedule.
+                retry_after = resp.headers.get("Retry-After")
+                try:
+                    sleep_s = float(retry_after) if retry_after else backoff
+                except ValueError:
+                    sleep_s = backoff
+                time.sleep(max(sleep_s, backoff))
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        # Should be unreachable — the loop either returns or raises.
+        raise RuntimeError("Kalshi 429 retry budget exhausted")
 
     # -- Series / events / markets -------------------------------------------------
 
@@ -335,6 +371,7 @@ def iter_all_open_events(
     client: KalshiClient,
     min_brackets: int = 2,
     on_progress=None,
+    max_markets: Optional[int] = None,
 ) -> Iterator[KalshiEvent]:
     """Yield every open Kalshi event with `min_brackets` or more markets,
     regardless of category.
@@ -371,6 +408,8 @@ def iter_all_open_events(
             )
             order.append(event_ticker)
         seen[event_ticker].markets.append(market)
+        if max_markets is not None and market_count >= max_markets:
+            break
     if on_progress is not None and market_count > last_progress_at:
         on_progress(market_count, len(seen))
     for event_ticker in order:
