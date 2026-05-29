@@ -15,10 +15,11 @@ import click
 from rich.console import Console
 from rich.table import Table
 
+from kalshi_scout.arbitrage import rank_arbitrage_opportunities
 from kalshi_scout.coherence import enforce_coherence
 from kalshi_scout.calibrate import calibrate as run_calibrate, report_to_dict
 from kalshi_scout.config import RankerConfig
-from kalshi_scout.kalshi import KalshiClient, iter_temperature_events
+from kalshi_scout.kalshi import KalshiClient, iter_all_open_events, iter_temperature_events
 from kalshi_scout.models import (
     Bracket,
     BracketKind,
@@ -1149,6 +1150,101 @@ def risk(store_path: str, as_json: bool) -> None:
                 f"${b.total_max_loss_dollars:.2f}",
             )
         console.print(t)
+
+
+@main.command()
+@click.option("--fee-per-leg", type=int, default=2,
+              help="Estimated Kalshi fee per leg in cents (default 2c).")
+@click.option("--min-edge", type=int, default=1,
+              help="Minimum net edge in cents after fees (default 1).")
+@click.option("--min-brackets", type=int, default=3,
+              help="Skip events with fewer than this many brackets (default 3).")
+@click.option("--limit", type=int, default=50,
+              help="Show top N opportunities.")
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of a table.")
+def arbitrage(fee_per_leg: int, min_edge: int, min_brackets: int,
+              limit: int, as_json: bool) -> None:
+    """Cross-bracket arbitrage scan across ALL open Kalshi events.
+
+    Category-agnostic — works on weather, sports, politics, econ data, etc.
+    For each event with mutually-exclusive brackets, computes:
+
+      Yes-basket arb: profit = 100 - Σ yes_asks - N × fee_per_leg
+      No-basket arb:  profit = Σ yes_bids - 100 - N × fee_per_leg
+
+    Ranks events by net edge (after fees) and shows the top N. This is a
+    one-shot scan; it does not persist to the snapshot store. Wire into
+    cron / `serve` once the math is validated against real prices.
+    """
+    console.print(
+        f"[dim]scanning all open Kalshi events "
+        f"(fee={fee_per_leg}c/leg, min_edge={min_edge}c, min_brackets={min_brackets})...[/dim]"
+    )
+    with KalshiClient() as kclient:
+        events = list(iter_all_open_events(kclient, min_brackets=min_brackets))
+
+    console.print(f"[dim]{len(events)} multi-bracket events found[/dim]")
+
+    arbs = rank_arbitrage_opportunities(
+        events, fee_per_leg_cents=fee_per_leg, min_net_edge_cents=min_edge,
+    )
+
+    if as_json:
+        click.echo(json.dumps(
+            [
+                {
+                    "event_ticker": a.event_ticker,
+                    "n_brackets": a.n_brackets,
+                    "n_priced": a.n_priced_brackets,
+                    "sum_yes_asks_cents": a.sum_yes_asks_cents,
+                    "sum_yes_bids_cents": a.sum_yes_bids_cents,
+                    "best_side": a.best_side,
+                    "best_net_edge_cents": a.best_net_edge_cents,
+                    "fee_per_leg_cents": a.fee_per_leg_cents,
+                    "market_tickers": list(a.market_tickers),
+                    "notes": list(a.notes),
+                }
+                for a in arbs[:limit]
+            ],
+            indent=2,
+        ))
+        return
+
+    if not arbs:
+        console.print("[yellow]no arbitrage opportunities above threshold[/yellow]")
+        console.print("[dim]try lowering --min-edge or --fee-per-leg[/dim]")
+        return
+
+    table = Table(
+        title=f"Cross-bracket arbitrage (top {min(limit, len(arbs))} of {len(arbs)}; "
+              f"edge ≥ {min_edge}c after {fee_per_leg}c/leg fees)",
+        header_style="bold cyan",
+    )
+    table.add_column("Event")
+    table.add_column("N", justify="right")
+    table.add_column("Priced", justify="right")
+    table.add_column("Σ yes_ask", justify="right")
+    table.add_column("Σ yes_bid", justify="right")
+    table.add_column("Side", justify="center")
+    table.add_column("Net edge", justify="right")
+    for a in arbs[:limit]:
+        sum_asks_s = f"{a.sum_yes_asks_cents}c" if a.sum_yes_asks_cents is not None else "—"
+        sum_bids_s = f"{a.sum_yes_bids_cents}c" if a.sum_yes_bids_cents is not None else "—"
+        edge_color = "green" if (a.best_net_edge_cents or 0) >= 3 else "yellow"
+        table.add_row(
+            a.event_ticker,
+            str(a.n_brackets),
+            f"{a.n_priced_brackets}/{a.n_brackets}",
+            sum_asks_s,
+            sum_bids_s,
+            (a.best_side or "—").upper(),
+            f"[bold {edge_color}]+{a.best_net_edge_cents}c[/bold {edge_color}]",
+        )
+    console.print(table)
+    console.print(
+        f"[dim]To act: buy 1 contract on every bracket of the chosen event "
+        f"on the SIDE column. Profit = {{Net edge}} × basket_size.[/dim]"
+    )
 
 
 if __name__ == "__main__":

@@ -331,6 +331,42 @@ def derive_series_from_event_ticker(event_ticker: str) -> Optional[str]:
     return event_ticker.split("-", 1)[0].upper()
 
 
+def iter_all_open_events(
+    client: KalshiClient,
+    min_brackets: int = 2,
+) -> Iterator[KalshiEvent]:
+    """Yield every open Kalshi event with `min_brackets` or more markets,
+    regardless of category.
+
+    For arbitrage scanning across the full exchange. Single-market events
+    are skipped because Yes+No on one contract always sums to 100 by
+    construction (no cross-bracket arb possible).
+
+    Pages through /markets without a series filter. With Kalshi's ~thousands
+    of open markets this is ~15-25 pages = a 30-second pass.
+    """
+    seen: dict[str, KalshiEvent] = {}
+    order: list[str] = []
+    for market in client.iter_markets(status="open"):
+        event_ticker = market.event_ticker
+        if not event_ticker:
+            continue
+        if event_ticker not in seen:
+            seen[event_ticker] = KalshiEvent(
+                event_ticker=event_ticker,
+                series_ticker="",
+                title="",
+                sub_title="",
+                markets=[],
+            )
+            order.append(event_ticker)
+        seen[event_ticker].markets.append(market)
+    for event_ticker in order:
+        event = seen[event_ticker]
+        if len(event.markets) >= min_brackets:
+            yield event
+
+
 def iter_temperature_events(client: KalshiClient, status: str = "open") -> Iterator[KalshiEvent]:
     """Yield all currently-open Kalshi temperature events grouped from /markets.
 
