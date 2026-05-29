@@ -1,0 +1,52 @@
+# fly.io deployment for the scout daemon + dashboard.
+#
+# Init: fly launch --no-deploy --copy-config
+# Volume: fly volumes create scout_data --size 1 --region <region>
+# Deploy: fly deploy
+#
+# The single VM runs both processes via a tiny supervisor — fly's free
+# tier gives us 256 MB which is plenty for SQLite + uvicorn + the daemon.
+
+app = "kalshi-scout"
+primary_region = "iad"  # change to your nearest region
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PYTHONUNBUFFERED = "1"
+
+[[mounts]]
+  source = "scout_data"
+  destination = "/data"
+
+# Run the dashboard as the foregrounded process so HTTP healthchecks work.
+# The scout daemon runs as a sidecar via processes below.
+[processes]
+  scout = "kalshi-scout serve --store /data/scout.db --interval 300 --min-grade C --notify stdout --notify jsonl:/data/alerts.jsonl --notify-min-grade A"
+  web = "kalshi-scout dashboard --store /data/scout.db --host 0.0.0.0 --port 8080"
+
+[[services]]
+  internal_port = 8080
+  protocol = "tcp"
+  processes = ["web"]
+
+  [[services.ports]]
+    handlers = ["http"]
+    port = 80
+    force_https = true
+
+  [[services.ports]]
+    handlers = ["tls", "http"]
+    port = 443
+
+  [services.concurrency]
+    type = "connections"
+    hard_limit = 25
+    soft_limit = 20
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 256
+  processes = ["scout", "web"]

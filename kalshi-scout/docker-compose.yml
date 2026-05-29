@@ -1,0 +1,44 @@
+# Two services share a /data volume:
+#   scout      — the scanner daemon (writes snapshots + alerts)
+#   dashboard  — the read-only FastAPI dashboard on :8080
+#
+# Run locally: `docker compose up -d`
+# Set WEBHOOK_URL in .env for Slack/Discord/ntfy alerts.
+
+services:
+  scout:
+    build: .
+    image: kalshi-scout:latest
+    container_name: kalshi-scout
+    restart: unless-stopped
+    volumes:
+      - scout-data:/data
+    command:
+      - serve
+      - --store=/data/scout.db
+      - --interval=300
+      - --min-grade=C
+      - --notify=stdout
+      - --notify=jsonl:/data/alerts.jsonl
+      - --notify-min-grade=A
+    environment:
+      - PYTHONUNBUFFERED=1
+
+  dashboard:
+    image: kalshi-scout:latest
+    container_name: kalshi-scout-dashboard
+    restart: unless-stopped
+    depends_on:
+      - scout
+    ports:
+      - "8080:8080"
+    volumes:
+      - scout-data:/data
+    command:
+      - dashboard
+      - --store=/data/scout.db
+      - --host=0.0.0.0
+      - --port=8080
+
+volumes:
+  scout-data:
