@@ -2,26 +2,30 @@
 
 Two information sources, used together:
 
-  1. Ticker shape, e.g. "KXHIGHHOUSTON-26MAY27-B79-80" or "KXLOWNYC-26MAY28-T70"
-     - Series prefix tells us metric (HIGH vs LOW) and city slug.
-     - Date token gives us the local-time market date (the city's local timezone).
-     - Final suffix gives us the bracket: T<n> = threshold, B<lo>-<hi> = between.
+  1. The event_ticker's series prefix (e.g. "KXHIGHHOU" from
+     "KXHIGHHOU-26MAY28"). Looked up in `kalshi.TEMPERATURE_SERIES` to get
+     the (metric, city_slug) pair. Kalshi's naming is too inconsistent to
+     regex (HOU/HOUSTON/NY/NYC/LV/etc.); the hardcoded map is the truth.
 
   2. `yes_sub_title`, e.g. "79° to 80°" / "78° or below" / "85° or above".
-     - Used to disambiguate T<n> tickers (above vs below) since the suffix
-       alone doesn't reveal direction.
+     Used for the bracket. Six operator forms map to BracketKind per the
+     GLOBALTEMPERATURE rulebook (see config.StateThresholds).
 
-We deliberately do not try to parse arbitrary event titles. If neither source
-fits, the parser returns None and the universe scanner skips the market —
-better silent skip than wrong settlement guess.
+The market_date comes from the date token in the event_ticker
+(e.g. "26MAY28" in "KXHIGHHOU-26MAY28").
+
+If the series isn't in TEMPERATURE_SERIES, or the bracket can't be parsed,
+or the date can't be parsed, we return None — silent skip beats wrong
+settlement (invariant I5).
 """
 
 from __future__ import annotations
 
 import re
-from datetime import date, datetime
+from datetime import date
 from typing import Optional
 
+from kalshi_scout.kalshi import TEMPERATURE_SERIES, derive_series_from_event_ticker
 from kalshi_scout.models import (
     Bracket,
     BracketKind,
@@ -30,18 +34,7 @@ from kalshi_scout.models import (
     ParsedContract,
 )
 
-_TICKER_RE = re.compile(
-    r"""^
-    KX(?P<metric>HIGH|LOW|TEMP)         # metric prefix
-    (?P<city>[A-Z]+)                    # city slug
-    -
-    (?P<datetok>\d{2}[A-Z]{3}\d{1,2})   # e.g. 26MAY27
-    -
-    (?P<suffix>.+)$
-    """,
-    re.VERBOSE,
-)
-
+_DATE_TOKEN_RE = re.compile(r"^(\d{2})([A-Z]{3})(\d{1,2})$")
 _BETWEEN_SUFFIX = re.compile(r"^B(?P<lo>\d+(?:\.\d+)?)-(?P<hi>\d+(?:\.\d+)?)$")
 _THRESHOLD_SUFFIX = re.compile(r"^T(?P<t>\d+(?:\.\d+)?)$")
 
@@ -81,25 +74,6 @@ _EQ_TITLE = re.compile(
     rf"exactly\s+(?P<t>-?\d+(?:\.\d+)?){_DEGREE}",
     re.IGNORECASE,
 )
-
-
-def _parse_date_token(tok: str) -> Optional[date]:
-    # "26MAY27" -> 2026-05-27
-    if len(tok) < 6:
-        return None
-    try:
-        yy = int(tok[:2])
-        mon = tok[2:5]
-        day = int(tok[5:])
-    except ValueError:
-        return None
-    if mon not in _MONTHS:
-        return None
-    year = 2000 + yy
-    try:
-        return date(year, _MONTHS[mon], day)
-    except ValueError:
-        return None
 
 
 def _bracket_from_title(yes_sub_title: str) -> Optional[Bracket]:
@@ -165,42 +139,62 @@ def _bracket_from_suffix(suffix: str, yes_sub_title: str) -> Optional[Bracket]:
 
 
 def parse_market(market: KalshiMarket) -> Optional[ParsedContract]:
-    """Return a ParsedContract or None if the ticker isn't a recognized temp market."""
-    ticker = market.ticker.upper()
-    m = _TICKER_RE.match(ticker)
-    if not m:
+    """Return a ParsedContract or None if the market isn't a recognized temp market.
+
+    Lookup chain:
+      1. Derive series_ticker from event_ticker (split on '-' once).
+      2. Look up TEMPERATURE_SERIES[series_ticker] -> (metric, city_slug).
+      3. Parse date token from event_ticker (second '-' segment).
+      4. Parse bracket from market ticker suffix and yes_sub_title.
+    """
+    series_ticker = derive_series_from_event_ticker(market.event_ticker)
+    if not series_ticker:
         return None
+    entry = TEMPERATURE_SERIES.get(series_ticker)
+    if entry is None:
+        return None
+    metric_str, city_slug = entry
+    metric = Metric.HIGH if metric_str == "high" else Metric.LOW
 
-    metric_tok = m.group("metric")
-    if metric_tok == "HIGH":
-        metric = Metric.HIGH
-    elif metric_tok == "LOW":
-        metric = Metric.LOW
-    else:
-        # KXTEMP* — infer from title; this is rare. Default to HIGH only if
-        # the title clearly says "high"; bail out otherwise.
-        title_low = (market.title or "").lower()
-        if "low" in title_low and "high" not in title_low:
-            metric = Metric.LOW
-        elif "high" in title_low and "low" not in title_low:
-            metric = Metric.HIGH
-        else:
-            return None
-
-    market_date = _parse_date_token(m.group("datetok"))
+    # Date token is the part of event_ticker after the series prefix.
+    # event_ticker shape: "<series>-<date>" e.g. "KXHIGHHOU-26MAY28"
+    parts = market.event_ticker.upper().split("-", 1)
+    if len(parts) < 2:
+        return None
+    market_date = _parse_date_token(parts[1])
     if market_date is None:
         return None
 
-    bracket = _bracket_from_suffix(m.group("suffix"), market.yes_sub_title) \
-        or _bracket_from_title(market.yes_sub_title)
+    # Bracket comes from the market ticker. Strip the event_ticker prefix
+    # to isolate the suffix. e.g. "KXHIGHHOU-26MAY28-B79-80" -> "B79-80".
+    suffix: Optional[str] = None
+    if market.ticker.upper().startswith(market.event_ticker.upper() + "-"):
+        suffix = market.ticker[len(market.event_ticker) + 1:]
+    bracket = (
+        _bracket_from_suffix(suffix, market.yes_sub_title) if suffix else None
+    ) or _bracket_from_title(market.yes_sub_title)
     if bracket is None:
         return None
 
     return ParsedContract(
         market_ticker=market.ticker,
         event_ticker=market.event_ticker,
-        city_slug=m.group("city"),
+        city_slug=city_slug,
         metric=metric,
         market_date=market_date,
         bracket=bracket,
     )
+
+
+def _parse_date_token(tok: str) -> Optional[date]:
+    """Parse Kalshi's date token, e.g. '26MAY28' -> date(2026, 5, 28)."""
+    m = _DATE_TOKEN_RE.match(tok)
+    if not m:
+        return None
+    yy, mon, dd = m.groups()
+    if mon not in _MONTHS:
+        return None
+    try:
+        return date(2000 + int(yy), _MONTHS[mon], int(dd))
+    except ValueError:
+        return None

@@ -159,30 +159,150 @@ class KalshiClient:
 
 # -- Temperature series discovery -------------------------------------------------
 
-TEMPERATURE_SERIES_PREFIXES = (
-    "KXHIGH",  # daily high temp series, e.g. KXHIGHHOUSTON
-    "KXLOW",   # daily low temp series, e.g. KXLOWHOUSTON
-    "KXTEMP",  # generic temperature variants seen on some cities
-)
+# Kalshi's temperature series naming is inconsistent across cities. There is no
+# single prefix that catches them all — some use `KXHIGH<CITY>`, some `HIGH<CITY>`
+# (no KX), some `KXHIGHT<CITY>` (extra T for "Temperature"), and some put the
+# city first like `KX<CITY>HIGH`. City codes are 2-4 letters (HOU/NY/NYC/LAX).
+#
+# So we hardcode a series-ticker -> (metric_str, city_slug) map. Verified
+# against the live /series endpoint (the temperature-relevant entries within
+# the "Climate and Weather" category as of 2026-05). Adding a new city just
+# means appending an entry here and a Station to stations.py.
+#
+# Metric is stored as a plain string here ("high"/"low") to keep this module
+# free of the models.Metric enum import (models.py would create a cycle).
+
+TEMPERATURE_SERIES: dict[str, tuple[str, str]] = {
+    # Houston (HOU)
+    "KXHIGHHOU":    ("high", "HOUSTON"),
+    "KXHOUHIGH":    ("high", "HOUSTON"),
+    "KXHIGHTHOU":   ("high", "HOUSTON"),
+    "KXLOWTHOU":    ("low", "HOUSTON"),
+    # Houston explicit full-city form (kept so existing test fixtures still parse).
+    "KXHIGHHOUSTON": ("high", "HOUSTON"),
+    "KXLOWHOUSTON":  ("low", "HOUSTON"),
+
+    # NYC
+    "HIGHNY":       ("high", "NYC"),
+    "KXHIGHNY":     ("high", "NYC"),
+    "KXLOWNY":      ("low", "NYC"),
+    "KXLOWNYC":     ("low", "NYC"),
+    "KXLOWTNYC":    ("low", "NYC"),
+    "KXHIGHNYC":    ("high", "NYC"),
+
+    # Chicago
+    "HIGHCHI":      ("high", "CHICAGO"),
+    "KXHIGHCHI":    ("high", "CHICAGO"),
+    "KXLOWCHI":     ("low", "CHICAGO"),
+    "KXLOWTCHI":    ("low", "CHICAGO"),
+    "KXHIGHCHICAGO": ("high", "CHICAGO"),
+
+    # Miami
+    "HIGHMIA":      ("high", "MIAMI"),
+    "KXHIGHMIA":    ("high", "MIAMI"),
+    "KXLOWMIA":     ("low", "MIAMI"),
+    "KXLOWTMIA":    ("low", "MIAMI"),
+    "KXHIGHMIAMI":  ("high", "MIAMI"),
+
+    # Austin
+    "HIGHAUS":      ("high", "AUSTIN"),
+    "KXHIGHAUS":    ("high", "AUSTIN"),
+    "KXLOWAUS":     ("low", "AUSTIN"),
+    "KXLOWTAUS":    ("low", "AUSTIN"),
+    "KXHIGHAUSTIN": ("high", "AUSTIN"),
+
+    # Denver
+    "KXHIGHDEN":    ("high", "DENVER"),
+    "KXDENHIGH":    ("high", "DENVER"),
+    "KXHIGHTDEN":   ("high", "DENVER"),
+    "KXLOWDEN":     ("low", "DENVER"),
+    "KXLOWTDEN":    ("low", "DENVER"),
+
+    # Los Angeles
+    "KXHIGHLAX":    ("high", "LA"),
+    "KXLOWLAX":     ("low", "LA"),
+    "KXLOWTLAX":    ("low", "LA"),
+    "KXHIGHLA":     ("high", "LA"),
+
+    # Boston
+    "KXHIGHTBOS":   ("high", "BOSTON"),
+    "KXLOWTBOS":    ("low", "BOSTON"),
+
+    # Las Vegas
+    "KXHIGHTLV":    ("high", "LASVEGAS"),
+    "KXLOWTLV":     ("low", "LASVEGAS"),
+
+    # Phoenix
+    "KXHIGHTPHX":   ("high", "PHOENIX"),
+    "KXLOWTPHX":    ("low", "PHOENIX"),
+
+    # New Orleans
+    "KXHIGHTNOLA":  ("high", "NEWORLEANS"),
+    "KXLOWTNOLA":   ("low", "NEWORLEANS"),
+
+    # Atlanta
+    "KXHIGHTATL":   ("high", "ATLANTA"),
+    "KXLOWTATL":    ("low", "ATLANTA"),
+
+    # Oklahoma City
+    "KXHIGHTOKC":   ("high", "OKCITY"),
+    "KXLOWTOKC":    ("low", "OKCITY"),
+
+    # Seattle
+    "KXHIGHTSEA":   ("high", "SEATTLE"),
+    "KXLOWTSEA":    ("low", "SEATTLE"),
+
+    # Dallas
+    "KXHIGHTDAL":   ("high", "DALLAS"),
+    "KXLOWTDAL":    ("low", "DALLAS"),
+
+    # San Francisco
+    "KXHIGHTSFO":   ("high", "SF"),
+    "KXLOWTSFO":    ("low", "SF"),
+
+    # San Antonio
+    "KXHIGHTSATX":  ("high", "SANANTONIO"),
+    "KXLOWTSATX":   ("low", "SANANTONIO"),
+
+    # Philadelphia
+    "KXPHILHIGH":   ("high", "PHILLY"),
+    "KXHIGHPHIL":   ("high", "PHILLY"),
+    "KXLOWPHIL":    ("low", "PHILLY"),
+    "KXLOWTPHIL":   ("low", "PHILLY"),
+
+    # Minneapolis
+    "KXHIGHTMIN":   ("high", "MINNEAPOLIS"),
+    "KXLOWTMIN":    ("low", "MINNEAPOLIS"),
+
+    # DC
+    "KXHIGHTDC":    ("high", "DC"),
+    "KXLOWTDC":     ("low", "DC"),
+}
 
 
-def is_temperature_series(series_ticker: str) -> bool:
-    s = series_ticker.upper()
-    return any(s.startswith(p) for p in TEMPERATURE_SERIES_PREFIXES)
+def derive_series_from_event_ticker(event_ticker: str) -> Optional[str]:
+    """Given an event ticker like `KXHIGHHOU-26MAY28`, return the series
+    portion `KXHIGHHOU`. Returns None if the shape is unexpected."""
+    if not event_ticker or "-" not in event_ticker:
+        return None
+    return event_ticker.split("-", 1)[0].upper()
 
 
 def iter_temperature_events(client: KalshiClient, status: str = "open") -> Iterator[KalshiEvent]:
-    """Yield all currently-open Kalshi temperature events across known prefixes.
+    """Yield all currently-open Kalshi temperature events.
 
-    We pull /events with each known series prefix. If a city's series ticker
-    doesn't match our known prefixes, the universe scanner will miss it; the
-    parser layer is the safety net (it ignores titles it can't interpret).
+    Iterates the hardcoded TEMPERATURE_SERIES list and queries /events once
+    per series ticker. Kalshi's `series_ticker` query param is an exact
+    match, not a prefix — verified empirically: prefix queries return [].
     """
     seen: set[str] = set()
-    for prefix in TEMPERATURE_SERIES_PREFIXES:
-        # Kalshi accepts series_ticker as a prefix match in /events
-        for event in client.iter_events(series_ticker=prefix, status=status):
-            if event.event_ticker in seen:
-                continue
-            seen.add(event.event_ticker)
-            yield event
+    for series_ticker in TEMPERATURE_SERIES:
+        try:
+            for event in client.iter_events(series_ticker=series_ticker, status=status):
+                if event.event_ticker in seen:
+                    continue
+                seen.add(event.event_ticker)
+                yield event
+        except httpx.HTTPStatusError:
+            # Some historical series may have been retired; skip and continue.
+            continue
