@@ -185,6 +185,20 @@ def test_count_snapshots_total_and_before(store: SnapshotStore):
     ) == 1
 
 
+def test_count_snapshots_keep_grades_matches_prune_behavior(store: SnapshotStore):
+    """Dry-run preview must report what the destructive prune would actually
+    delete — counting old A+/A rows when keep_grades=('A+','A') is a bug."""
+    old = datetime(2026, 5, 1, 10, 0, tzinfo=timezone.utc)
+    store.record_scan(evaluations=[_eval(grade="A+")], scanned_at=old)
+    store.record_scan(evaluations=[_eval(grade="B")], scanned_at=old)
+    store.record_scan(evaluations=[_eval(grade="D")], scanned_at=old)
+
+    cutoff = datetime(2026, 5, 27, 0, 0, tzinfo=timezone.utc)
+    preview = store.count_snapshots(before=cutoff, keep_grades=("A+", "A"))
+    deleted = store.prune_snapshots(before=cutoff, keep_grades=("A+", "A"))
+    assert preview == deleted == 2
+
+
 def test_prune_snapshots_deletes_old_rows(store: SnapshotStore):
     # Microseconds zeroed so the stored ISO timestamp round-trips exactly.
     now = datetime.now(timezone.utc).replace(microsecond=0)

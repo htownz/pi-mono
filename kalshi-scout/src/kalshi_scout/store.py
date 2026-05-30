@@ -437,8 +437,14 @@ class SnapshotStore:
         self,
         market_ticker: Optional[str] = None,
         before: Optional[datetime] = None,
+        keep_grades: Optional[tuple[str, ...]] = None,
     ) -> int:
-        """Cheap row counter used by the prune CLI for a dry-run preview."""
+        """Cheap row counter used by the prune CLI for a dry-run preview.
+
+        `keep_grades` mirrors `prune_snapshots`: rows whose grade is in the
+        set are excluded from the count, so a dry-run accurately reflects
+        what the destructive call would delete.
+        """
         clauses: list[str] = []
         params: list = []
         if market_ticker:
@@ -447,6 +453,10 @@ class SnapshotStore:
         if before:
             clauses.append("scanned_at_utc < ?")
             params.append(_iso_utc(before))
+        if keep_grades:
+            placeholders = ",".join("?" * len(keep_grades))
+            clauses.append(f"grade NOT IN ({placeholders})")
+            params.extend(keep_grades)
         sql = "SELECT COUNT(*) AS n FROM snapshots"
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)

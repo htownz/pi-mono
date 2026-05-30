@@ -618,6 +618,11 @@ def explain(market_ticker: str, as_json: bool, config_path: Optional[str]) -> No
                 contract, market, state_value, state_reason,
                 fair_lo, fair_hi, config=ranker_config,
             )
+        elif contract is not None and settlement is not None:
+            # Parseable contract but resolver couldn't pin a station — invariant I4
+            # forces an F. `scan`/`evaluate` surface this via _make_unverified_eval;
+            # `explain` must do the same so its grade output agrees.
+            eval_ = _make_unverified_eval(contract, market, settlement)
 
     if as_json:
         click.echo(json.dumps(
@@ -644,6 +649,18 @@ def _in_window_forecast(forecast: list, station_state: Optional[StationState],
         return []
     end_utc = station_state.window_end.astimezone(timezone.utc)
     return [p for p in forecast if now_utc <= p.start <= end_utc]
+
+
+def _derivation_for_eval(eval_: ContractEvaluation, state_value,
+                         spread_cents, config: RankerConfig) -> str:
+    """Wrapper that special-cases the I4 unverified-source path before falling
+    back to the ladder-rung derivation. _make_unverified_eval forces grade=F
+    independent of the edge math, so the ladder explanation would be misleading.
+    """
+    if eval_.grade == "F" and any("invariant I4" in n for n in eval_.notes):
+        return "F: invariant I4 — settlement source not verified"
+    return _grade_derivation(state_value, eval_.edge_yes, eval_.edge_no,
+                             spread_cents, config)
 
 
 def _grade_derivation(state_value, edge_yes, edge_no, spread_cents,
@@ -800,8 +817,8 @@ def _explain_to_dict(
                 "no_ask_cents": eval_.no_ask_cents,
                 "edge_yes": eval_.edge_yes,
                 "edge_no": eval_.edge_no,
-                "derivation": _grade_derivation(
-                    state_value, eval_.edge_yes, eval_.edge_no,
+                "derivation": _derivation_for_eval(
+                    eval_, state_value,
                     (market.yes_ask - market.yes_bid)
                     if (market.yes_ask and market.yes_bid) else None,
                     config,
@@ -859,9 +876,20 @@ def _print_explain(
         notes_join = ("\n" + "\n".join(settlement.notes)) if settlement and settlement.notes else ""
         console.print(Panel(
             f"[red]Settlement unverified (provenance={prov}).[/red]\n"
-            "No station resolved — market grades F. Pipeline aborts here." + notes_join,
+            "No station resolved — market grades F per invariant I4." + notes_join,
             title="Settlement", border_style="red",
         ))
+        if eval_ is not None:
+            notes_line = (
+                "notes:\n  - " + "\n  - ".join(eval_.notes)
+                if eval_.notes else "notes: —"
+            )
+            console.print(Panel(
+                f"[bold]grade: {eval_.grade}[/bold]\n"
+                "derivation: F: invariant I4 — settlement source not verified\n"
+                f"{notes_line}",
+                title="Grade", border_style="bold red",
+            ))
         return
     s = settlement.station
     settle_block = (
@@ -957,7 +985,7 @@ def _print_explain(
         ey = f"{eval_.edge_yes:+.3f}" if eval_.edge_yes is not None else "—"
         en = f"{eval_.edge_no:+.3f}" if eval_.edge_no is not None else "—"
         spread = (market.yes_ask - market.yes_bid) if (market.yes_ask and market.yes_bid) else None
-        derivation = _grade_derivation(state_value, eval_.edge_yes, eval_.edge_no, spread, config)
+        derivation = _derivation_for_eval(eval_, state_value, spread, config)
         notes_line = ("notes:\n  - " + "\n  - ".join(eval_.notes)) if eval_.notes else "notes: —"
         grade_block = (
             f"[bold]grade: {eval_.grade}[/bold]\n"
@@ -1131,13 +1159,13 @@ def prune(store_path: str, older_than_days: int,
 
     with SnapshotStore(store_path) as store:
         if dry_run:
-            n_eligible = store.count_snapshots(before=cutoff)
+            n_eligible = store.count_snapshots(before=cutoff, keep_grades=keep_tuple)
             kept = ""
             if keep_tuple:
-                kept = f"  (would preserve grades {', '.join(keep_tuple)})"
+                kept = f"  (preserving grades {', '.join(keep_tuple)})"
             console.print(
                 f"[dim]dry-run: {n_eligible} snapshots older than "
-                f"{cutoff.isoformat(timespec='minutes')} match{kept}[/dim]"
+                f"{cutoff.isoformat(timespec='minutes')} would be deleted{kept}[/dim]"
             )
             return
         deleted = store.prune_snapshots(before=cutoff, keep_grades=keep_tuple)

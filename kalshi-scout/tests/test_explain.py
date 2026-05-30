@@ -255,3 +255,33 @@ def test_explain_to_dict_handles_unverified_settlement():
     assert "no rules text" in out["settlement"]["notes"]
     assert out["station_state"] is None
     assert out["grade"] is None
+
+
+def test_explain_to_dict_surfaces_unverified_F_grade():
+    """When a contract parses but the resolver can't pin a station, the
+    explain command must surface the F grade from `_make_unverified_eval`
+    so the diagnostic agrees with `scan`/`evaluate` (invariant I4).
+    """
+    from kalshi_scout.cli import _make_unverified_eval
+
+    market = _market()
+    contract = _contract()
+    settlement = Settlement(
+        station=None, source_agency="?", area_description="",
+        provenance=SettlementProvenance.UNVERIFIED,
+        notes=("no CLIHOU mention",),
+    )
+    eval_ = _make_unverified_eval(contract, market, settlement)
+    assert eval_.grade == "F"
+
+    out = _explain_to_dict(
+        market, contract, settlement, station_state=None,
+        forecast=[], regime_reading=None,
+        state_value=None, state_reason="",
+        fair_lo=None, fair_hi=None, eval_=eval_,
+        config=RankerConfig.default(),
+        now_utc=datetime(2026, 5, 29, 12, 0, tzinfo=timezone.utc),
+    )
+    assert out["grade"]["grade"] == "F"
+    assert "invariant I4" in out["grade"]["derivation"]
+    assert any("invariant I4" in n for n in out["grade"]["notes"])
