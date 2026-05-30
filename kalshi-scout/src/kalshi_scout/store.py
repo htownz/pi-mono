@@ -73,6 +73,7 @@ CREATE TABLE IF NOT EXISTS snapshots (
 
     running_max_f REAL,
     running_min_f REAL,
+    projected_extremum_f REAL,
     cli_report_date TEXT,
     cli_max_f REAL,
     cli_min_f REAL,
@@ -161,6 +162,7 @@ class SnapshotRow:
     regime: Optional[str]
     running_max_f: Optional[float]
     running_min_f: Optional[float]
+    projected_extremum_f: Optional[float]
     cli_report_date: Optional[date]
     cli_max_f: Optional[float]
     cli_min_f: Optional[float]
@@ -307,6 +309,10 @@ class SnapshotStore:
         cols = {row["name"] for row in cur.fetchall()}
         if "regime" not in cols:
             self._conn.execute("ALTER TABLE snapshots ADD COLUMN regime TEXT")
+        # V1.2 migration: per-snapshot forecast projection so the calibration
+        # tuner can compute (projected - realized) residuals from settled rows.
+        if "projected_extremum_f" not in cols:
+            self._conn.execute("ALTER TABLE snapshots ADD COLUMN projected_extremum_f REAL")
         cur = self._conn.execute(
             "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('version', ?)",
             (str(SCHEMA_VERSION),),
@@ -355,6 +361,7 @@ class SnapshotStore:
                 ss.get("source_provenance", "registry"),
                 ss.get("regime"),
                 ss.get("running_max_f"), ss.get("running_min_f"),
+                ss.get("projected_extremum_f"),
                 _iso_date(ss["cli_report_date"]) if ss.get("cli_report_date") else None,
                 ss.get("cli_max_f"), ss.get("cli_min_f"),
                 e.state.value, e.reason, e.fair_prob_low, e.fair_prob_high,
@@ -371,13 +378,13 @@ class SnapshotStore:
                     bracket_kind, bracket_lo, bracket_hi,
                     station_icao, cli_product, source_provenance,
                     regime,
-                    running_max_f, running_min_f,
+                    running_max_f, running_min_f, projected_extremum_f,
                     cli_report_date, cli_max_f, cli_min_f,
                     state, reason, fair_prob_low, fair_prob_high,
                     yes_bid, yes_ask, no_bid, no_ask, last_price,
                     volume, open_interest,
                     edge_yes, edge_no, grade, notes_json
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 rows,
             )
@@ -800,6 +807,9 @@ def _row_to_snapshot(row: sqlite3.Row) -> SnapshotRow:
         regime=row["regime"] if "regime" in row.keys() else None,
         running_max_f=row["running_max_f"],
         running_min_f=row["running_min_f"],
+        projected_extremum_f=(
+            row["projected_extremum_f"] if "projected_extremum_f" in row.keys() else None
+        ),
         cli_report_date=_parse_date(row["cli_report_date"]),
         cli_max_f=row["cli_max_f"],
         cli_min_f=row["cli_min_f"],

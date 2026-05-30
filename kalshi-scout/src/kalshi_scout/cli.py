@@ -50,7 +50,7 @@ from kalshi_scout.ranker import grade, sort_key
 from kalshi_scout.regime import classify_regime
 from kalshi_scout.resolver import resolve_settlement
 from kalshi_scout.tuning import derive_config
-from kalshi_scout.state import build_station_state, classify, fair_probability
+from kalshi_scout.state import build_station_state, classify, fair_probability, project_extremum
 from kalshi_scout.stations import all_cities, get_station
 from kalshi_scout.store import (
     SnapshotStore,
@@ -82,24 +82,45 @@ def _print_tuning_report(report, written_to: str) -> None:
         )
     console.print(tier_table)
 
-    if not report.regimes:
+    if report.regimes:
+        reg_table = Table(title="Regime shifts", header_style="bold cyan")
+        reg_table.add_column("Regime")
+        reg_table.add_column("Metric")
+        reg_table.add_column("Bracket")
+        reg_table.add_column("N", justify="right")
+        reg_table.add_column("Avg bias", justify="right")
+        reg_table.add_column("Applied", justify="center")
+        reg_table.add_column("Note")
+        for r in report.regimes:
+            applied_str = "[green]yes[/green]" if r.applied else "[dim]no[/dim]"
+            reg_table.add_row(
+                r.regime, r.metric, r.bracket_kind, str(r.n_settled),
+                f"{r.avg_bias:+.3f}", applied_str, r.note,
+            )
+        console.print(reg_table)
+    else:
         console.print("[dim]no regime-shift candidates in history[/dim]")
-        return
-    reg_table = Table(title="Regime shifts", header_style="bold cyan")
-    reg_table.add_column("Regime")
-    reg_table.add_column("Metric")
-    reg_table.add_column("Bracket")
-    reg_table.add_column("N", justify="right")
-    reg_table.add_column("Avg bias", justify="right")
-    reg_table.add_column("Applied", justify="center")
-    reg_table.add_column("Note")
-    for r in report.regimes:
-        applied_str = "[green]yes[/green]" if r.applied else "[dim]no[/dim]"
-        reg_table.add_row(
-            r.regime, r.metric, r.bracket_kind, str(r.n_settled),
-            f"{r.avg_bias:+.3f}", applied_str, r.note,
+
+    if report.residuals:
+        res_table = Table(title="Forecast residuals (°F)", header_style="bold cyan")
+        res_table.add_column("Station")
+        res_table.add_column("Metric")
+        res_table.add_column("N days", justify="right")
+        res_table.add_column("Median |residual|", justify="right")
+        res_table.add_column("Applied", justify="center")
+        res_table.add_column("Note")
+        for r in report.residuals:
+            applied_str = "[green]yes[/green]" if r.applied else "[dim]no[/dim]"
+            res_table.add_row(
+                r.station_icao, r.metric, str(r.n_settled),
+                f"{r.median_residual_f:.2f}", applied_str, r.note,
+            )
+        console.print(res_table)
+    else:
+        console.print(
+            "[dim]no forecast-residual candidates yet "
+            "(needs settled snapshots with projections)[/dim]"
         )
-    console.print(reg_table)
 
 
 def _build_sinks(specs: tuple[str, ...]) -> list[AlertSink]:
@@ -202,6 +223,9 @@ def _evaluate_event(
             local_forecast = forecast
 
         state, reason = classify(contract, local_state)
+        projected_f = project_extremum(
+            contract.metric, local_forecast or None, local_state, now_utc=now_utc,
+        )
         fair_lo, fair_hi = fair_probability(
             contract,
             local_state,
@@ -233,6 +257,7 @@ def _evaluate_event(
                 "regime": regime_reading.regime.value,
                 "running_max_f": local_state.running_max_f,
                 "running_min_f": local_state.running_min_f,
+                "projected_extremum_f": projected_f,
                 "cli_report_date": local_state.cli_report_date,
                 "cli_max_f": local_state.cli_max_f,
                 "cli_min_f": local_state.cli_min_f,

@@ -23,7 +23,7 @@ operator can see exactly which knobs got moved and which didn't.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from statistics import median
 from typing import Optional
@@ -33,12 +33,15 @@ from kalshi_scout.config import (
     DEFAULT_DEAD_NO,
     DEFAULT_FORECAST_DEPENDENT,
     DEFAULT_LOCKED_YES,
+    ForecastResidual,
     MIN_N_PER_REGIME,
+    MIN_N_PER_RESIDUAL,
     MIN_N_PER_TIER,
     RankerConfig,
     RegimeShift,
     StateThresholds,
     regime_key,
+    residual_key,
 )
 from kalshi_scout.models import ContractState
 from kalshi_scout.store import SnapshotRow, SnapshotStore, backtest
@@ -70,11 +73,23 @@ class RegimeTuning:
 
 
 @dataclass(frozen=True)
+class ResidualTuning:
+    """One row of the tuning report — per (station_icao, metric)."""
+    station_icao: str
+    metric: str
+    n_settled: int
+    median_residual_f: float    # median |projected - realized|, in °F
+    applied: bool
+    note: str
+
+
+@dataclass(frozen=True)
 class TuningReport:
     """The full tuning audit. Returned alongside the derived RankerConfig
     so the operator can see exactly what changed and why."""
     tiers: list[TierTuning]
     regimes: list[RegimeTuning]
+    residuals: list[ResidualTuning] = field(default_factory=list)
 
 
 # -- Threshold derivation ----------------------------------------------------
@@ -256,6 +271,71 @@ def derive_regime_shifts(
     return shifts, report
 
 
+# -- Forecast-residual derivation --------------------------------------------
+
+def derive_forecast_residuals(
+    store: SnapshotStore,
+    since: Optional[datetime] = None,
+) -> tuple[dict[str, ForecastResidual], list[ResidualTuning]]:
+    """For each (station_icao, metric), compute the median absolute residual
+    between the engine's projected daily extremum and the realized CLI value.
+
+    The result feeds `RankerConfig.forecast_residual_for(station, metric)`,
+    which `fair_probability` uses to size the projected uncertainty band.
+
+    Per (station, metric) because microclimate matters: KSFO's marine layer
+    has different forecast skill than KIAH's humid stagnation, and morning
+    lows have different skill than afternoon highs.
+
+    Gates on `MIN_N_PER_RESIDUAL` settled days. Below threshold, the entry
+    is stored with applied=False and the engine keeps the 2.0°F default.
+    """
+    settled_rows = backtest(store, min_grade="D", since=since)
+    settled_index = {b.snapshot_id: b for b in settled_rows}
+    all_snapshots = store.query_snapshots(min_grade="D", since=since)
+
+    # Group |residual| by (station_icao, metric). One day's max contract
+    # contributes one residual; same-day siblings would double-count, so
+    # dedupe by (station, metric, market_date).
+    seen_days: set[tuple[str, str, str]] = set()
+    groups: dict[tuple[str, str], list[float]] = {}
+    for row in all_snapshots:
+        if row.projected_extremum_f is None or row.station_icao is None:
+            continue
+        if row.id not in settled_index:
+            continue
+        # Need the realized CLI value, not just win/loss. Look up the settlement.
+        # Settlements are keyed by market_ticker; one settlement per market.
+        settlement = store.get_settlement(row.market_ticker)
+        if settlement is None or settlement.cli_value_f is None:
+            continue
+        day_key = (row.station_icao, row.metric, row.market_date.isoformat())
+        if day_key in seen_days:
+            continue
+        seen_days.add(day_key)
+        residual = abs(row.projected_extremum_f - settlement.cli_value_f)
+        groups.setdefault((row.station_icao, row.metric), []).append(residual)
+
+    residuals: dict[str, ForecastResidual] = {}
+    report: list[ResidualTuning] = []
+    for (station_icao, metric), values in groups.items():
+        n = len(values)
+        med = float(median(values))
+        applied = n >= MIN_N_PER_RESIDUAL
+        residuals[residual_key(station_icao, metric)] = ForecastResidual.of(
+            residual_f=med, n=n, applied=applied,
+        )
+        if applied:
+            note = f"N={n}, median |residual| {med:.2f}°F"
+        else:
+            note = f"N={n} below threshold {MIN_N_PER_RESIDUAL}; default kept"
+        report.append(ResidualTuning(
+            station_icao=station_icao, metric=metric,
+            n_settled=n, median_residual_f=med, applied=applied, note=note,
+        ))
+    return residuals, report
+
+
 # -- Top-level entrypoint ----------------------------------------------------
 
 def derive_config(
@@ -265,6 +345,7 @@ def derive_config(
     """Build a RankerConfig + auditable TuningReport from stored history."""
     thresholds, tier_report = derive_tier_thresholds(store, since=since)
     shifts, regime_report = derive_regime_shifts(store, since=since)
+    residuals, residual_report = derive_forecast_residuals(store, since=since)
     total_snaps = len(store.query_snapshots(min_grade="D", since=since))
     config = RankerConfig(
         generated_at=datetime.now().astimezone(),
@@ -274,5 +355,8 @@ def derive_config(
         bracket_hit=thresholds[ContractState.BRACKET_HIT_VULNERABLE.value],
         forecast_dependent=thresholds[ContractState.FORECAST_DEPENDENT.value],
         regime_shifts=shifts,
+        forecast_residuals=residuals,
     )
-    return config, TuningReport(tiers=tier_report, regimes=regime_report)
+    return config, TuningReport(
+        tiers=tier_report, regimes=regime_report, residuals=residual_report,
+    )
