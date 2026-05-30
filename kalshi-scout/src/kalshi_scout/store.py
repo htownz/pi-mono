@@ -94,6 +94,7 @@ CREATE TABLE IF NOT EXISTS snapshots (
 );
 
 CREATE INDEX IF NOT EXISTS idx_snapshots_market_date ON snapshots(market_ticker, market_date);
+CREATE INDEX IF NOT EXISTS idx_snapshots_market_scanned ON snapshots(market_ticker, scanned_at_utc);
 CREATE INDEX IF NOT EXISTS idx_snapshots_grade_scanned ON snapshots(grade, scanned_at_utc);
 CREATE INDEX IF NOT EXISTS idx_snapshots_event_scan ON snapshots(event_ticker, scanned_at_utc);
 
@@ -431,6 +432,59 @@ class SnapshotStore:
             sql += f" LIMIT {int(limit)}"
         cur = self._conn.execute(sql, params)
         return [_row_to_snapshot(r) for r in cur.fetchall()]
+
+    def count_snapshots(
+        self,
+        market_ticker: Optional[str] = None,
+        before: Optional[datetime] = None,
+        keep_grades: Optional[tuple[str, ...]] = None,
+    ) -> int:
+        """Cheap row counter used by the prune CLI for a dry-run preview.
+
+        `keep_grades` mirrors `prune_snapshots`: rows whose grade is in the
+        set are excluded from the count, so a dry-run accurately reflects
+        what the destructive call would delete.
+        """
+        clauses: list[str] = []
+        params: list = []
+        if market_ticker:
+            clauses.append("market_ticker = ?")
+            params.append(market_ticker)
+        if before:
+            clauses.append("scanned_at_utc < ?")
+            params.append(_iso_utc(before))
+        if keep_grades:
+            placeholders = ",".join("?" * len(keep_grades))
+            clauses.append(f"grade NOT IN ({placeholders})")
+            params.extend(keep_grades)
+        sql = "SELECT COUNT(*) AS n FROM snapshots"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        return int(self._conn.execute(sql, params).fetchone()["n"])
+
+    def prune_snapshots(
+        self,
+        before: datetime,
+        keep_grades: Optional[tuple[str, ...]] = None,
+    ) -> int:
+        """Delete snapshots older than `before`, optionally preserving rows whose
+        grade is in `keep_grades`. Returns the number of rows deleted.
+
+        Use cases:
+          - Daily housekeeping: prune older than 30d, keep A+/A history forever
+          - Compact for backup: prune older than 7d, no grade exclusion
+        """
+        clauses = ["scanned_at_utc < ?"]
+        params: list = [_iso_utc(before)]
+        if keep_grades:
+            placeholders = ",".join("?" * len(keep_grades))
+            clauses.append(f"grade NOT IN ({placeholders})")
+            params.extend(keep_grades)
+        with self._txn() as conn:
+            cur = conn.execute(
+                "DELETE FROM snapshots WHERE " + " AND ".join(clauses), params,
+            )
+            return cur.rowcount
 
     # -- Settlement writes ---------------------------------------------------
 

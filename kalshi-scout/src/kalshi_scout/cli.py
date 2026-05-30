@@ -8,11 +8,12 @@ from __future__ import annotations
 import json
 import sys
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Iterable, Optional
 
 import click
 from rich.console import Console
+from rich.panel import Panel
 from rich.table import Table
 
 from kalshi_scout.arbitrage import rank_arbitrage_opportunities
@@ -561,6 +562,442 @@ def evaluate(event_or_market: str, as_json: bool,
 
 
 @main.command()
+@click.argument("market_ticker")
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of panels.")
+@click.option("--config", "config_path", type=click.Path(exists=True), default=None,
+              help="Load a calibrated RankerConfig (from `calibrate --apply`).")
+def explain(market_ticker: str, as_json: bool, config_path: Optional[str]) -> None:
+    """Trace one market through the full evaluation pipeline.
+
+    Prints every intermediate: market quote, parsed contract, resolved
+    settlement source, station state (running max/min, observation count,
+    CLI report), in-window forecast points, regime classification, state
+    machine output, fair-probability derivation, grade derivation and notes.
+
+    Use when an alert fires (or fails to fire) and you want to see exactly
+    which pipeline step produced the outcome.
+    """
+    now_utc = datetime.now(timezone.utc)
+    ranker_config = RankerConfig.load_json(config_path) if config_path else RankerConfig.default()
+
+    with KalshiClient() as kclient, NwsClient() as nclient:
+        market = kclient.get_market(market_ticker)
+        contract = parse_market(market)
+        settlement = resolve_settlement(market, contract) if contract else None
+
+        station_state: Optional[StationState] = None
+        forecast: list = []
+        regime_reading = None
+        state_value = None
+        state_reason = ""
+        fair_lo = fair_hi = None
+        eval_: Optional[ContractEvaluation] = None
+
+        if contract is not None and settlement is not None and settlement.station is not None:
+            station_state = build_station_state(
+                nclient, settlement.station, contract.market_date, now_utc=now_utc,
+            )
+            try:
+                forecast = nclient.hourly_forecast(settlement.station)
+            except Exception:
+                forecast = []
+            regime_reading = classify_regime(
+                station=settlement.station,
+                forecast=forecast or None,
+                recent_obs=station_state.observations,
+                now_utc=now_utc,
+            )
+            state_value, state_reason = classify(contract, station_state)
+            fair_lo, fair_hi = fair_probability(
+                contract, station_state, state_value,
+                forecast or None, now_utc=now_utc,
+                regime=regime_reading.regime.value,
+                config=ranker_config,
+            )
+            eval_ = grade(
+                contract, market, state_value, state_reason,
+                fair_lo, fair_hi, config=ranker_config,
+            )
+        elif contract is not None and settlement is not None:
+            # Parseable contract but resolver couldn't pin a station — invariant I4
+            # forces an F. `scan`/`evaluate` surface this via _make_unverified_eval;
+            # `explain` must do the same so its grade output agrees.
+            eval_ = _make_unverified_eval(contract, market, settlement)
+
+    if as_json:
+        click.echo(json.dumps(
+            _explain_to_dict(
+                market, contract, settlement, station_state,
+                forecast, regime_reading, state_value, state_reason,
+                fair_lo, fair_hi, eval_, ranker_config, now_utc,
+            ),
+            indent=2,
+            default=str,
+        ))
+        return
+
+    _print_explain(
+        market, contract, settlement, station_state,
+        forecast, regime_reading, state_value, state_reason,
+        fair_lo, fair_hi, eval_, ranker_config, now_utc,
+    )
+
+
+def _in_window_forecast(forecast: list, station_state: Optional[StationState],
+                        now_utc: datetime) -> list:
+    if not forecast or station_state is None:
+        return []
+    end_utc = station_state.window_end.astimezone(timezone.utc)
+    return [p for p in forecast if now_utc <= p.start <= end_utc]
+
+
+def _derivation_for_eval(eval_: ContractEvaluation, state_value,
+                         spread_cents, config: RankerConfig) -> str:
+    """Wrapper that special-cases the I4 unverified-source path before falling
+    back to the ladder-rung derivation. _make_unverified_eval forces grade=F
+    independent of the edge math, so the ladder explanation would be misleading.
+    """
+    if eval_.grade == "F" and any("invariant I4" in n for n in eval_.notes):
+        return "F: invariant I4 — settlement source not verified"
+    return _grade_derivation(state_value, eval_.edge_yes, eval_.edge_no,
+                             spread_cents, config)
+
+
+def _grade_derivation(state_value, edge_yes, edge_no, spread_cents,
+                      config: RankerConfig) -> str:
+    """Reproduce the ladder rung that ranker._grade_value chose, in words."""
+    if state_value is None:
+        return "no state — pipeline aborted before grading"
+    edges = [e for e in (edge_yes, edge_no) if e is not None]
+    best_edge = max(edges) if edges else None
+    wide = spread_cents is not None and spread_cents >= 10
+    t = config.thresholds_for(state_value.value)
+    if state_value is ContractState.LOCKED_YES:
+        if edge_yes is None:
+            return "F: LOCKED_YES but no yes_ask available"
+        if edge_yes >= t.high_cutoff:
+            return (f"edge_yes {edge_yes:+.3f} ≥ high cutoff {t.high_cutoff:.2f}"
+                    + (" (wide spread → A)" if wide else " → A+"))
+        if edge_yes >= t.low_cutoff:
+            return (f"edge_yes {edge_yes:+.3f} ≥ low cutoff {t.low_cutoff:.2f}"
+                    + (" (wide spread → B+)" if wide else " → A"))
+        return f"edge_yes {edge_yes:+.3f} below cutoff {t.low_cutoff:.2f} → B"
+    if state_value is ContractState.DEAD_NO:
+        if edge_no is None:
+            return "F: DEAD_NO but no no_ask available"
+        if edge_no >= t.high_cutoff:
+            return (f"edge_no {edge_no:+.3f} ≥ high cutoff {t.high_cutoff:.2f}"
+                    + (" (wide spread → A)" if wide else " → A+"))
+        if edge_no >= t.low_cutoff:
+            return (f"edge_no {edge_no:+.3f} ≥ low cutoff {t.low_cutoff:.2f}"
+                    + (" (wide spread → B+)" if wide else " → A"))
+        return f"edge_no {edge_no:+.3f} below cutoff {t.low_cutoff:.2f} → B"
+    if state_value is ContractState.BRACKET_HIT_VULNERABLE:
+        if best_edge is None:
+            return "D: bracket-hit but no fillable side"
+        if best_edge >= t.high_cutoff:
+            return (f"best_edge {best_edge:+.3f} ≥ high cutoff {t.high_cutoff:.2f}"
+                    + (" (wide spread → B)" if wide else " → B+"))
+        if best_edge >= t.low_cutoff:
+            return f"best_edge {best_edge:+.3f} ≥ low cutoff {t.low_cutoff:.2f} → B"
+        return f"best_edge {best_edge:+.3f} below cutoff {t.low_cutoff:.2f} → C"
+    # NOT_REACHED / FORECAST_DEPENDENT
+    if best_edge is None:
+        return "D: no fillable side"
+    if best_edge >= t.high_cutoff:
+        return f"best_edge {best_edge:+.3f} ≥ high cutoff {t.high_cutoff:.2f} → B"
+    if best_edge >= t.low_cutoff:
+        return f"best_edge {best_edge:+.3f} ≥ low cutoff {t.low_cutoff:.2f} → C"
+    return f"best_edge {best_edge:+.3f} below cutoff {t.low_cutoff:.2f} → D"
+
+
+def _explain_to_dict(
+    market, contract, settlement, station_state, forecast, regime_reading,
+    state_value, state_reason, fair_lo, fair_hi, eval_, config, now_utc,
+) -> dict:
+    """Structured form of the explain output. Used by --json mode."""
+    in_window = _in_window_forecast(forecast, station_state, now_utc)
+    return {
+        "scanned_at_utc": now_utc.isoformat(),
+        "market": {
+            "ticker": market.ticker,
+            "event_ticker": market.event_ticker,
+            "title": market.title,
+            "yes_sub_title": market.yes_sub_title,
+            "status": market.status,
+            "close_time": market.close_time.isoformat() if market.close_time else None,
+            "yes_bid": market.yes_bid, "yes_ask": market.yes_ask,
+            "no_bid": market.no_bid, "no_ask": market.no_ask,
+            "last_price": market.last_price,
+            "volume": market.volume, "open_interest": market.open_interest,
+        },
+        "parsed_contract": (
+            None if contract is None else {
+                "city_slug": contract.city_slug,
+                "metric": contract.metric.value,
+                "market_date": contract.market_date.isoformat(),
+                "bracket": {
+                    "kind": contract.bracket.kind.value,
+                    "lo": contract.bracket.lo, "hi": contract.bracket.hi,
+                    "label": contract.bracket.label(),
+                },
+            }
+        ),
+        "settlement": (
+            None if settlement is None else {
+                "station_icao": settlement.station.icao if settlement.station else None,
+                "station_name": settlement.station.name if settlement.station else None,
+                "tz": settlement.station.tz if settlement.station else None,
+                "cli_product": settlement.station.cli_product if settlement.station else None,
+                "source_agency": settlement.source_agency,
+                "area_description": settlement.area_description,
+                "provenance": settlement.provenance.value,
+                "notes": list(settlement.notes),
+            }
+        ),
+        "station_state": (
+            None if station_state is None else {
+                "window_start_local": station_state.window_start.isoformat(),
+                "window_end_local": station_state.window_end.isoformat(),
+                "running_max_f": station_state.running_max_f,
+                "running_min_f": station_state.running_min_f,
+                "n_observations": len(station_state.observations),
+                "latest_observed_at": (
+                    station_state.latest.observed_at.isoformat() if station_state.latest else None
+                ),
+                "latest_temperature_f": (
+                    station_state.latest.temperature_f if station_state.latest else None
+                ),
+                "cli_report_date": (
+                    station_state.cli_report_date.isoformat() if station_state.cli_report_date else None
+                ),
+                "cli_max_f": station_state.cli_max_f,
+                "cli_min_f": station_state.cli_min_f,
+                "cli_matches_market_date": station_state.cli_matches_market_date,
+            }
+        ),
+        "forecast_in_window": [
+            {
+                "start": p.start.isoformat(), "temperature_f": p.temperature_f,
+                "sky_cover_pct": p.sky_cover_pct,
+                "probability_of_precip": p.probability_of_precip,
+                "wind_speed_mph": p.wind_speed_mph,
+            }
+            for p in in_window
+        ],
+        "regime": (
+            None if regime_reading is None else {
+                "regime": regime_reading.regime.value,
+                "confidence": regime_reading.confidence,
+                "reasoning": list(regime_reading.reasoning),
+            }
+        ),
+        "state_machine": (
+            None if state_value is None else {
+                "state": state_value.value, "reason": state_reason,
+            }
+        ),
+        "fair_probability": (
+            None if fair_lo is None else {
+                "low": round(fair_lo, 3), "high": round(fair_hi, 3),
+                "mid": round((fair_lo + fair_hi) / 2.0, 3),
+                "regime_shift": (
+                    config.regime_shift_for(
+                        regime_reading.regime.value,
+                        contract.metric.value,
+                        contract.bracket.kind.value,
+                    ) if (regime_reading and contract) else 0.0
+                ),
+            }
+        ),
+        "grade": (
+            None if eval_ is None else {
+                "grade": eval_.grade,
+                "yes_ask_cents": eval_.yes_ask_cents,
+                "no_ask_cents": eval_.no_ask_cents,
+                "edge_yes": eval_.edge_yes,
+                "edge_no": eval_.edge_no,
+                "derivation": _derivation_for_eval(
+                    eval_, state_value,
+                    (market.yes_ask - market.yes_bid)
+                    if (market.yes_ask and market.yes_bid) else None,
+                    config,
+                ),
+                "notes": list(eval_.notes),
+            }
+        ),
+    }
+
+
+def _print_explain(
+    market, contract, settlement, station_state, forecast, regime_reading,
+    state_value, state_reason, fair_lo, fair_hi, eval_, config, now_utc,
+) -> None:
+    """Rich panel rendering of the full pipeline trace."""
+    sub = market.yes_sub_title or "—"
+    close = market.close_time.isoformat() if market.close_time else "—"
+    market_block = (
+        f"[bold]{market.ticker}[/bold]\n"
+        f"event:   {market.event_ticker}\n"
+        f"title:   {market.title}\n"
+        f"yes_sub: {sub}\n"
+        f"status:  {market.status}    close: {close}"
+    )
+    console.print(Panel(market_block, title="Market", border_style="cyan"))
+
+    quote = (
+        f"yes_bid/ask: {market.yes_bid}c / {market.yes_ask}c    "
+        f"no_bid/ask: {market.no_bid}c / {market.no_ask}c\n"
+        f"last:        {market.last_price}c\n"
+        f"volume:      {market.volume}    open_interest: {market.open_interest}"
+    )
+    console.print(Panel(quote, title="Quote", border_style="cyan"))
+
+    if contract is None:
+        console.print(Panel(
+            "[red]parse_market returned None — market ticker doesn't match "
+            "a parseable temperature contract.[/red]\n"
+            "Pipeline aborted. Check rules text / city_slug mapping.",
+            title="Parsed Contract", border_style="red",
+        ))
+        return
+    parsed_block = (
+        f"city:    {contract.city_slug}\n"
+        f"metric:  {contract.metric.value}\n"
+        f"date:    {contract.market_date.isoformat()}\n"
+        f"bracket: {contract.bracket.kind.value}  "
+        f"lo={contract.bracket.lo}  hi={contract.bracket.hi}  "
+        f"({contract.bracket.label()})"
+    )
+    console.print(Panel(parsed_block, title="Parsed Contract", border_style="cyan"))
+
+    if settlement is None or settlement.station is None:
+        prov = settlement.provenance.value if settlement else "n/a"
+        notes_join = ("\n" + "\n".join(settlement.notes)) if settlement and settlement.notes else ""
+        console.print(Panel(
+            f"[red]Settlement unverified (provenance={prov}).[/red]\n"
+            "No station resolved — market grades F per invariant I4." + notes_join,
+            title="Settlement", border_style="red",
+        ))
+        if eval_ is not None:
+            notes_line = (
+                "notes:\n  - " + "\n  - ".join(eval_.notes)
+                if eval_.notes else "notes: —"
+            )
+            console.print(Panel(
+                f"[bold]grade: {eval_.grade}[/bold]\n"
+                "derivation: F: invariant I4 — settlement source not verified\n"
+                f"{notes_line}",
+                title="Grade", border_style="bold red",
+            ))
+        return
+    s = settlement.station
+    settle_block = (
+        f"station: {s.icao}  ({s.name}, {s.tz})\n"
+        f"cli:     {s.cli_product}\n"
+        f"agency:  {settlement.source_agency}\n"
+        f"area:    {settlement.area_description or '—'}\n"
+        f"provenance: {settlement.provenance.value}"
+    )
+    if settlement.notes:
+        settle_block += "\nnotes: " + "; ".join(settlement.notes)
+    console.print(Panel(settle_block, title="Settlement", border_style="cyan"))
+
+    if station_state is None:
+        console.print(Panel(
+            "[yellow]No station_state — NWS fetch failed.[/yellow]",
+            title="Station State", border_style="yellow",
+        ))
+        return
+    rm = f"{station_state.running_max_f:g}°F" if station_state.running_max_f is not None else "—"
+    rmin = f"{station_state.running_min_f:g}°F" if station_state.running_min_f is not None else "—"
+    latest = "—"
+    if station_state.latest:
+        latest = (f"{station_state.latest.temperature_f:g}°F at "
+                  f"{station_state.latest.observed_at.isoformat(timespec='minutes')}")
+    cli_line = "—"
+    if station_state.cli_report_date:
+        match = "matches market date" if station_state.cli_matches_market_date else "STALE — different date"
+        cli_line = (f"{station_state.cli_report_date.isoformat()}  "
+                    f"max={station_state.cli_max_f}  min={station_state.cli_min_f}  ({match})")
+    state_block = (
+        f"window:    {station_state.window_start.isoformat()}  →  "
+        f"{station_state.window_end.isoformat()}\n"
+        f"running:   max {rm}    min {rmin}\n"
+        f"obs count: {len(station_state.observations)}\n"
+        f"latest:    {latest}\n"
+        f"CLI:       {cli_line}"
+    )
+    console.print(Panel(state_block, title="Station State", border_style="cyan"))
+
+    in_window = _in_window_forecast(forecast, station_state, now_utc)
+    if not in_window:
+        console.print(Panel("[dim]no forecast points remaining in market window[/dim]",
+                            title="Forecast (in-window)", border_style="cyan"))
+    else:
+        f_table = Table(header_style="bold cyan", show_edge=False)
+        f_table.add_column("when (UTC)")
+        f_table.add_column("temp", justify="right")
+        f_table.add_column("sky %", justify="right")
+        f_table.add_column("precip %", justify="right")
+        f_table.add_column("wind", justify="right")
+        # Cap at first 12 to keep output tight.
+        for p in in_window[:12]:
+            f_table.add_row(
+                p.start.isoformat(timespec="minutes"),
+                f"{p.temperature_f:g}°F",
+                f"{p.sky_cover_pct:g}" if p.sky_cover_pct is not None else "—",
+                f"{p.probability_of_precip:g}" if p.probability_of_precip is not None else "—",
+                f"{p.wind_speed_mph:g}" if p.wind_speed_mph is not None else "—",
+            )
+        tail = f"  (+{len(in_window) - 12} more)" if len(in_window) > 12 else ""
+        console.print(Panel(f_table, title=f"Forecast (in-window){tail}", border_style="cyan"))
+
+    if regime_reading is not None:
+        regime_block = (
+            f"regime:     {regime_reading.regime.value}\n"
+            f"confidence: {regime_reading.confidence:.2f}\n"
+            "reasoning:  " + ("; ".join(regime_reading.reasoning) or "—")
+        )
+        console.print(Panel(regime_block, title="Regime", border_style="cyan"))
+
+    if state_value is not None:
+        console.print(Panel(
+            f"state:  [bold]{state_value.value}[/bold]\nreason: {state_reason}",
+            title="State Machine", border_style="green",
+        ))
+
+    if fair_lo is not None:
+        shift = config.regime_shift_for(
+            regime_reading.regime.value if regime_reading else "unknown",
+            contract.metric.value, contract.bracket.kind.value,
+        )
+        mid = (fair_lo + fair_hi) / 2.0
+        shift_line = (f"\nregime shift applied: {shift:+.3f}"
+                      if shift != 0.0 else
+                      "\nregime shift applied: 0 (no calibrated shift for this regime/metric/kind)")
+        console.print(Panel(
+            f"fair_prob: [{fair_lo:.3f}, {fair_hi:.3f}]  (mid {mid:.3f})" + shift_line,
+            title="Fair Probability", border_style="green",
+        ))
+
+    if eval_ is not None:
+        ey = f"{eval_.edge_yes:+.3f}" if eval_.edge_yes is not None else "—"
+        en = f"{eval_.edge_no:+.3f}" if eval_.edge_no is not None else "—"
+        spread = (market.yes_ask - market.yes_bid) if (market.yes_ask and market.yes_bid) else None
+        derivation = _derivation_for_eval(eval_, state_value, spread, config)
+        notes_line = ("notes:\n  - " + "\n  - ".join(eval_.notes)) if eval_.notes else "notes: —"
+        grade_block = (
+            f"[bold]grade: {eval_.grade}[/bold]\n"
+            f"yes_ask: {eval_.yes_ask_cents}c  edge_yes: {ey}\n"
+            f"no_ask:  {eval_.no_ask_cents}c  edge_no:  {en}\n"
+            f"derivation: {derivation}\n"
+            f"{notes_line}"
+        )
+        console.print(Panel(grade_block, title="Grade", border_style="bold green"))
+
+
+@main.command()
 @click.argument("event_ticker")
 @click.option("--interval", type=int, default=300, help="Seconds between polls.")
 @click.option("--min-grade", default="B", help="Only emit alerts at or above this grade.")
@@ -618,18 +1055,43 @@ def cities() -> None:
 
 # -- V0.7 snapshot / settlement / backtest / replay --------------------------
 
+_TIME_FORMATS = ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M",
+                 "%Y-%m-%d"]
+
+
 @main.command()
 @click.option("--store", "store_path", required=True, type=click.Path())
+@click.option("--ticker", "market_ticker", default=None,
+              help="Filter to one market ticker's full history.")
+@click.option("--event", "event_ticker", default=None,
+              help="Filter to all markets in one event over time.")
 @click.option("--market-date", type=click.DateTime(formats=["%Y-%m-%d"]),
               help="Filter to a single market date (YYYY-MM-DD).")
 @click.option("--min-grade", default=None, help="Show only snapshots at this grade or better.")
+@click.option("--since", "since_str", default=None,
+              help="Lower bound on scanned_at_utc (e.g. 2026-05-29T12:00 or 2026-05-29).")
+@click.option("--until", "until_str", default=None,
+              help="Upper bound on scanned_at_utc.")
 @click.option("--limit", type=int, default=50)
-def snapshots(store_path: str, market_date: Optional[datetime],
-              min_grade: Optional[str], limit: int) -> None:
-    """Query the snapshot store. Useful for inspecting what scan recorded."""
+def snapshots(store_path: str, market_ticker: Optional[str],
+              event_ticker: Optional[str], market_date: Optional[datetime],
+              min_grade: Optional[str], since_str: Optional[str],
+              until_str: Optional[str], limit: int) -> None:
+    """Query the snapshot store. Useful for inspecting what scan recorded.
+
+    `--ticker` pulls a single market's full price/state history — useful when
+    a flagged contract has aged out of the default top-N view. Combine with
+    `--since` / `--until` to scope a time window.
+    """
     md = market_date.date() if market_date else None
+    since = _parse_utc(since_str) if since_str else None
+    until = _parse_utc(until_str) if until_str else None
     with SnapshotStore(store_path) as store:
-        rows = store.query_snapshots(market_date=md, min_grade=min_grade, limit=limit)
+        rows = store.query_snapshots(
+            market_ticker=market_ticker, event_ticker=event_ticker,
+            market_date=md, min_grade=min_grade,
+            since=since, until=until, limit=limit,
+        )
     if not rows:
         console.print("[yellow]no snapshots match[/yellow]")
         return
@@ -658,6 +1120,59 @@ def snapshots(store_path: str, market_date: Optional[datetime],
             f"{rm} / {rmin}",
         )
     console.print(table)
+
+
+def _parse_utc(s: str) -> datetime:
+    """Parse a CLI time string (date or datetime) as UTC."""
+    for fmt in _TIME_FORMATS:
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    raise click.BadParameter(f"unrecognized time format: {s!r}")
+
+
+@main.command()
+@click.option("--store", "store_path", required=True, type=click.Path())
+@click.option("--older-than-days", type=int, required=True,
+              help="Delete snapshots scanned more than N days ago.")
+@click.option("--keep-grade", default=None,
+              help="Preserve rows at this grade or better (e.g. --keep-grade A "
+                   "keeps A+/A history forever).")
+@click.option("--dry-run", is_flag=True,
+              help="Report how many rows would be deleted without touching the store.")
+def prune(store_path: str, older_than_days: int,
+          keep_grade: Optional[str], dry_run: bool) -> None:
+    """Evict old snapshot rows. Use to bound the store's growth.
+
+    Settled history that drives the calibration loop should be preserved with
+    `--keep-grade A` — the realized P/L for A+/A picks is what tunes the next
+    iteration of cutoffs. Lower-grade noise can be pruned aggressively.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=older_than_days)
+    grade_order = ["A+", "A", "B+", "B", "C", "D", "F"]
+    keep_tuple: Optional[tuple[str, ...]] = None
+    if keep_grade:
+        if keep_grade not in grade_order:
+            raise click.BadParameter(f"--keep-grade must be one of {grade_order}")
+        keep_tuple = tuple(grade_order[: grade_order.index(keep_grade) + 1])
+
+    with SnapshotStore(store_path) as store:
+        if dry_run:
+            n_eligible = store.count_snapshots(before=cutoff, keep_grades=keep_tuple)
+            kept = ""
+            if keep_tuple:
+                kept = f"  (preserving grades {', '.join(keep_tuple)})"
+            console.print(
+                f"[dim]dry-run: {n_eligible} snapshots older than "
+                f"{cutoff.isoformat(timespec='minutes')} would be deleted{kept}[/dim]"
+            )
+            return
+        deleted = store.prune_snapshots(before=cutoff, keep_grades=keep_tuple)
+        console.print(
+            f"[green]pruned {deleted} snapshots older than "
+            f"{cutoff.isoformat(timespec='minutes')}[/green]"
+        )
 
 
 @main.command(name="backfill-settlements")
@@ -1163,9 +1678,14 @@ def risk(store_path: str, as_json: bool) -> None:
               help="Show top N opportunities.")
 @click.option("--max-markets", type=int, default=None,
               help="Stop crawling after this many markets (for fast partial scans).")
+@click.option("--all-events", "all_events", is_flag=True,
+              help="Diagnostic: include events whose brackets aren't verified "
+                   "mutually exclusive. Most hits will be FALSE POSITIVES. "
+                   "Do not trade off this output.")
 @click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of a table.")
 def arbitrage(fee_per_leg: int, min_edge: int, min_brackets: int,
-              limit: int, max_markets: Optional[int], as_json: bool) -> None:
+              limit: int, max_markets: Optional[int],
+              all_events: bool, as_json: bool) -> None:
     """Cross-bracket arbitrage scan across ALL open Kalshi events.
 
     Category-agnostic — works on weather, sports, politics, econ data, etc.
@@ -1178,12 +1698,16 @@ def arbitrage(fee_per_leg: int, min_edge: int, min_brackets: int,
     one-shot scan; it does not persist to the snapshot store. Wire into
     cron / `serve` once the math is validated against real prices.
     """
-    console.print(
+    # When --json is on, route human diagnostics (progress, warnings) to
+    # stderr so stdout stays a parseable JSON document for `| jq` consumers.
+    diag = Console(stderr=True) if as_json else console
+
+    diag.print(
         f"[dim]scanning all open Kalshi events "
         f"(fee={fee_per_leg}c/leg, min_edge={min_edge}c, min_brackets={min_brackets})...[/dim]"
     )
     def _progress(markets_seen: int, events_seen: int) -> None:
-        console.print(f"[dim]  {markets_seen} markets, {events_seen} events grouped...[/dim]")
+        diag.print(f"[dim]  {markets_seen} markets, {events_seen} events grouped...[/dim]")
 
     with KalshiClient() as kclient:
         events = list(iter_all_open_events(
@@ -1191,10 +1715,16 @@ def arbitrage(fee_per_leg: int, min_edge: int, min_brackets: int,
             on_progress=_progress, max_markets=max_markets,
         ))
 
-    console.print(f"[dim]{len(events)} multi-bracket events meet the bracket threshold[/dim]")
+    diag.print(f"[dim]{len(events)} multi-bracket events meet the bracket threshold[/dim]")
 
+    if all_events:
+        diag.print(
+            "[bold red]WARNING: --all-events ON — most hits below are FALSE "
+            "POSITIVES from non-mutually-exclusive events. Do NOT trade.[/bold red]"
+        )
     arbs = rank_arbitrage_opportunities(
         events, fee_per_leg_cents=fee_per_leg, min_net_edge_cents=min_edge,
+        require_mex=not all_events,
     )
 
     if as_json:

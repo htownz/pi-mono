@@ -11,12 +11,21 @@ Yes and the rest resolve No. Two no-arbitrage bounds follow:
                           you pay 100 to settle that single position. Profit
                           = Σ yes_bids - 100 - N × fee_per_leg.
 
-The right side is fee-sensitive: Kalshi's per-trade fee depends on side and
-size. We approximate with a flat per-leg cents value (default 2c, override
-via CLI). True arb survives the fee; "edge" reported is after-fee.
+**CRITICAL**: this math only applies to events whose brackets actually partition
+the outcome space (weather temp brackets, election vote-share bands, etc.).
+Kalshi groups many *non*-mutually-exclusive markets under one event_ticker too
+— artist-streams pairwise comparisons, overlapping price thresholds — for
+which Σ yes_bids legitimately exceeds 100 without arbitrage.
 
-This module is **category-agnostic** — it operates on KalshiEvent shape only.
-Same code applies to weather, sports, politics, econ data, entertainment.
+We gate the math on `MUTUALLY_EXCLUSIVE_SERIES`: a whitelist of series_ticker
+prefixes whose bracket structure has been verified MEX. Today that's just
+weather temperature (`KXHIGH*` / `KXLOW*` / `HIGH*`). Expanding the list is a
+manual exercise — pull a sample event from each candidate series and
+confirm the brackets form a disjoint partition.
+
+This module is category-agnostic in spirit but conservative in practice:
+better to miss real opportunities in unverified series than to surface
+false positives from non-MEX events.
 """
 
 from __future__ import annotations
@@ -24,7 +33,26 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
+from kalshi_scout.kalshi import TEMPERATURE_SERIES
 from kalshi_scout.models import KalshiEvent
+
+
+# Series_ticker prefixes whose events have been verified mutually exclusive.
+# Add new entries only after confirming the brackets form a disjoint partition
+# of the outcome space (one and only one bracket can settle Yes).
+MUTUALLY_EXCLUSIVE_SERIES: frozenset[str] = frozenset(TEMPERATURE_SERIES.keys())
+
+
+def is_mutually_exclusive_event(event: KalshiEvent) -> bool:
+    """Best-effort MEX check.
+
+    Returns True iff the event's series_ticker (derived from event_ticker's
+    leading segment if needed) is in MUTUALLY_EXCLUSIVE_SERIES.
+    """
+    series = event.series_ticker or (
+        event.event_ticker.split("-", 1)[0] if event.event_ticker else ""
+    )
+    return series.upper() in MUTUALLY_EXCLUSIVE_SERIES
 
 
 @dataclass(frozen=True)
@@ -129,10 +157,19 @@ def rank_arbitrage_opportunities(
     events: list[KalshiEvent],
     fee_per_leg_cents: int = 2,
     min_net_edge_cents: int = 1,
+    require_mex: bool = True,
 ) -> list[EventArbitrage]:
-    """Compute arb per event, drop those below threshold, sort by net edge."""
+    """Compute arb per event, drop those below threshold, sort by net edge.
+
+    By default skips events that aren't in MUTUALLY_EXCLUSIVE_SERIES; pass
+    `require_mex=False` only for diagnostic dumps where you want to see
+    raw Σ-deviation across all series (most will be false positives — see
+    module docstring).
+    """
     out: list[EventArbitrage] = []
     for event in events:
+        if require_mex and not is_mutually_exclusive_event(event):
+            continue
         arb = compute_event_arbitrage(event, fee_per_leg_cents=fee_per_leg_cents)
         if arb is None or arb.best_net_edge_cents is None:
             continue

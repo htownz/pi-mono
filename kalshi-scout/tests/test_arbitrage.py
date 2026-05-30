@@ -14,6 +14,7 @@ and the >2-bracket eligibility check.
 
 from kalshi_scout.arbitrage import (
     compute_event_arbitrage,
+    is_mutually_exclusive_event,
     rank_arbitrage_opportunities,
 )
 from kalshi_scout.models import KalshiEvent, KalshiMarket
@@ -32,14 +33,18 @@ def _market(ticker: str, yes_ask: int | None = None, yes_bid: int | None = None,
 
 
 def _event(yes_asks: list[int], yes_bids: list[int] | None = None,
-           event_ticker: str = "E") -> KalshiEvent:
+           event_ticker: str = "KXHIGHHOU-26MAY29",
+           series_ticker: str = "KXHIGHHOU") -> KalshiEvent:
+    """Default event uses a known-MEX series (weather) so most tests bypass
+    the mutual-exclusivity gate. Tests that exercise the gate use a
+    non-whitelisted series_ticker explicitly."""
     yes_bids = yes_bids if yes_bids is not None else [a - 1 for a in yes_asks]
     markets = [
         _market(f"{event_ticker}-B{i}", yes_ask=a, yes_bid=b, event_ticker=event_ticker)
         for i, (a, b) in enumerate(zip(yes_asks, yes_bids))
     ]
     return KalshiEvent(
-        event_ticker=event_ticker, series_ticker="",
+        event_ticker=event_ticker, series_ticker=series_ticker,
         title="", sub_title="", markets=markets,
     )
 
@@ -175,3 +180,54 @@ def test_ranking_with_custom_fee_changes_threshold():
     e = _event([15] * 5)
     assert len(rank_arbitrage_opportunities([e], fee_per_leg_cents=2)) == 1
     assert len(rank_arbitrage_opportunities([e], fee_per_leg_cents=5)) == 0
+
+
+# -- Mutual-exclusivity gate (invariant against false positives) -------------
+
+def test_ranking_skips_non_mex_events_by_default():
+    """A non-whitelisted series (e.g. KXARTISTSTREAMSY) is skipped even when
+    the raw Σ-deviation looks like a huge arb — those numbers come from
+    non-disjoint bracket structures and aren't real edge."""
+    fake_arb = _event(
+        yes_asks=[80] * 30, yes_bids=[78] * 30,
+        event_ticker="KXARTISTSTREAMSY-BEY26DEC31",
+        series_ticker="KXARTISTSTREAMSY",
+    )
+    # Without gating: Σ yes_bids = 2340c. no_basket gross = 2240c, fees = 30 × 2c = 60c,
+    # net = +2180c — a fake huge "arb" from a non-mutually-exclusive event.
+    ranked = rank_arbitrage_opportunities([fake_arb])
+    assert ranked == []
+
+
+def test_ranking_keeps_mex_events_with_real_edge():
+    """A whitelisted series (weather) with the same numbers is treated as
+    real candidate edge."""
+    real_arb = _event(
+        yes_asks=[80] * 30, yes_bids=[78] * 30,
+        event_ticker="KXHIGHHOU-26MAY29",
+        series_ticker="KXHIGHHOU",
+    )
+    ranked = rank_arbitrage_opportunities([real_arb])
+    assert len(ranked) == 1
+
+
+def test_require_mex_false_bypasses_gate_for_diagnostics():
+    fake_arb = _event(
+        yes_asks=[80] * 30, yes_bids=[78] * 30,
+        event_ticker="KXARTISTSTREAMSY-BEY26DEC31",
+        series_ticker="KXARTISTSTREAMSY",
+    )
+    ranked = rank_arbitrage_opportunities([fake_arb], require_mex=False)
+    assert len(ranked) == 1
+    # Big "arb" because Σ yes_bids = 2340, no_basket gross = 2240, net = 2180.
+    assert ranked[0].best_net_edge_cents > 2000
+
+
+def test_mex_detection_derives_series_from_event_ticker():
+    """Even if series_ticker is empty, derive it from the event_ticker
+    prefix so weather events still pass the gate."""
+    e = KalshiEvent(
+        event_ticker="KXHIGHHOU-26MAY29", series_ticker="",
+        title="", sub_title="", markets=[],
+    )
+    assert is_mutually_exclusive_event(e) is True
