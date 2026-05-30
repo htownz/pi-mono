@@ -6,7 +6,7 @@ They exercise the full snapshot -> settlement -> backtest -> replay loop
 that activates AGENTS.md invariants D1 and D2.
 """
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -20,6 +20,9 @@ from kalshi_scout.models import (
     Metric,
     ParsedContract,
 )
+import click
+
+from kalshi_scout.cli import _parse_utc
 from kalshi_scout.store import (
     SnapshotStore,
     backtest,
@@ -133,6 +136,110 @@ def test_query_snapshots_filters_by_grade_and_date(store: SnapshotStore):
     assert a_rows[0].grade == "A+"
     # min_grade=C should include both
     assert len(c_rows) == 2
+
+
+# -- Ticker-history query + retention ----------------------------------------
+
+def test_query_snapshots_filters_by_ticker(store: SnapshotStore):
+    """Single-ticker history query — the use case that motivated #2."""
+    store.record_scan(evaluations=[_eval(ticker="KXHIGHHOUSTON-26MAY27-B79-80")])
+    store.record_scan(evaluations=[_eval(ticker="KXHIGHHOUSTON-26MAY27-B80-81")])
+    store.record_scan(evaluations=[_eval(ticker="KXHIGHHOUSTON-26MAY27-B79-80")])
+    rows = store.query_snapshots(market_ticker="KXHIGHHOUSTON-26MAY27-B79-80")
+    assert len(rows) == 2
+    assert {r.market_ticker for r in rows} == {"KXHIGHHOUSTON-26MAY27-B79-80"}
+
+
+def test_query_snapshots_filters_by_since_until(store: SnapshotStore):
+    early = datetime(2026, 5, 27, 10, 0, tzinfo=timezone.utc)
+    mid = datetime(2026, 5, 27, 14, 0, tzinfo=timezone.utc)
+    late = datetime(2026, 5, 27, 18, 0, tzinfo=timezone.utc)
+    store.record_scan(evaluations=[_eval()], scanned_at=early)
+    store.record_scan(evaluations=[_eval()], scanned_at=mid)
+    store.record_scan(evaluations=[_eval()], scanned_at=late)
+
+    # since alone
+    after_noon = store.query_snapshots(
+        since=datetime(2026, 5, 27, 12, 0, tzinfo=timezone.utc),
+    )
+    assert len(after_noon) == 2
+
+    # since + until window
+    window = store.query_snapshots(
+        since=datetime(2026, 5, 27, 12, 0, tzinfo=timezone.utc),
+        until=datetime(2026, 5, 27, 16, 0, tzinfo=timezone.utc),
+    )
+    assert len(window) == 1
+    assert window[0].scanned_at_utc == mid
+
+
+def test_count_snapshots_total_and_before(store: SnapshotStore):
+    early = datetime(2026, 5, 27, 10, 0, tzinfo=timezone.utc)
+    late = datetime(2026, 5, 27, 18, 0, tzinfo=timezone.utc)
+    store.record_scan(evaluations=[_eval()], scanned_at=early)
+    store.record_scan(evaluations=[_eval()], scanned_at=late)
+
+    assert store.count_snapshots() == 2
+    assert store.count_snapshots(
+        before=datetime(2026, 5, 27, 12, 0, tzinfo=timezone.utc),
+    ) == 1
+
+
+def test_prune_snapshots_deletes_old_rows(store: SnapshotStore):
+    # Microseconds zeroed so the stored ISO timestamp round-trips exactly.
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    old = now - timedelta(days=45)
+    recent = now - timedelta(days=5)
+    store.record_scan(evaluations=[_eval()], scanned_at=old)
+    store.record_scan(evaluations=[_eval()], scanned_at=recent)
+
+    deleted = store.prune_snapshots(before=now - timedelta(days=30))
+    assert deleted == 1
+    remaining = store.query_snapshots()
+    assert len(remaining) == 1
+    assert remaining[0].scanned_at_utc == recent
+
+
+def test_prune_snapshots_preserves_kept_grades(store: SnapshotStore):
+    """`keep_grades` lets us prune noise while keeping the calibration loop's
+    settled history intact — A+/A picks drive the next config iteration."""
+    now = datetime.now(timezone.utc)
+    old = now - timedelta(days=45)
+    store.record_scan(evaluations=[_eval(grade="A+")], scanned_at=old)
+    store.record_scan(evaluations=[_eval(grade="B")], scanned_at=old)
+    store.record_scan(evaluations=[_eval(grade="D")], scanned_at=old)
+
+    deleted = store.prune_snapshots(
+        before=now - timedelta(days=30),
+        keep_grades=("A+", "A"),
+    )
+    assert deleted == 2  # B and D pruned, A+ kept
+    remaining = {r.grade for r in store.query_snapshots()}
+    assert remaining == {"A+"}
+
+
+def test_prune_snapshots_is_noop_when_nothing_qualifies(store: SnapshotStore):
+    now = datetime.now(timezone.utc)
+    store.record_scan(evaluations=[_eval()], scanned_at=now - timedelta(hours=1))
+    deleted = store.prune_snapshots(before=now - timedelta(days=30))
+    assert deleted == 0
+    assert len(store.query_snapshots()) == 1
+
+
+def test_parse_utc_accepts_date_and_datetime_forms():
+    """The `--since` / `--until` CLI options accept multiple shorthand forms."""
+    expected = datetime(2026, 5, 29, 0, 0, tzinfo=timezone.utc)
+    assert _parse_utc("2026-05-29") == expected
+
+    with_hour = datetime(2026, 5, 29, 12, 30, tzinfo=timezone.utc)
+    assert _parse_utc("2026-05-29T12:30") == with_hour
+    assert _parse_utc("2026-05-29 12:30") == with_hour
+    assert _parse_utc("2026-05-29T12:30:00") == with_hour
+
+
+def test_parse_utc_rejects_garbage():
+    with pytest.raises(click.BadParameter):
+        _parse_utc("not a date")
 
 
 # -- Settlement derivation ---------------------------------------------------

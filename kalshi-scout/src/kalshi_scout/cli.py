@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import sys
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Iterable, Optional
 
 import click
@@ -1027,18 +1027,43 @@ def cities() -> None:
 
 # -- V0.7 snapshot / settlement / backtest / replay --------------------------
 
+_TIME_FORMATS = ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M",
+                 "%Y-%m-%d"]
+
+
 @main.command()
 @click.option("--store", "store_path", required=True, type=click.Path())
+@click.option("--ticker", "market_ticker", default=None,
+              help="Filter to one market ticker's full history.")
+@click.option("--event", "event_ticker", default=None,
+              help="Filter to all markets in one event over time.")
 @click.option("--market-date", type=click.DateTime(formats=["%Y-%m-%d"]),
               help="Filter to a single market date (YYYY-MM-DD).")
 @click.option("--min-grade", default=None, help="Show only snapshots at this grade or better.")
+@click.option("--since", "since_str", default=None,
+              help="Lower bound on scanned_at_utc (e.g. 2026-05-29T12:00 or 2026-05-29).")
+@click.option("--until", "until_str", default=None,
+              help="Upper bound on scanned_at_utc.")
 @click.option("--limit", type=int, default=50)
-def snapshots(store_path: str, market_date: Optional[datetime],
-              min_grade: Optional[str], limit: int) -> None:
-    """Query the snapshot store. Useful for inspecting what scan recorded."""
+def snapshots(store_path: str, market_ticker: Optional[str],
+              event_ticker: Optional[str], market_date: Optional[datetime],
+              min_grade: Optional[str], since_str: Optional[str],
+              until_str: Optional[str], limit: int) -> None:
+    """Query the snapshot store. Useful for inspecting what scan recorded.
+
+    `--ticker` pulls a single market's full price/state history — useful when
+    a flagged contract has aged out of the default top-N view. Combine with
+    `--since` / `--until` to scope a time window.
+    """
     md = market_date.date() if market_date else None
+    since = _parse_utc(since_str) if since_str else None
+    until = _parse_utc(until_str) if until_str else None
     with SnapshotStore(store_path) as store:
-        rows = store.query_snapshots(market_date=md, min_grade=min_grade, limit=limit)
+        rows = store.query_snapshots(
+            market_ticker=market_ticker, event_ticker=event_ticker,
+            market_date=md, min_grade=min_grade,
+            since=since, until=until, limit=limit,
+        )
     if not rows:
         console.print("[yellow]no snapshots match[/yellow]")
         return
@@ -1067,6 +1092,59 @@ def snapshots(store_path: str, market_date: Optional[datetime],
             f"{rm} / {rmin}",
         )
     console.print(table)
+
+
+def _parse_utc(s: str) -> datetime:
+    """Parse a CLI time string (date or datetime) as UTC."""
+    for fmt in _TIME_FORMATS:
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    raise click.BadParameter(f"unrecognized time format: {s!r}")
+
+
+@main.command()
+@click.option("--store", "store_path", required=True, type=click.Path())
+@click.option("--older-than-days", type=int, required=True,
+              help="Delete snapshots scanned more than N days ago.")
+@click.option("--keep-grade", default=None,
+              help="Preserve rows at this grade or better (e.g. --keep-grade A "
+                   "keeps A+/A history forever).")
+@click.option("--dry-run", is_flag=True,
+              help="Report how many rows would be deleted without touching the store.")
+def prune(store_path: str, older_than_days: int,
+          keep_grade: Optional[str], dry_run: bool) -> None:
+    """Evict old snapshot rows. Use to bound the store's growth.
+
+    Settled history that drives the calibration loop should be preserved with
+    `--keep-grade A` — the realized P/L for A+/A picks is what tunes the next
+    iteration of cutoffs. Lower-grade noise can be pruned aggressively.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=older_than_days)
+    grade_order = ["A+", "A", "B+", "B", "C", "D", "F"]
+    keep_tuple: Optional[tuple[str, ...]] = None
+    if keep_grade:
+        if keep_grade not in grade_order:
+            raise click.BadParameter(f"--keep-grade must be one of {grade_order}")
+        keep_tuple = tuple(grade_order[: grade_order.index(keep_grade) + 1])
+
+    with SnapshotStore(store_path) as store:
+        if dry_run:
+            n_eligible = store.count_snapshots(before=cutoff)
+            kept = ""
+            if keep_tuple:
+                kept = f"  (would preserve grades {', '.join(keep_tuple)})"
+            console.print(
+                f"[dim]dry-run: {n_eligible} snapshots older than "
+                f"{cutoff.isoformat(timespec='minutes')} match{kept}[/dim]"
+            )
+            return
+        deleted = store.prune_snapshots(before=cutoff, keep_grades=keep_tuple)
+        console.print(
+            f"[green]pruned {deleted} snapshots older than "
+            f"{cutoff.isoformat(timespec='minutes')}[/green]"
+        )
 
 
 @main.command(name="backfill-settlements")
