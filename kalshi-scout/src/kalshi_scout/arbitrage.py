@@ -17,19 +17,26 @@ Kalshi groups many *non*-mutually-exclusive markets under one event_ticker too
 — artist-streams pairwise comparisons, overlapping price thresholds — for
 which Σ yes_bids legitimately exceeds 100 without arbitrage.
 
-We gate the math on `MUTUALLY_EXCLUSIVE_SERIES`: a whitelist of series_ticker
-prefixes whose bracket structure has been verified MEX. Today that's just
-weather temperature (`KXHIGH*` / `KXLOW*` / `HIGH*`). Expanding the list is a
-manual exercise — pull a sample event from each candidate series and
-confirm the brackets form a disjoint partition.
+We gate the math two ways:
 
-This module is category-agnostic in spirit but conservative in practice:
-better to miss real opportunities in unverified series than to surface
-false positives from non-MEX events.
+  1. `MUTUALLY_EXCLUSIVE_SERIES`: a hand-curated whitelist of series_ticker
+     prefixes whose bracket structure has been confirmed MEX (today: weather
+     temperature, `KXHIGH*` / `KXLOW*` / `HIGH*`).
+
+  2. `detect_numeric_partition`: algorithmic fallback that parses numeric
+     ranges from each market's yes_sub_title and confirms they tile a
+     contiguous numeric axis with no overlaps. Promotes any event whose
+     brackets look like `60-61°`, `61-62°`, ... regardless of series_ticker.
+
+The fallback is conservative by design: an event with any market whose
+yes_sub_title doesn't parse as a numeric interval is rejected (catches
+artist-streams pairwise comparisons cleanly). Pass `--strict-mex` on the
+arbitrage CLI to disable the fallback and use whitelist-only.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Optional
 
@@ -43,16 +50,153 @@ from kalshi_scout.models import KalshiEvent
 MUTUALLY_EXCLUSIVE_SERIES: frozenset[str] = frozenset(TEMPERATURE_SERIES.keys())
 
 
-def is_mutually_exclusive_event(event: KalshiEvent) -> bool:
+# -- Algorithmic MEX detection -----------------------------------------------
+
+# Matches "60-61", "60 to 61", "60° to 61°", "$3.00–$3.50", etc.
+# The interval marker can be a hyphen, "to", en-dash, or em-dash.
+_RANGE_RE = re.compile(
+    r"(-?\d+(?:\.\d+)?)\s*(?:°|°[FCK])?\s*"
+    r"(?:to|-|–|—)\s*"
+    r"(-?\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+# "above N" / "over N" / ">N"
+_ABOVE_PREFIX_RE = re.compile(
+    r"\b(?:above|over|greater than|at least|>=?)\s*(-?\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+# "N or above" / "N or higher" / "N+"
+_ABOVE_SUFFIX_RE = re.compile(
+    r"(-?\d+(?:\.\d+)?)\s*°?\s*(?:or above|or higher|or more|or greater|\+)",
+    re.IGNORECASE,
+)
+_BELOW_PREFIX_RE = re.compile(
+    r"\b(?:below|under|less than|at most|<=?)\s*(-?\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+_BELOW_SUFFIX_RE = re.compile(
+    r"(-?\d+(?:\.\d+)?)\s*°?\s*(?:or below|or lower|or fewer|or less)",
+    re.IGNORECASE,
+)
+_EXACT_RE = re.compile(
+    r"\b(?:exactly|equal to|=)\s*(-?\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+
+# Gap tolerance between adjacent intervals (in interval units). 1.5 is
+# generous enough for integer-bucket weather (`60-61` then `62-63` has a
+# 1-unit gap that's actually the strict-inequality boundary) and tight
+# enough that an event missing a whole bucket would be rejected.
+_GAP_TOLERANCE = 1.5
+
+
+def _parse_interval(text: Optional[str]) -> Optional[tuple[float, float]]:
+    """Return (lo, hi) extracted from a yes_sub_title-like string.
+
+    Endpoints may be ±inf for "above N" / "below N" tail brackets. Returns
+    None when no recognizable interval pattern is found — caller treats
+    that as "this market can't participate in the partition check".
+    """
+    if not text:
+        return None
+    cleaned = text.strip().replace("$", "").replace(",", "")
+    # Strip everything before the first digit; phrases like "between 60 and 61"
+    # confuse the BELOW pattern otherwise.
+    m = _RANGE_RE.search(cleaned)
+    if m:
+        a, b = float(m.group(1)), float(m.group(2))
+        return (min(a, b), max(a, b))
+    for above_re in (_ABOVE_SUFFIX_RE, _ABOVE_PREFIX_RE):
+        m = above_re.search(cleaned)
+        if m:
+            return (float(m.group(1)), float("inf"))
+    for below_re in (_BELOW_SUFFIX_RE, _BELOW_PREFIX_RE):
+        m = below_re.search(cleaned)
+        if m:
+            return (float("-inf"), float(m.group(1)))
+    m = _EXACT_RE.search(cleaned)
+    if m:
+        v = float(m.group(1))
+        return (v, v)
+    return None
+
+
+def _is_partition(intervals: list[tuple[float, float]]) -> tuple[bool, str]:
+    """True iff intervals (any order) tile a contiguous numeric axis with no
+    overlaps and no significant gaps. Returns (verdict, reason) for diagnostics.
+    """
+    if len(intervals) < 2:
+        return False, "fewer than 2 intervals"
+    finite = [iv for iv in intervals if iv[0] != float("-inf") and iv[1] != float("inf")]
+    if not finite:
+        return False, "no finite intervals to anchor the partition"
+    sorted_iv = sorted(intervals)
+    for prev, curr in zip(sorted_iv, sorted_iv[1:]):
+        if curr[0] < prev[1] - 0.01:
+            return False, f"overlap: {prev} and {curr}"
+        if (curr[0] - prev[1]) > _GAP_TOLERANCE:
+            return False, f"gap of {curr[0] - prev[1]:g} between {prev} and {curr}"
+    return True, f"partitions axis across {len(intervals)} intervals"
+
+
+@dataclass(frozen=True)
+class MexDetection:
+    """Audit-friendly result from algorithmic MEX detection."""
+    is_mex: bool
+    reason: str
+    n_markets: int
+    n_parsed: int          # markets whose yes_sub_title yielded an interval
+
+
+def detect_numeric_partition(event: KalshiEvent) -> MexDetection:
+    """Heuristic MEX classifier: does this event's bracket structure tile a
+    numeric axis cleanly?
+
+    Returns True when every market in the event has a parseable numeric
+    interval (from yes_sub_title, falling back to title) AND those intervals
+    form a contiguous non-overlapping partition. Either condition failing
+    drops the event back into "treat as non-MEX" territory.
+    """
+    n = len(event.markets)
+    if n < 2:
+        return MexDetection(False, "fewer than 2 markets", n, 0)
+    intervals: list[tuple[float, float]] = []
+    n_parsed = 0
+    for m in event.markets:
+        iv = _parse_interval(m.yes_sub_title) or _parse_interval(m.title)
+        if iv is None:
+            return MexDetection(
+                False, f"market {m.ticker} has no parseable numeric range "
+                f"(yes_sub_title={m.yes_sub_title!r})",
+                n, n_parsed,
+            )
+        n_parsed += 1
+        intervals.append(iv)
+    ok, reason = _is_partition(intervals)
+    return MexDetection(ok, reason, n, n_parsed)
+
+
+def is_mutually_exclusive_event(event: KalshiEvent, *, strict: bool = False) -> bool:
     """Best-effort MEX check.
 
-    Returns True iff the event's series_ticker (derived from event_ticker's
-    leading segment if needed) is in MUTUALLY_EXCLUSIVE_SERIES.
+    Pass-conditions (any one suffices):
+      - Event's series_ticker (or event_ticker prefix) is in the curated
+        `MUTUALLY_EXCLUSIVE_SERIES` whitelist.
+      - `detect_numeric_partition(event)` returns True — the brackets tile
+        a numeric axis cleanly. Skipped when `strict=True`.
+
+    The detector adds expressive power without introducing the artist-streams
+    false positives: non-MEX events overwhelmingly use non-numeric labels
+    ("Team X wins") that fail interval parsing.
     """
     series = event.series_ticker or (
         event.event_ticker.split("-", 1)[0] if event.event_ticker else ""
     )
-    return series.upper() in MUTUALLY_EXCLUSIVE_SERIES
+    if series.upper() in MUTUALLY_EXCLUSIVE_SERIES:
+        return True
+    if strict:
+        return False
+    return detect_numeric_partition(event).is_mex
 
 
 @dataclass(frozen=True)
@@ -158,17 +302,23 @@ def rank_arbitrage_opportunities(
     fee_per_leg_cents: int = 2,
     min_net_edge_cents: int = 1,
     require_mex: bool = True,
+    strict_mex: bool = False,
 ) -> list[EventArbitrage]:
     """Compute arb per event, drop those below threshold, sort by net edge.
 
-    By default skips events that aren't in MUTUALLY_EXCLUSIVE_SERIES; pass
-    `require_mex=False` only for diagnostic dumps where you want to see
-    raw Σ-deviation across all series (most will be false positives — see
-    module docstring).
+    `require_mex=True` (default): only events that pass MEX gating are
+    scored. By default the gate accepts both the curated whitelist AND
+    events whose brackets pass `detect_numeric_partition`. Pass
+    `strict_mex=True` to use the whitelist only (and reject everything
+    else regardless of bracket structure) — the V1.1 behavior.
+
+    `require_mex=False`: bypass the gate entirely for diagnostic dumps
+    where you want to see raw Σ-deviation across all series. Most hits
+    will be false positives from non-MEX events; do not trade them.
     """
     out: list[EventArbitrage] = []
     for event in events:
-        if require_mex and not is_mutually_exclusive_event(event):
+        if require_mex and not is_mutually_exclusive_event(event, strict=strict_mex):
             continue
         arb = compute_event_arbitrage(event, fee_per_leg_cents=fee_per_leg_cents)
         if arb is None or arb.best_net_edge_cents is None:
