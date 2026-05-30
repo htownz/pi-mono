@@ -38,7 +38,9 @@ from kalshi_scout.models import (
 from kalshi_scout.notify import (
     AlertDispatcher,
     AlertSink,
+    DiscordSink,
     JsonlSink,
+    NtfySink,
     StdoutSink,
     WebhookSink,
 )
@@ -106,9 +108,11 @@ def _build_sinks(specs: tuple[str, ...]) -> list[AlertSink]:
     """Parse --notify spec strings into sink instances.
 
     Accepted forms:
-      stdout                       -> StdoutSink
-      jsonl:/abs/or/rel/path.jsonl -> JsonlSink(path)
-      webhook:https://example.com  -> WebhookSink(url)
+      stdout                          -> StdoutSink
+      jsonl:/abs/or/rel/path.jsonl    -> JsonlSink(path)
+      webhook:https://example.com     -> WebhookSink(url)         (raw alert JSON)
+      ntfy:<topic-or-url>             -> NtfySink                 (push to phone)
+      discord:https://discord.com/... -> DiscordSink              (rich embed)
     """
     sinks: list[AlertSink] = []
     for spec in specs:
@@ -118,9 +122,14 @@ def _build_sinks(specs: tuple[str, ...]) -> list[AlertSink]:
             sinks.append(JsonlSink(spec[len("jsonl:"):]))
         elif spec.startswith("webhook:"):
             sinks.append(WebhookSink(spec[len("webhook:"):]))
+        elif spec.startswith("ntfy:"):
+            sinks.append(NtfySink(spec[len("ntfy:"):]))
+        elif spec.startswith("discord:"):
+            sinks.append(DiscordSink(spec[len("discord:"):]))
         else:
             raise click.BadParameter(
-                f"--notify spec '{spec}' not recognized; use stdout, jsonl:PATH, or webhook:URL"
+                f"--notify spec '{spec}' not recognized; "
+                "use stdout, jsonl:PATH, webhook:URL, ntfy:TOPIC, or discord:URL"
             )
     return sinks
 
@@ -350,7 +359,8 @@ def main() -> None:
 @click.option("--store", "store_path", type=click.Path(), default=None,
               help="Persist every evaluation to a SQLite snapshot store (path).")
 @click.option("--notify", "notify_specs", multiple=True,
-              help="Alert sink spec: 'stdout', 'jsonl:/path.jsonl', or 'webhook:https://...'. "
+              help="Alert sink spec: 'stdout', 'jsonl:/path.jsonl', 'webhook:URL', "
+                   "'ntfy:TOPIC' (or 'ntfy:https://self-hosted/topic'), or 'discord:WEBHOOK_URL'. "
                    "May be passed multiple times. Requires --store.")
 @click.option("--notify-min-grade", default="A",
               help="Only fire alerts at this grade or better (default A).")
@@ -1414,7 +1424,8 @@ def replay(store_path: str, snapshot_id: int) -> None:
 @click.option("--min-grade", default="C",
               help="Skip results worse than this grade.")
 @click.option("--notify", "notify_specs", multiple=True,
-              help="Alert sink spec: 'stdout', 'jsonl:/path.jsonl', or 'webhook:https://...'.")
+              help="Alert sink spec: 'stdout', 'jsonl:PATH', 'webhook:URL', "
+                   "'ntfy:TOPIC', or 'discord:WEBHOOK_URL'.")
 @click.option("--notify-min-grade", default="A",
               help="Only fire alerts at this grade or better.")
 @click.option("--config", "config_path", type=click.Path(exists=True), default=None,
