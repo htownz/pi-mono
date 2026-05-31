@@ -21,6 +21,13 @@ services:
       - --notify=stdout
       - --notify=jsonl:/data/alerts.jsonl
       - --notify-min-grade=A
+      - --auto-trade
+      - --paper
+      - --api-key-id=9d5e530a-77bf-4c2b-8d03-86e7466fdb85
+      - --api-key-path=/data/kalshi.pem
+      - --kill-file=/data/scout.kill
+      - --audit-log=/data/auto-trade.jsonl
+      - --refresh-quote
     environment:
       - PYTHONUNBUFFERED=1
 
