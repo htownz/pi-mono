@@ -266,7 +266,7 @@ def test_detector_passes_clean_weather_partition():
     `KXUNKNOWN` series isn't in the whitelist, so this only passes via the
     algorithmic detector."""
     event = _typed_event([
-        "59° or below",      # LT tail
+        "60° or below",      # LT tail
         "60° to 61°", "61° to 62°", "62° to 63°", "63° to 64°", "64° to 65°",
         "65° or above",      # GT tail
     ])
@@ -297,7 +297,7 @@ def test_detector_rejects_overlapping_ranges():
     """Tails-present event whose finite buckets overlap must be rejected
     — the no-arb math is invalid even if labels parse and tails exist."""
     event = _typed_event([
-        "9 or below",
+        "10 or below",
         "10 to 20", "15 to 25", "20 to 30",
         "30 or above",
     ])
@@ -310,7 +310,7 @@ def test_detector_rejects_large_gap():
     """Tails-present event with a missing middle bucket: finite intervals
     don't tile adjacently, so settlement in the gap has no winning bracket."""
     event = _typed_event([
-        "59 or below",
+        "60 or below",
         "60 to 65", "70 to 75",   # 5-unit gap between 65 and 70
         "75 or above",
     ])
@@ -329,7 +329,7 @@ def test_detector_accepts_mixed_inclusive_exclusive_boundaries():
     """Weather-style buckets share endpoints (`60-61` then `61-62`) with
     gap=0 between them. With tail brackets at both ends, this passes."""
     event = _typed_event([
-        "59 or below",
+        "60 or below",
         "60 to 61", "61 to 62", "62 to 63",
         "63 or above",
     ])
@@ -388,7 +388,7 @@ def test_detector_rejects_decimal_gap_below_old_blanket_tolerance():
 def test_strict_mex_disables_algorithmic_fallback():
     """`--strict-mex` returns the V1.1 whitelist-only behavior."""
     event = _typed_event([
-        "59 or below",
+        "60 or below",
         "60 to 61", "61 to 62", "62 to 63",
         "63 or above",
     ], series_ticker="KXTOTALLYNEW")
@@ -400,7 +400,7 @@ def test_ranker_strict_mex_rejects_algorithmically_detected_events():
     """End-to-end: an event the detector promotes shows up in `rank` with
     default args but disappears under `strict_mex=True`."""
     sub_titles = [
-        "59 or below",
+        "60 or below",
         "60 to 61", "61 to 62", "62 to 63", "63 to 64", "64 to 65",
         "65 or above",
     ]
@@ -422,7 +422,7 @@ def test_detector_handles_above_below_tail_brackets():
     """Tail brackets extend coverage to ±inf so the contiguous-axis check
     passes for finite intervals between them."""
     event = _typed_event([
-        "59° or below",
+        "60° or below",
         "60° to 61°", "61° to 62°", "62° to 63°",
         "63° or above",
     ])
@@ -451,6 +451,53 @@ def test_detector_does_not_fall_back_to_title():
     result = detect_numeric_partition(event)
     assert result.is_mex is False
     assert "no parseable numeric range" in result.reason
+
+
+def test_detector_rejects_gap_between_low_tail_and_first_finite():
+    """Codex P1: `2 or below` + `3 to 4` + `4 or above` has a (2, 3) gap
+    that no bracket covers. The detector now verifies tail-finite adjacency
+    in addition to finite-finite gaps."""
+    event = _typed_event([
+        "2 or below", "3 to 4", "4 or above",
+    ])
+    result = detect_numeric_partition(event)
+    assert result.is_mex is False
+    assert "low-tail" in result.reason
+    assert "gap" in result.reason
+
+
+def test_detector_rejects_gap_between_last_finite_and_high_tail():
+    """Mirror of the above on the high side: `0 or below`, `0-1`, `5 or above`
+    has a (1, 5) gap between the last finite bucket and the high tail."""
+    event = _typed_event([
+        "0 or below", "0 to 1", "5 or above",
+    ])
+    result = detect_numeric_partition(event)
+    assert result.is_mex is False
+    assert "high-tail" in result.reason
+    assert "gap" in result.reason
+
+
+def test_detector_rejects_low_tail_overlapping_first_finite():
+    """`5 or below` overlaps `3 to 7` (the finite bucket starts at 3,
+    below 5). A settlement at 4 has two Yes brackets, which is the
+    overlap case the gate must reject."""
+    event = _typed_event([
+        "5 or below", "3 to 7", "7 or above",
+    ])
+    result = detect_numeric_partition(event)
+    assert result.is_mex is False
+    assert "overlap" in result.reason
+
+
+def test_detector_accepts_pure_tails_when_touching():
+    """A 2-market event with only the two tails meeting at a single value
+    (`50 or below` + `50 or above`) IS a valid partition — every outcome
+    has exactly one winning bracket."""
+    event = _typed_event([
+        "50 or below", "50 or above",
+    ])
+    assert detect_numeric_partition(event).is_mex is True
 
 
 def test_parse_interval_handles_symbolic_operators():

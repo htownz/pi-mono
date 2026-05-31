@@ -125,43 +125,83 @@ def _parse_interval(text: Optional[str]) -> Optional[tuple[float, float]]:
 
 
 def _is_partition(intervals: list[tuple[float, float]]) -> tuple[bool, str]:
-    """True iff intervals tile the entire real line: at least one tail
-    bracket on each end AND finite intervals between them tile adjacently
-    with no overlaps or gaps. Returns (verdict, reason) for diagnostics.
+    """True iff intervals tile the entire real line: a low tail bracket and
+    a high tail bracket on the ends AND finite intervals between them tile
+    adjacently — including across the tail/finite boundaries — with no
+    overlaps or gaps. Returns (verdict, reason) for diagnostics.
 
     Requiring tail brackets (low-tail = `-inf`-bounded, high-tail = `+inf`-
     bounded) is the gate's exhaustive-coverage proof: a finite-only set like
     `$3.00 to $3.25`, `$3.25 to $3.50`, `$3.50 to $3.75` has no winning
-    bracket for prices outside that span, so the no-arbitrage math is
-    invalid even though the listed buckets tile cleanly.
+    bracket for prices outside that span, so the no-arbitrage math is invalid.
+
+    Tail adjacency matters too: `2 or below` + `3 to 4` + `4 or above` has
+    a real (2, 3) gap that no bracket covers; without the tail-finite
+    boundary check, the gap-against-finite-only sweep wouldn't catch it.
     """
     if len(intervals) < 2:
         return False, "fewer than 2 intervals"
-    has_low_tail = any(iv[0] == float("-inf") for iv in intervals)
-    has_high_tail = any(iv[1] == float("inf") for iv in intervals)
-    if not (has_low_tail and has_high_tail):
+    low_tails = [iv for iv in intervals if iv[0] == float("-inf")]
+    high_tails = [iv for iv in intervals if iv[1] == float("inf")]
+    if not (low_tails and high_tails):
         missing = []
-        if not has_low_tail:
+        if not low_tails:
             missing.append("below-tail (e.g. 'N or below')")
-        if not has_high_tail:
+        if not high_tails:
             missing.append("above-tail (e.g. 'N or above')")
         return False, (
             f"finite-only partition — missing {', '.join(missing)}; "
             "outcomes outside the listed span have no winning bracket"
         )
+    # The low-tail's right edge must be the lowest right edge among the
+    # low tails (a market labeled `5 or below` covers (-inf, 5]).
+    low_tail_hi = max(iv[1] for iv in low_tails)
+    high_tail_lo = min(iv[0] for iv in high_tails)
     finite = sorted(
         iv for iv in intervals
         if iv[0] != float("-inf") and iv[1] != float("inf")
     )
-    if finite:
-        for prev, curr in zip(finite, finite[1:]):
-            if curr[0] < prev[1] - _GAP_EPSILON:
-                return False, f"overlap: {prev} and {curr}"
-            if (curr[0] - prev[1]) > _GAP_EPSILON:
-                return False, f"gap of {curr[0] - prev[1]:g} between {prev} and {curr}"
+    if not finite:
+        # Pure low-tail + high-tail with no finite buckets between them:
+        # check the two tails themselves touch within epsilon.
+        if abs(low_tail_hi - high_tail_lo) > _GAP_EPSILON:
+            return False, (
+                f"gap of {high_tail_lo - low_tail_hi:g} between low-tail "
+                f"({low_tail_hi:g}) and high-tail ({high_tail_lo:g})"
+            )
+        return True, "tiles axis with two tail brackets touching at boundary"
+    # Finite buckets present: low tail must touch the lowest finite lo,
+    # finite intervals must tile adjacently, and the highest finite hi
+    # must touch the high tail lo. All within `_GAP_EPSILON`.
+    first_lo, last_hi = finite[0][0], finite[-1][1]
+    if first_lo < low_tail_hi - _GAP_EPSILON:
+        return False, (
+            f"low-tail (-inf, {low_tail_hi:g}) overlaps first finite "
+            f"bucket {finite[0]}"
+        )
+    if (first_lo - low_tail_hi) > _GAP_EPSILON:
+        return False, (
+            f"gap of {first_lo - low_tail_hi:g} between low-tail "
+            f"(-inf, {low_tail_hi:g}) and first finite bucket {finite[0]}"
+        )
+    for prev, curr in zip(finite, finite[1:]):
+        if curr[0] < prev[1] - _GAP_EPSILON:
+            return False, f"overlap: {prev} and {curr}"
+        if (curr[0] - prev[1]) > _GAP_EPSILON:
+            return False, f"gap of {curr[0] - prev[1]:g} between {prev} and {curr}"
+    if high_tail_lo < last_hi - _GAP_EPSILON:
+        return False, (
+            f"high-tail ({high_tail_lo:g}, +inf) overlaps last finite "
+            f"bucket {finite[-1]}"
+        )
+    if (high_tail_lo - last_hi) > _GAP_EPSILON:
+        return False, (
+            f"gap of {high_tail_lo - last_hi:g} between last finite "
+            f"bucket {finite[-1]} and high-tail ({high_tail_lo:g}, +inf)"
+        )
     return True, (
         f"tiles axis with {len(intervals)} intervals "
-        f"({len(finite)} finite + low/high tails)"
+        f"({len(finite)} finite + low/high tails, all adjacent)"
     )
 
 
