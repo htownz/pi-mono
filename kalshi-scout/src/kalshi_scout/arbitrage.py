@@ -60,12 +60,14 @@ _RANGE_RE = re.compile(
     r"(-?\d+(?:\.\d+)?)",
     re.IGNORECASE,
 )
-# Word-boundary `\b` applies only to letter-based alternatives. Symbolic
-# operators (`>=N`, `<N`, `=N`) don't have a word boundary before them at
-# string start, so the `\b` has to sit inside the letter group, not outside
-# the whole alternation, or the symbolic forms would be unreachable.
+# Only INCLUSIVE tail forms are accepted. Strict-open operators (`above N`,
+# `below N`, `>N`, `<N`) are ambiguous wrt boundary coverage: `below 50` +
+# `above 50` leaves an exact-50 settlement with no winning bracket, so
+# promoting events with strict labels would surface false-positive arbs.
+# Word-boundary `\b` sits inside the letter alternative so symbolic
+# operators (`>=N`, `<=N`) also match at string start.
 _ABOVE_PREFIX_RE = re.compile(
-    r"(?:\b(?:above|over|greater than|at least)|>=?)\s*(-?\d+(?:\.\d+)?)",
+    r"(?:\b(?:at least)|>=)\s*(-?\d+(?:\.\d+)?)",
     re.IGNORECASE,
 )
 _ABOVE_SUFFIX_RE = re.compile(
@@ -73,7 +75,7 @@ _ABOVE_SUFFIX_RE = re.compile(
     re.IGNORECASE,
 )
 _BELOW_PREFIX_RE = re.compile(
-    r"(?:\b(?:below|under|less than|at most)|<=?)\s*(-?\d+(?:\.\d+)?)",
+    r"(?:\b(?:at most)|<=)\s*(-?\d+(?:\.\d+)?)",
     re.IGNORECASE,
 )
 _BELOW_SUFFIX_RE = re.compile(
@@ -162,14 +164,15 @@ def _is_partition(intervals: list[tuple[float, float]]) -> tuple[bool, str]:
         if iv[0] != float("-inf") and iv[1] != float("inf")
     )
     if not finite:
-        # Pure low-tail + high-tail with no finite buckets between them:
-        # check the two tails themselves touch within epsilon.
-        if abs(low_tail_hi - high_tail_lo) > _GAP_EPSILON:
-            return False, (
-                f"gap of {high_tail_lo - low_tail_hi:g} between low-tail "
-                f"({low_tail_hi:g}) and high-tail ({high_tail_lo:g})"
-            )
-        return True, "tiles axis with two tail brackets touching at boundary"
+        # Pure low-tail + high-tail with no finite bucket between them is
+        # always ambiguous at the boundary: with INCLUSIVE labels (`50 or
+        # below` + `50 or above`) the value 50 is in BOTH brackets; with
+        # STRICT labels (`below 50` + `above 50`) it's in NEITHER. Either
+        # way it's not a true partition.
+        return False, (
+            "pure-tails partition with no finite bucket between them; "
+            "boundary value is either double-covered or uncovered"
+        )
     # Finite buckets present: low tail must touch the lowest finite lo,
     # finite intervals must tile adjacently, and the highest finite hi
     # must touch the high tail lo. All within `_GAP_EPSILON`.

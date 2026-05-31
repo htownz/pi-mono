@@ -490,22 +490,33 @@ def test_detector_rejects_low_tail_overlapping_first_finite():
     assert "overlap" in result.reason
 
 
-def test_detector_accepts_pure_tails_when_touching():
-    """A 2-market event with only the two tails meeting at a single value
-    (`50 or below` + `50 or above`) IS a valid partition — every outcome
-    has exactly one winning bracket."""
+def test_detector_rejects_pure_tails_event():
+    """Codex P2 round 2: a 2-market event with ONLY tails (`50 or below` +
+    `50 or above`) is never a valid partition. With inclusive labels the
+    boundary value 50 is in both brackets; with strict labels it's in
+    neither. Either way it's not a true partition, so the detector rejects."""
     event = _typed_event([
         "50 or below", "50 or above",
     ])
-    assert detect_numeric_partition(event).is_mex is True
+    result = detect_numeric_partition(event)
+    assert result.is_mex is False
+    assert "pure-tails" in result.reason
 
 
-def test_parse_interval_handles_symbolic_operators():
-    """Copilot P3: the regex word-boundary made `>=60` / `<60` / `=60`
-    unreachable because there's no \\b before a non-word character at
-    string start. The fix moves \\b inside the letter-only alternatives."""
+def test_parse_interval_rejects_strict_prefix_operators():
+    """Codex P2 round 2: strict-open operators (`above N`, `below N`,
+    `>N`, `<N`) are ambiguous at the boundary. The detector drops them
+    so events with strict labels can't be promoted as MEX."""
+    # Inclusive forms still work.
     assert _parse_interval(">= 60") == (60.0, float("inf"))
-    assert _parse_interval(">60") == (60.0, float("inf"))
     assert _parse_interval("<= 50") == (float("-inf"), 50.0)
-    assert _parse_interval("<50") == (float("-inf"), 50.0)
+    assert _parse_interval("at least 60") == (60.0, float("inf"))
+    assert _parse_interval("at most 50") == (float("-inf"), 50.0)
     assert _parse_interval("= 75") == (75.0, 75.0)
+    # Strict forms are rejected (no fallback inclusive interpretation).
+    assert _parse_interval("above 60") is None
+    assert _parse_interval("below 50") is None
+    assert _parse_interval(">60") is None
+    assert _parse_interval("<50") is None
+    assert _parse_interval("greater than 60") is None
+    assert _parse_interval("less than 50") is None
