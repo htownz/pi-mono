@@ -179,19 +179,21 @@ class WebhookSink:
 
 
 def _format_alert_text(alert: Alert) -> str:
-    """Compact phone-friendly summary used by ntfy and Discord sinks."""
+    """Compact phone-friendly summary used by ntfy and Discord sinks.
+
+    The price line names the actionable side so a DEAD_NO alert shows
+    `no_ask: 7c` instead of `yes_ask: —` — matching the side that the
+    edge line reports.
+    """
     prev = f" (was {alert.previous_grade})" if alert.previous_grade else ""
-    edge_line = ""
-    if alert.edge_yes is not None and (alert.edge_no is None or alert.edge_yes >= alert.edge_no):
-        edge_line = f"edge_yes: {alert.edge_yes:+.2f}"
-    elif alert.edge_no is not None:
-        edge_line = f"edge_no: {alert.edge_no:+.2f}"
-    yes_line = f"yes_ask: {alert.yes_ask_cents}c" if alert.yes_ask_cents is not None else "yes_ask: —"
+    side, price, edge_str = _embed_side(alert)
+    edge_line = f"edge_{side}: {edge_str.split()[1]}" if edge_str != "—" else ""
+    price_line = f"{side}_ask: {price}"
     fair_line = f"fair: {alert.fair_prob_low * 100:.0f}-{alert.fair_prob_high * 100:.0f}%"
     return (
         f"{alert.market_ticker} -> {alert.grade}{prev}\n"
         f"state: {alert.state}\n"
-        f"{yes_line}  {fair_line}\n"
+        f"{price_line}  {fair_line}\n"
         f"{edge_line}"
     ).rstrip()
 

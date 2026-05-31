@@ -285,6 +285,35 @@ def test_ntfy_sink_swallows_failures():
     assert "ntfy" in failures[0]
 
 
+def test_ntfy_body_shows_no_side_when_no_edge_larger():
+    """Codex P2 round 2: the ntfy text body had the same yes_ask-only bug
+    as Discord. For DEAD_NO alerts the body should report the no side's
+    tradable price (`no_ask`) and edge, not a misleading `yes_ask: —`."""
+    with respx.mock(base_url="https://ntfy.sh") as mock:
+        route = mock.post("/topic").respond(200)
+        sink = NtfySink(topic_or_url="topic")
+        alert = Alert(
+            fired_at_utc=datetime(2026, 5, 30, 16, 30, tzinfo=timezone.utc),
+            market_ticker="KXLOWTDC-26MAY30-T62",
+            event_ticker="KXLOWTDC-26MAY30",
+            city_slug="DC", market_date="2026-05-30",
+            bracket="≤ 62°", metric="low", state="dead_no",
+            reason="observed min below bracket",
+            grade="A", previous_grade="B",
+            yes_ask_cents=None, no_ask_cents=7,
+            edge_yes=None, edge_no=0.45,
+            fair_prob_low=0.0, fair_prob_high=0.02,
+            notes=[],
+        )
+        sink.emit(alert)
+        sink.close()
+        body = route.calls.last.request.content.decode("utf-8")
+
+    assert "no_ask: 7c" in body
+    assert "yes_ask" not in body  # the misleading line is gone
+    assert "edge_no: +0.45" in body
+
+
 # -- DiscordSink -------------------------------------------------------------
 
 def test_discord_sink_posts_rich_embed():
