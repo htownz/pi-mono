@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
 import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Iterable, Optional
@@ -57,6 +58,14 @@ from kalshi_scout.parser import parse_market
 from kalshi_scout.ranker import grade, sort_key
 from kalshi_scout.regime import classify_regime
 from kalshi_scout.resolver import resolve_settlement
+from kalshi_scout.trading import (
+    AutoTrader,
+    KalshiTradingClient,
+    KillSwitch,
+    RiskGuard,
+    RiskLimits,
+    auto_close_settled_positions,
+)
 from kalshi_scout.tuning import derive_config
 from kalshi_scout.state import build_station_state, classify, fair_probability, project_extremum
 from kalshi_scout.stations import all_cities, get_station
@@ -1221,7 +1230,13 @@ def prune(store_path: str, older_than_days: int,
 @click.option("--date", "date_str", required=True,
               help="Market date to settle (YYYY-MM-DD). Pulls the matching CLI report per station.")
 @click.option("--dry-run", is_flag=True, help="Compute outcomes but don't write to the store.")
-def backfill_settlements(store_path: str, date_str: str, dry_run: bool) -> None:
+@click.option("--auto-close", is_flag=True,
+              help="After recording settlements, close any open positions on "
+                   "those markets with the realized exit price (100 for "
+                   "winners, 0 for losers). Captures realized P&L without "
+                   "needing a separate `positions close` per ticker.")
+def backfill_settlements(store_path: str, date_str: str, dry_run: bool,
+                         auto_close: bool) -> None:
     """Fetch the official CLI report for each market date and write realized outcomes.
 
     For every distinct (event_ticker, station, market_date) in stored
@@ -1293,6 +1308,20 @@ def backfill_settlements(store_path: str, date_str: str, dry_run: bool) -> None:
             f"[green]{'(dry-run) ' if dry_run else ''}"
             f"wrote {written} settlements[/green]"
         )
+
+        if auto_close and not dry_run:
+            closed = auto_close_settled_positions(store, on_settled_date=target_date)
+            if closed:
+                console.print(
+                    f"[green]auto-closed {len(closed)} position(s) with realized P&L:[/green]"
+                )
+                for pid, ticker, exit_price in closed:
+                    verdict = "WON" if exit_price == 100 else "LOST"
+                    console.print(
+                        f"  position {pid}: {ticker} → {verdict} @ {exit_price}c"
+                    )
+            else:
+                console.print("[dim]no open positions matched these settlements[/dim]")
 
 
 @main.command()
@@ -1464,9 +1493,56 @@ def replay(store_path: str, snapshot_id: int) -> None:
               help="Load a calibrated RankerConfig.")
 @click.option("--once", is_flag=True,
               help="Run a single scan and exit (useful for cron).")
+# -- auto-trade -----------------------------------------------------------
+@click.option("--auto-trade", is_flag=True,
+              help="Auto-place orders on each fired alert via the Kalshi "
+                   "trading API. Requires --api-key-id and --api-key-path.")
+@click.option("--api-key-id", envvar="KALSHI_API_KEY_ID", default=None,
+              help="Kalshi API key ID (or set KALSHI_API_KEY_ID env var).")
+@click.option("--api-key-path", envvar="KALSHI_API_KEY_PATH", default=None,
+              type=click.Path(exists=True),
+              help="Path to Kalshi API private key PEM file "
+                   "(or set KALSHI_API_KEY_PATH env var).")
+@click.option("--paper", is_flag=True,
+              help="Run the full auto-trade pipeline (risk-check, audit, "
+                   "position record) but skip the actual API call. Use this "
+                   "for a multi-day soak test before going live.")
+@click.option("--default-size", type=int, default=1,
+              help="Contracts per auto-trade order. Default 1 (max-conservative).")
+@click.option("--max-position-size", type=int, default=5,
+              help="Hard cap on contracts per order. Default 5.")
+@click.option("--max-position-cost", type=int, default=500,
+              help="Hard cap on cents deployed per order. Default 500c ($5).")
+@click.option("--max-daily-loss", type=int, default=5000,
+              help="Kill threshold for realized losses today (UTC). "
+                   "Default 5000c ($50).")
+@click.option("--max-concentration-per-event", type=int, default=2500,
+              help="Hard cap on cumulative open cost per event_ticker. "
+                   "Default 2500c ($25).")
+@click.option("--min-edge", "min_edge_cents_opt", type=int, default=5,
+              help="Refuse orders whose snapshot edge is below this. Default 5c.")
+@click.option("--rounding-buffer", type=float, default=0.5,
+              help="Refuse dead_no/locked_yes orders whose running extremum "
+                   "is within this many °F of the bracket boundary. Default "
+                   "0.5°F (matches CLI report rounding). Set 0 to disable.")
+@click.option("--kill-file", type=click.Path(),
+              default=None,
+              help="Touch this file to halt all trading. Default "
+                   "<store-dir>/scout.kill.")
+@click.option("--audit-log", type=click.Path(),
+              default=None,
+              help="JSONL file capturing every trade attempt. Default "
+                   "<store-dir>/auto-trade.jsonl.")
 def serve(store_path: str, interval: int, min_grade: str,
           notify_specs: tuple[str, ...], notify_min_grade: str,
-          config_path: Optional[str], once: bool) -> None:
+          config_path: Optional[str], once: bool,
+          auto_trade: bool, api_key_id: Optional[str],
+          api_key_path: Optional[str], paper: bool,
+          default_size: int, max_position_size: int,
+          max_position_cost: int, max_daily_loss: int,
+          max_concentration_per_event: int, min_edge_cents_opt: int,
+          rounding_buffer: float, kill_file: Optional[str],
+          audit_log: Optional[str]) -> None:
     """Run the universe scanner on a loop.
 
     Equivalent to running `scan --store ... --notify ...` in a `while sleep`
@@ -1499,6 +1575,41 @@ def serve(store_path: str, interval: int, min_grade: str,
     _signal.signal(_signal.SIGTERM, _handle_signal)
 
     sinks = _build_sinks(notify_specs) if notify_specs else []
+
+    # -- auto-trade setup ------------------------------------------------
+    trading_client: Optional[KalshiTradingClient] = None
+    risk_limits = RiskLimits(
+        max_position_size_contracts=max_position_size,
+        max_position_cost_cents=max_position_cost,
+        max_daily_loss_cents=max_daily_loss,
+        max_concentration_per_event_cents=max_concentration_per_event,
+        min_edge_cents=min_edge_cents_opt,
+        rounding_risk_buffer_f=rounding_buffer,
+    )
+    store_dir = Path(store_path).resolve().parent
+    kill_path = Path(kill_file) if kill_file else store_dir / "scout.kill"
+    audit_path = Path(audit_log) if audit_log else store_dir / "auto-trade.jsonl"
+    if auto_trade and not paper:
+        if not api_key_id or not api_key_path:
+            raise click.BadParameter(
+                "--auto-trade (live mode) requires --api-key-id and --api-key-path "
+                "(or KALSHI_API_KEY_ID / KALSHI_API_KEY_PATH env vars). "
+                "Use --paper to run the auto-trade pipeline without calling the API."
+            )
+        trading_client = KalshiTradingClient(
+            key_id=api_key_id, private_key_path=Path(api_key_path),
+        )
+    if auto_trade:
+        log.info(
+            f"auto-trade {'PAPER' if paper else 'LIVE'} enabled: "
+            f"size={default_size} max_pos=${max_position_cost / 100:.2f} "
+            f"max_event=${max_concentration_per_event / 100:.2f} "
+            f"max_daily_loss=${max_daily_loss / 100:.2f} "
+            f"min_edge={min_edge_cents_opt}c "
+            f"rounding_buffer={rounding_buffer}°F "
+            f"kill_file={kill_path}"
+        )
+
     iteration = 0
     while not stop["flag"]:
         iteration += 1
@@ -1532,9 +1643,47 @@ def serve(store_path: str, interval: int, min_grade: str,
                         scanned_at=scan_started,
                         station_state_map=sink_map,
                     )
+
+                # Auto-trade runs AFTER record_scan so the fresh snapshot is
+                # already in the store for the AutoTrader to look up.
+                n_placed = n_refused = 0
+                if auto_trade and fired:
+                    guard = RiskGuard(risk_limits, store, KillSwitch(kill_path))
+                    trader = AutoTrader(
+                        client=trading_client, guard=guard, store=store,
+                        default_size=default_size, paper=paper,
+                        audit_log_path=audit_path,
+                    )
+                    for alert in fired:
+                        snaps = store.query_snapshots(
+                            market_ticker=alert.market_ticker, limit=1,
+                        )
+                        if not snaps:
+                            log.warning(
+                                f"auto-trade: no snapshot for {alert.market_ticker} — skipping"
+                            )
+                            continue
+                        attempt = trader.maybe_trade(alert, snaps[0])
+                        if attempt.placed:
+                            n_placed += 1
+                            log.info(
+                                f"auto-trade PLACED: {attempt.market_ticker} "
+                                f"{attempt.side} {attempt.size_contracts}@{attempt.price_cents}c "
+                                f"{'(paper)' if attempt.paper else f'order_id={attempt.order_id}'}"
+                            )
+                        else:
+                            n_refused += 1
+                            log.info(
+                                f"auto-trade REFUSED: {attempt.market_ticker} — {attempt.reason}"
+                            )
+
+                trade_summary = (
+                    f", auto-trade {n_placed} placed / {n_refused} refused"
+                    if auto_trade else ""
+                )
                 log.info(
                     f"scan {iteration}: persisted {len(persistable)} snapshots, "
-                    f"fired {len(fired)} alerts"
+                    f"fired {len(fired)} alerts{trade_summary}"
                 )
             finally:
                 store.close()
@@ -1790,6 +1939,160 @@ def take(store_path: str, market_ticker: str, size: int,
         f"{market_ticker} {side} {size}@{price}c "
         f"(cost ${size * price / 100:.2f})"
     )
+
+
+@main.command()
+@click.argument("market_ticker")
+@click.option("--store", "store_path", required=True, type=click.Path())
+@click.option("--size", required=True, type=int, help="Number of contracts.")
+@click.option("--api-key-id", envvar="KALSHI_API_KEY_ID", default=None,
+              help="Kalshi API key ID (or KALSHI_API_KEY_ID env var). "
+                   "Not required with --paper.")
+@click.option("--api-key-path", envvar="KALSHI_API_KEY_PATH", default=None,
+              type=click.Path(exists=True),
+              help="Path to Kalshi API private key PEM file "
+                   "(or KALSHI_API_KEY_PATH env var). Not required with --paper.")
+@click.option("--side", type=click.Choice(["yes", "no"]), default=None,
+              help="Override the side derived from the latest snapshot.")
+@click.option("--price", type=int, default=None,
+              help="Override the snapshot's ask. Must be 1..99.")
+@click.option("--paper", is_flag=True,
+              help="Run the risk-guard + audit pipeline without calling the API.")
+@click.option("--yes", "skip_confirm", is_flag=True,
+              help="Skip the interactive y/N confirmation. Required for "
+                   "non-interactive shells.")
+@click.option("--max-position-size", type=int, default=5)
+@click.option("--max-position-cost", type=int, default=500)
+@click.option("--max-daily-loss", type=int, default=5000)
+@click.option("--max-concentration-per-event", type=int, default=2500)
+@click.option("--min-edge", "min_edge_cents_opt", type=int, default=5)
+@click.option("--rounding-buffer", type=float, default=0.5)
+@click.option("--kill-file", type=click.Path(), default=None)
+@click.option("--audit-log", type=click.Path(), default=None)
+def fire(market_ticker: str, store_path: str, size: int,
+         api_key_id: Optional[str], api_key_path: Optional[str],
+         side: Optional[str], price: Optional[int],
+         paper: bool, skip_confirm: bool,
+         max_position_size: int, max_position_cost: int,
+         max_daily_loss: int, max_concentration_per_event: int,
+         min_edge_cents_opt: int, rounding_buffer: float,
+         kill_file: Optional[str], audit_log: Optional[str]) -> None:
+    """Single-shot manual order through the same risk-guard + audit pipeline
+    as `serve --auto-trade`.
+
+    Use this to validate the auth path with Kalshi (1-contract paper order
+    first, then 1-contract live) before turning on the full auto-trader.
+    Also handy for overriding the bot when you want to take a position the
+    risk guards would normally refuse — bump --max-* knobs explicitly.
+    """
+    if not paper and (not api_key_id or not api_key_path):
+        raise click.BadParameter(
+            "live `fire` requires --api-key-id and --api-key-path "
+            "(or KALSHI_API_KEY_ID / KALSHI_API_KEY_PATH env vars). "
+            "Use --paper to dry-run."
+        )
+    if size <= 0:
+        raise click.BadParameter(f"--size must be > 0, got {size}")
+
+    store_dir = Path(store_path).resolve().parent
+    kill_path = Path(kill_file) if kill_file else store_dir / "scout.kill"
+    audit_path = Path(audit_log) if audit_log else store_dir / "auto-trade.jsonl"
+    limits = RiskLimits(
+        max_position_size_contracts=max_position_size,
+        max_position_cost_cents=max_position_cost,
+        max_daily_loss_cents=max_daily_loss,
+        max_concentration_per_event_cents=max_concentration_per_event,
+        min_edge_cents=min_edge_cents_opt,
+        rounding_risk_buffer_f=rounding_buffer,
+    )
+
+    with SnapshotStore(store_path) as store:
+        snaps = store.query_snapshots(market_ticker=market_ticker, limit=1)
+        if not snaps:
+            console.print(
+                f"[red]no snapshot found for {market_ticker} — run "
+                f"`kalshi-scout evaluate {market_ticker} --store {store_path}` first.[/red]"
+            )
+            sys.exit(1)
+        snap = snaps[0]
+
+        # Synthesize an Alert (the AutoTrader expects one for the audit trail).
+        from kalshi_scout.notify import Alert
+        alert = Alert(
+            fired_at_utc=datetime.now(timezone.utc),
+            market_ticker=snap.market_ticker,
+            event_ticker=snap.event_ticker,
+            city_slug=snap.city_slug, market_date=snap.market_date.isoformat(),
+            bracket=f"{snap.bracket_kind} lo={snap.bracket_lo} hi={snap.bracket_hi}",
+            metric=snap.metric, state=snap.state,
+            reason=f"manual fire by operator (grade {snap.grade})",
+            grade=snap.grade, previous_grade=None,
+            yes_ask_cents=snap.yes_ask, no_ask_cents=snap.no_ask,
+            edge_yes=snap.edge_yes, edge_no=snap.edge_no,
+            fair_prob_low=snap.fair_prob_low, fair_prob_high=snap.fair_prob_high,
+            notes=[],
+        )
+
+        # Derive side/price (allowing overrides).
+        derived_side, derived_ask = AutoTrader._derive_side_and_price(snap)
+        if side is None:
+            side = derived_side
+        if price is None:
+            price = derived_ask if (side == derived_side and derived_ask is not None) else (
+                snap.yes_ask if side == "yes" else snap.no_ask
+            )
+        if price is None or price <= 0 or price >= 100:
+            console.print(
+                f"[red]no usable {side}_ask in snapshot (got {price}c). "
+                "Pass --price explicitly (1..99).[/red]"
+            )
+            sys.exit(1)
+
+        # Confirmation prompt — last chance to bail.
+        cost_dollars = size * price / 100.0
+        mode = "[yellow]PAPER[/yellow]" if paper else "[bold red]LIVE[/bold red]"
+        console.print(Panel(
+            f"  ticker:  [bold]{market_ticker}[/bold]\n"
+            f"  side:    {side}\n"
+            f"  size:    {size} contracts\n"
+            f"  price:   {price}c\n"
+            f"  cost:    ${cost_dollars:.2f}\n"
+            f"  mode:    {mode}\n"
+            f"  grade:   {snap.grade}    state: {snap.state}",
+            title=f"fire {market_ticker}", border_style="yellow",
+        ))
+        if not skip_confirm:
+            if not click.confirm("Place this order?", default=False):
+                console.print("[dim]aborted by operator[/dim]")
+                return
+
+        trading_client: Optional[KalshiTradingClient] = None
+        if not paper:
+            trading_client = KalshiTradingClient(
+                key_id=api_key_id, private_key_path=Path(api_key_path),
+            )
+        try:
+            guard = RiskGuard(limits, store, KillSwitch(kill_path))
+            trader = AutoTrader(
+                client=trading_client, guard=guard, store=store,
+                default_size=size, paper=paper, audit_log_path=audit_path,
+            )
+            attempt = trader.maybe_trade(alert, snap, size=size)
+        finally:
+            if trading_client is not None:
+                trading_client.close()
+
+    if attempt.placed:
+        order_str = f" order_id={attempt.order_id}" if attempt.order_id else ""
+        console.print(
+            f"[green]PLACED[/green]: {attempt.market_ticker} {attempt.side} "
+            f"{attempt.size_contracts}@{attempt.price_cents}c "
+            f"{'(paper)' if attempt.paper else ''}{order_str} "
+            f"position_id={attempt.position_id}"
+        )
+    else:
+        console.print(f"[red]REFUSED[/red]: {attempt.reason}")
+        sys.exit(1)
 
 
 @main.command()
