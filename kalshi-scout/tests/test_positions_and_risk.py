@@ -113,6 +113,22 @@ def test_realized_pnl_handles_losing_settlement(store: SnapshotStore):
     assert row.cost_basis_cents == 300
 
 
+def test_close_position_rejects_out_of_range_exit_price(store: SnapshotStore):
+    """Codex/Copilot P2: an operator typo like `--at-price 150` or `-5`
+    would silently persist and produce nonsensical realized P&L. The
+    close path now validates [0, 100] before writing."""
+    pid = store.add_position("K1", "E1", "yes", size_contracts=10, avg_price_cents=30)
+    with pytest.raises(ValueError, match="at_price_cents must be in"):
+        store.close_position(pid, at_price_cents=150)
+    with pytest.raises(ValueError, match="at_price_cents must be in"):
+        store.close_position(pid, at_price_cents=-5)
+    # Position remains open after rejected close attempts.
+    assert len(store.query_positions(open_only=True)) == 1
+    # Boundary values are valid: 0 (settled loser) and 100 (settled winner).
+    store.close_position(pid, at_price_cents=100)
+    assert store.query_positions(open_only=False)[0].realized_pnl_cents == 700
+
+
 def test_add_position_validates_inputs(store: SnapshotStore):
     with pytest.raises(ValueError):
         store.add_position("K", "E", side="maybe", size_contracts=10, avg_price_cents=50)

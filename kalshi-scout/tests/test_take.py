@@ -30,6 +30,7 @@ def _snap(
         station_icao="KHOU", cli_product="CLIHOU",
         source_provenance="resolver", regime="clear_and_dry",
         running_max_f=None, running_min_f=None,
+        projected_extremum_f=None,
         cli_report_date=None, cli_max_f=None, cli_min_f=None,
         state=state, reason="",
         fair_prob_low=0.4, fair_prob_high=0.6,

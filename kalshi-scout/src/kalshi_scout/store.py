@@ -230,8 +230,10 @@ class PositionRow:
 
         Convention: `closed_at_price_cents` is the per-contract realized
         value of the side we hold. For a settled YES that won, that's 100;
-        for a settled YES that lost, 0. For a mid-trade close, it's the
-        opposite side's bid (proceeds of selling our position).
+        for a settled YES that lost, 0. For a mid-trade close, it's our
+        side's bid (the proceeds-per-contract of selling our position into
+        the resting order book on the SAME side we hold). For a YES close
+        that's `yes_bid`, not `no_bid`; symmetrically for a NO close.
         """
         if self.closed_at_price_cents is None:
             return None
@@ -583,7 +585,17 @@ class SnapshotStore:
     ) -> bool:
         """Mark a position closed. `at_price_cents` is the per-contract exit
         value (100 if our side won, 0 if it lost, mid-trade close price
-        otherwise) and enables realized-P&L on the listing."""
+        otherwise) and enables realized-P&L on the listing.
+
+        Unlike entry prices, exits at exactly 0 or 100 are valid — they're
+        the settlement endpoints. Anything outside [0, 100] is operator
+        typo (e.g. `--at-price 150`) and would corrupt the realized-P&L
+        column, so reject it before writing.
+        """
+        if at_price_cents is not None and not (0 <= at_price_cents <= 100):
+            raise ValueError(
+                f"at_price_cents must be in [0, 100] cents, got {at_price_cents}"
+            )
         closed_at = closed_at or datetime.now(timezone.utc)
         with self._txn() as conn:
             cur = conn.execute(

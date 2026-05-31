@@ -1650,8 +1650,14 @@ def positions_list(store_path: str, show_all: bool) -> None:
             pnl_str = "—"
         else:
             pnl_dollars = r.realized_pnl_cents / 100.0
-            color = "green" if r.realized_pnl_cents > 0 else "red" if r.realized_pnl_cents < 0 else "white"
-            pnl_str = f"[{color}]${pnl_dollars:+.2f}[/{color}]"
+            # Skip Rich markup for break-even so the row inherits the user's
+            # terminal foreground (white-on-white is invisible on light themes).
+            if r.realized_pnl_cents > 0:
+                pnl_str = f"[green]${pnl_dollars:+.2f}[/green]"
+            elif r.realized_pnl_cents < 0:
+                pnl_str = f"[red]${pnl_dollars:+.2f}[/red]"
+            else:
+                pnl_str = f"${pnl_dollars:+.2f}"
         table.add_row(
             str(r.id), r.market_ticker, r.side, str(r.size_contracts),
             f"{r.avg_price_cents}c", exit_str,
@@ -1706,6 +1712,11 @@ def take(store_path: str, market_ticker: str, size: int,
     either with `--side` / `--price` if you took it at a different
     price than the snapshot recorded.
     """
+    # Validate size up-front so --dry-run also catches typos like `--size 0`
+    # instead of computing nonsensical costs and only failing at write time.
+    if size <= 0:
+        raise click.BadParameter(f"--size must be > 0, got {size}")
+
     with SnapshotStore(store_path) as store:
         snaps = store.query_snapshots(market_ticker=market_ticker, limit=1)
         if not snaps:
@@ -1725,22 +1736,35 @@ def take(store_path: str, market_ticker: str, size: int,
                 price = snap.yes_ask
             else:
                 price = snap.no_ask
-        if price is None or price <= 0:
+        if price is None or price <= 0 or price >= 100:
+            # add_position requires 0 < price < 100 — surface the same
+            # friendly error here so a settled-LOCKED_YES snap (ask=100) or
+            # missing-ask doesn't crash with a raw ValueError stack trace.
             console.print(
-                f"[red]no usable {side}_ask in the latest snapshot. "
-                "Pass --price explicitly.[/red]"
+                f"[red]no usable {side}_ask in the latest snapshot "
+                f"(got {price}c). Pass --price explicitly (must be 1..99).[/red]"
             )
             sys.exit(1)
 
         event_ticker = market_ticker.rsplit("-", 1)[0]
-        snap_age = datetime.now(timezone.utc) - snap.scanned_at_utc
+        # Clamp future-dated snapshots to "0m ago" instead of reporting a
+        # misleading negative minute count from clock skew.
+        snap_age = max(
+            datetime.now(timezone.utc) - snap.scanned_at_utc,
+            timedelta(0),
+        )
+        override_note = ""
+        if side != derived_side:
+            override_note = (
+                f"side overridden: took {side}, scout would have taken {derived_side}"
+            )
         snap_note = (
             f"scout: grade={snap.grade} state={snap.state} "
             f"fair={snap.fair_prob_low * 100:.0f}-{snap.fair_prob_high * 100:.0f}% "
             f"(snapshot {snap.scanned_at_utc.strftime('%m-%d %H:%M')}, "
             f"{int(snap_age.total_seconds() // 60)}m ago)"
         )
-        final_note = "; ".join(n for n in (note, snap_note) if n)
+        final_note = "; ".join(n for n in (note, override_note, snap_note) if n)
 
         if dry_run:
             console.print(Panel(
