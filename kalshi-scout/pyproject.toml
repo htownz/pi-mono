@@ -19,6 +19,10 @@ dependencies = [
     "rich>=13.7",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
+    # Kalshi trading API requires RSA-PSS-SHA256 signing on every authenticated
+    # request; `cryptography` is the standard pure-Python library that supports
+    # it without dragging in OpenSSL bindings or non-FIPS curves.
+    "cryptography>=42.0",
 ]
 
 [project.optional-dependencies]
