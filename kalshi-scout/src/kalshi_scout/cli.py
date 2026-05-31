@@ -1602,12 +1602,22 @@ def positions_add(store_path: str, market_ticker: str, side: str,
 @positions.command("close")
 @click.option("--store", "store_path", required=True, type=click.Path())
 @click.argument("position_id", type=int)
-def positions_close(store_path: str, position_id: int) -> None:
-    """Mark a position closed (no longer in risk aggregation)."""
+@click.option("--at-price", "at_price_cents", type=int, default=None,
+              help="Per-contract exit price in cents. Use 100 for a winning "
+                   "settlement, 0 for a losing one, or the mid-trade close "
+                   "price you actually took. Enables realized-P&L on listing.")
+def positions_close(store_path: str, position_id: int,
+                    at_price_cents: Optional[int]) -> None:
+    """Mark a position closed. Pass `--at-price N` to capture the exit
+    value — needed for realized-P&L reporting on `positions list`."""
     with SnapshotStore(store_path) as store:
-        ok = store.close_position(position_id)
+        ok = store.close_position(position_id, at_price_cents=at_price_cents)
     if ok:
-        console.print(f"[green]closed position {position_id}[/green]")
+        price_note = (
+            f" @ {at_price_cents}c" if at_price_cents is not None
+            else " (no exit price recorded — P&L unavailable)"
+        )
+        console.print(f"[green]closed position {position_id}[/green]{price_note}")
     else:
         console.print(f"[yellow]position {position_id} not found or already closed[/yellow]")
 
@@ -1616,7 +1626,8 @@ def positions_close(store_path: str, position_id: int) -> None:
 @click.option("--store", "store_path", required=True, type=click.Path())
 @click.option("--all", "show_all", is_flag=True, help="Include closed positions.")
 def positions_list(store_path: str, show_all: bool) -> None:
-    """List positions (default: open only)."""
+    """List positions (default: open only). Closed rows show realized P&L
+    when an exit price was captured at close time."""
     with SnapshotStore(store_path) as store:
         rows = store.query_positions(open_only=not show_all)
     if not rows:
@@ -1627,18 +1638,158 @@ def positions_list(store_path: str, show_all: bool) -> None:
     table.add_column("Market")
     table.add_column("Side")
     table.add_column("Size", justify="right")
-    table.add_column("Price", justify="right")
+    table.add_column("Entry", justify="right")
+    table.add_column("Exit", justify="right")
     table.add_column("Cost", justify="right")
+    table.add_column("P&L", justify="right")
     table.add_column("Opened")
     table.add_column("Closed")
     for r in rows:
+        exit_str = f"{r.closed_at_price_cents}c" if r.closed_at_price_cents is not None else "—"
+        if r.realized_pnl_cents is None:
+            pnl_str = "—"
+        else:
+            pnl_dollars = r.realized_pnl_cents / 100.0
+            # Skip Rich markup for break-even so the row inherits the user's
+            # terminal foreground (white-on-white is invisible on light themes).
+            if r.realized_pnl_cents > 0:
+                pnl_str = f"[green]${pnl_dollars:+.2f}[/green]"
+            elif r.realized_pnl_cents < 0:
+                pnl_str = f"[red]${pnl_dollars:+.2f}[/red]"
+            else:
+                pnl_str = f"${pnl_dollars:+.2f}"
         table.add_row(
             str(r.id), r.market_ticker, r.side, str(r.size_contracts),
-            f"{r.avg_price_cents}c", f"${r.cost_basis_cents / 100:.2f}",
+            f"{r.avg_price_cents}c", exit_str,
+            f"${r.cost_basis_cents / 100:.2f}",
+            pnl_str,
             r.opened_at_utc.strftime("%m-%d %H:%M"),
             r.closed_at_utc.strftime("%m-%d %H:%M") if r.closed_at_utc else "—",
         )
     console.print(table)
+
+
+def _derive_take_side(snap) -> tuple[str, Optional[int]]:
+    """Pick the actionable (side, ask_cents) from a snapshot.
+
+    LOCKED_YES → yes side, yes_ask price.
+    DEAD_NO    → no side, no_ask price.
+    Other     → whichever edge is larger.
+    """
+    if snap.state == "locked_yes":
+        return "yes", snap.yes_ask
+    if snap.state == "dead_no":
+        return "no", snap.no_ask
+    yes_e = snap.edge_yes if snap.edge_yes is not None else float("-inf")
+    no_e = snap.edge_no if snap.edge_no is not None else float("-inf")
+    if no_e > yes_e:
+        return "no", snap.no_ask
+    return "yes", snap.yes_ask
+
+
+@main.command()
+@click.option("--store", "store_path", required=True, type=click.Path())
+@click.argument("market_ticker")
+@click.option("--size", required=True, type=int, help="Number of contracts.")
+@click.option("--side", type=click.Choice(["yes", "no"]), default=None,
+              help="Override the side derived from the latest snapshot.")
+@click.option("--price", type=int, default=None,
+              help="Override the per-contract fill price (cents). Defaults to "
+                   "the snapshot's yes_ask/no_ask for the chosen side.")
+@click.option("--note", default="", help="Free-text note.")
+@click.option("--dry-run", is_flag=True,
+              help="Show what would be recorded without writing to the store.")
+def take(store_path: str, market_ticker: str, size: int,
+         side: Optional[str], price: Optional[int],
+         note: str, dry_run: bool) -> None:
+    """Record a position you just took manually, auto-filling side+price
+    from the latest snapshot.
+
+    Workflow: alert fires -> open Kalshi web UI -> place the trade ->
+    `kalshi-scout take TICKER --size N`. The scout looks up the latest
+    snapshot for the ticker, derives the actionable side from its
+    state/edge, and uses its stored ask as the fill price. Override
+    either with `--side` / `--price` if you took it at a different
+    price than the snapshot recorded.
+    """
+    # Validate size up-front so --dry-run also catches typos like `--size 0`
+    # instead of computing nonsensical costs and only failing at write time.
+    if size <= 0:
+        raise click.BadParameter(f"--size must be > 0, got {size}")
+
+    with SnapshotStore(store_path) as store:
+        snaps = store.query_snapshots(market_ticker=market_ticker, limit=1)
+        if not snaps:
+            console.print(
+                f"[red]no snapshot found for {market_ticker}. "
+                f"Run `kalshi-scout evaluate {market_ticker} --store {store_path}` "
+                "first, or pass --side and --price explicitly via `positions add`.[/red]"
+            )
+            sys.exit(1)
+        snap = snaps[0]
+        derived_side, derived_ask = _derive_take_side(snap)
+        side = side or derived_side
+        if price is None:
+            if derived_side == side and derived_ask is not None:
+                price = derived_ask
+            elif side == "yes":
+                price = snap.yes_ask
+            else:
+                price = snap.no_ask
+        if price is None or price <= 0 or price >= 100:
+            # add_position requires 0 < price < 100 — surface the same
+            # friendly error here so a settled-LOCKED_YES snap (ask=100) or
+            # missing-ask doesn't crash with a raw ValueError stack trace.
+            console.print(
+                f"[red]no usable {side}_ask in the latest snapshot "
+                f"(got {price}c). Pass --price explicitly (must be 1..99).[/red]"
+            )
+            sys.exit(1)
+
+        event_ticker = market_ticker.rsplit("-", 1)[0]
+        # Clamp future-dated snapshots to "0m ago" instead of reporting a
+        # misleading negative minute count from clock skew.
+        snap_age = max(
+            datetime.now(timezone.utc) - snap.scanned_at_utc,
+            timedelta(0),
+        )
+        override_note = ""
+        if side != derived_side:
+            override_note = (
+                f"side overridden: took {side}, scout would have taken {derived_side}"
+            )
+        snap_note = (
+            f"scout: grade={snap.grade} state={snap.state} "
+            f"fair={snap.fair_prob_low * 100:.0f}-{snap.fair_prob_high * 100:.0f}% "
+            f"(snapshot {snap.scanned_at_utc.strftime('%m-%d %H:%M')}, "
+            f"{int(snap_age.total_seconds() // 60)}m ago)"
+        )
+        final_note = "; ".join(n for n in (note, override_note, snap_note) if n)
+
+        if dry_run:
+            console.print(Panel(
+                f"[bold]would record:[/bold]\n"
+                f"  ticker: {market_ticker}\n"
+                f"  event:  {event_ticker}\n"
+                f"  side:   {side}\n"
+                f"  size:   {size}\n"
+                f"  price:  {price}c\n"
+                f"  cost:   ${size * price / 100:.2f}\n"
+                f"  note:   {final_note}",
+                title="take --dry-run", border_style="yellow",
+            ))
+            return
+
+        pid = store.add_position(
+            market_ticker=market_ticker, event_ticker=event_ticker,
+            side=side, size_contracts=size, avg_price_cents=price,
+            notes=final_note,
+        )
+    console.print(
+        f"[green]took position id={pid}[/green]: "
+        f"{market_ticker} {side} {size}@{price}c "
+        f"(cost ${size * price / 100:.2f})"
+    )
 
 
 @main.command()

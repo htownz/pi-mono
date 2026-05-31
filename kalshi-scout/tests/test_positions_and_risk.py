@@ -81,6 +81,54 @@ def test_close_position_excludes_from_open_list(store: SnapshotStore):
     assert store.close_position(pid) is False
 
 
+def test_close_position_captures_exit_price_for_pnl(store: SnapshotStore):
+    """Exit price recorded at close → realized_pnl_cents computable on read."""
+    pid = store.add_position("K1", "E1", "yes", size_contracts=10, avg_price_cents=30)
+    assert store.close_position(pid, at_price_cents=100) is True   # settled YES win
+
+    rows = store.query_positions(open_only=False)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.closed_at_price_cents == 100
+    # (exit - entry) × size = (100 - 30) × 10 = 700c.
+    assert row.realized_pnl_cents == 700
+
+
+def test_close_position_without_exit_price_leaves_pnl_unknown(store: SnapshotStore):
+    """Backwards-compat: old close() calls and operators who don't pass
+    --at-price should still work, just with realized_pnl_cents=None."""
+    pid = store.add_position("K1", "E1", "yes", size_contracts=10, avg_price_cents=30)
+    assert store.close_position(pid) is True
+    row = store.query_positions(open_only=False)[0]
+    assert row.closed_at_price_cents is None
+    assert row.realized_pnl_cents is None
+
+
+def test_realized_pnl_handles_losing_settlement(store: SnapshotStore):
+    """Settled YES that lost → exit price is 0 → P&L = -cost_basis."""
+    pid = store.add_position("K1", "E1", "yes", size_contracts=10, avg_price_cents=30)
+    store.close_position(pid, at_price_cents=0)
+    row = store.query_positions(open_only=False)[0]
+    assert row.realized_pnl_cents == -300   # (0 - 30) × 10
+    assert row.cost_basis_cents == 300
+
+
+def test_close_position_rejects_out_of_range_exit_price(store: SnapshotStore):
+    """Codex/Copilot P2: an operator typo like `--at-price 150` or `-5`
+    would silently persist and produce nonsensical realized P&L. The
+    close path now validates [0, 100] before writing."""
+    pid = store.add_position("K1", "E1", "yes", size_contracts=10, avg_price_cents=30)
+    with pytest.raises(ValueError, match="at_price_cents must be in"):
+        store.close_position(pid, at_price_cents=150)
+    with pytest.raises(ValueError, match="at_price_cents must be in"):
+        store.close_position(pid, at_price_cents=-5)
+    # Position remains open after rejected close attempts.
+    assert len(store.query_positions(open_only=True)) == 1
+    # Boundary values are valid: 0 (settled loser) and 100 (settled winner).
+    store.close_position(pid, at_price_cents=100)
+    assert store.query_positions(open_only=False)[0].realized_pnl_cents == 700
+
+
 def test_add_position_validates_inputs(store: SnapshotStore):
     with pytest.raises(ValueError):
         store.add_position("K", "E", side="maybe", size_contracts=10, avg_price_cents=50)

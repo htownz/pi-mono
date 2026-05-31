@@ -128,6 +128,7 @@ CREATE TABLE IF NOT EXISTS positions (
     avg_price_cents INTEGER NOT NULL,
     opened_at_utc TEXT NOT NULL,
     closed_at_utc TEXT,                  -- NULL while open
+    closed_at_price_cents INTEGER,       -- NULL until closed; payout=100 for win, 0 for loss
     notes TEXT NOT NULL DEFAULT ''
 );
 
@@ -211,6 +212,7 @@ class PositionRow:
     avg_price_cents: int
     opened_at_utc: datetime
     closed_at_utc: Optional[datetime]
+    closed_at_price_cents: Optional[int]  # NULL until closed with an exit price
     notes: str
 
     @property
@@ -219,7 +221,23 @@ class PositionRow:
 
     @property
     def cost_basis_cents(self) -> int:
+        """Total cash deployed = size × avg fill price, in cents."""
         return self.size_contracts * self.avg_price_cents
+
+    @property
+    def realized_pnl_cents(self) -> Optional[int]:
+        """(exit - entry) × size, in cents. None if no exit price recorded.
+
+        Convention: `closed_at_price_cents` is the per-contract realized
+        value of the side we hold. For a settled YES that won, that's 100;
+        for a settled YES that lost, 0. For a mid-trade close, it's our
+        side's bid (the proceeds-per-contract of selling our position into
+        the resting order book on the SAME side we hold). For a YES close
+        that's `yes_bid`, not `no_bid`; symmetrically for a NO close.
+        """
+        if self.closed_at_price_cents is None:
+            return None
+        return (self.closed_at_price_cents - self.avg_price_cents) * self.size_contracts
 
     @property
     def max_loss_cents(self) -> int:
@@ -313,6 +331,13 @@ class SnapshotStore:
         # tuner can compute (projected - realized) residuals from settled rows.
         if "projected_extremum_f" not in cols:
             self._conn.execute("ALTER TABLE snapshots ADD COLUMN projected_extremum_f REAL")
+        # Add closed-at exit price on positions for realized-P&L tracking.
+        cur = self._conn.execute("PRAGMA table_info(positions)")
+        pos_cols = {row["name"] for row in cur.fetchall()}
+        if "closed_at_price_cents" not in pos_cols:
+            self._conn.execute(
+                "ALTER TABLE positions ADD COLUMN closed_at_price_cents INTEGER"
+            )
         cur = self._conn.execute(
             "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('version', ?)",
             (str(SCHEMA_VERSION),),
@@ -552,12 +577,32 @@ class SnapshotStore:
             )
             return cur.lastrowid
 
-    def close_position(self, position_id: int, closed_at: Optional[datetime] = None) -> bool:
+    def close_position(
+        self,
+        position_id: int,
+        closed_at: Optional[datetime] = None,
+        at_price_cents: Optional[int] = None,
+    ) -> bool:
+        """Mark a position closed. `at_price_cents` is the per-contract exit
+        value (100 if our side won, 0 if it lost, mid-trade close price
+        otherwise) and enables realized-P&L on the listing.
+
+        Unlike entry prices, exits at exactly 0 or 100 are valid — they're
+        the settlement endpoints. Anything outside [0, 100] is operator
+        typo (e.g. `--at-price 150`) and would corrupt the realized-P&L
+        column, so reject it before writing.
+        """
+        if at_price_cents is not None and not (0 <= at_price_cents <= 100):
+            raise ValueError(
+                f"at_price_cents must be in [0, 100] cents, got {at_price_cents}"
+            )
         closed_at = closed_at or datetime.now(timezone.utc)
         with self._txn() as conn:
             cur = conn.execute(
-                "UPDATE positions SET closed_at_utc = ? WHERE id = ? AND closed_at_utc IS NULL",
-                (_iso_utc(closed_at), position_id),
+                """UPDATE positions
+                   SET closed_at_utc = ?, closed_at_price_cents = ?
+                   WHERE id = ? AND closed_at_utc IS NULL""",
+                (_iso_utc(closed_at), at_price_cents, position_id),
             )
             return cur.rowcount > 0
 
@@ -837,6 +882,9 @@ def _row_to_position(row: sqlite3.Row) -> PositionRow:
         avg_price_cents=row["avg_price_cents"],
         opened_at_utc=_parse_utc(row["opened_at_utc"]),
         closed_at_utc=_parse_utc(row["closed_at_utc"]) if row["closed_at_utc"] else None,
+        closed_at_price_cents=(
+            row["closed_at_price_cents"] if "closed_at_price_cents" in row.keys() else None
+        ),
         notes=row["notes"] or "",
     )
 
