@@ -26,6 +26,7 @@ from typing import Optional
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 
+from kalshi_scout.audit import read_audit_log, summarize as summarize_audit
 from kalshi_scout.calibrate import calibrate as run_calibrate, report_to_dict
 from kalshi_scout.risk import aggregate_risk
 from kalshi_scout.store import SnapshotStore
@@ -53,10 +54,22 @@ th { background: #f6f8fa; }
 """
 
 
-def create_app(store_path: Path | str) -> FastAPI:
+def create_app(
+    store_path: Path | str,
+    audit_log_path: Path | str | None = None,
+) -> FastAPI:
     """Build the dashboard app. Store path is captured in closure so the
-    app can be served by stock uvicorn without any further configuration."""
+    app can be served by stock uvicorn without any further configuration.
+
+    `audit_log_path` powers the /auto-trade panel; defaults to
+    `<store-dir>/auto-trade.jsonl` (the same default `serve --auto-trade`
+    writes to).
+    """
     store_path = Path(store_path)
+    audit_path = (
+        Path(audit_log_path) if audit_log_path
+        else store_path.resolve().parent / "auto-trade.jsonl"
+    )
     app = FastAPI(title="kalshi-scout dashboard")
 
     def _store() -> SnapshotStore:
@@ -88,6 +101,7 @@ def create_app(store_path: Path | str) -> FastAPI:
                 <a href="/">overview</a>
                 <a href="/calibration">calibration</a>
                 <a href="/risk">risk</a>
+                <a href="/auto-trade">auto-trade</a>
                 <a href="/api/snapshots">snapshots api</a>
             </nav>
             <h2>Current alerts (grade B+ or better)</h2>
@@ -124,6 +138,25 @@ def create_app(store_path: Path | str) -> FastAPI:
             {_risk_summary(risk)}
             {_risk_collisions(risk)}
             {_risk_buckets(risk)}
+            """,
+        )
+
+    @app.get("/auto-trade", response_class=HTMLResponse)
+    def auto_trade_page() -> str:
+        # Default to today UTC; the operator can hit /api/auto-trade?days=N
+        # for a wider window. The HTML page intentionally shows just today
+        # so a glance answers "what is the bot doing right now?".
+        entries = list(read_audit_log(audit_path))
+        summary = summarize_audit(entries, recent_n=20)
+        kill_file_path = audit_path.parent / "scout.kill"
+        kill_active = kill_file_path.exists()
+        return _render(
+            "kalshi-scout: auto-trade",
+            f"""
+            <h1>Auto-trade activity</h1>
+            <nav><a href="/">← overview</a></nav>
+            {_kill_banner(kill_active, kill_file_path)}
+            {_auto_trade_summary(summary, audit_path)}
             """,
         )
 
@@ -169,6 +202,15 @@ def create_app(store_path: Path | str) -> FastAPI:
         with _store() as store:
             n = len(store.query_snapshots(limit=1))
         return JSONResponse({"ok": True, "has_data": n > 0})
+
+    @app.get("/api/auto-trade")
+    def api_auto_trade() -> JSONResponse:
+        entries = list(read_audit_log(audit_path))
+        summary = summarize_audit(entries, recent_n=20)
+        out = summary.to_dict()
+        out["audit_log"] = str(audit_path)
+        out["kill_switch_active"] = (audit_path.parent / "scout.kill").exists()
+        return JSONResponse(out)
 
     return app
 
@@ -324,3 +366,87 @@ def _bucket_to_dict(b) -> dict:
         "total_max_loss_cents": b.total_max_loss_cents,
         "market_tickers": b.market_tickers,
     }
+
+
+def _kill_banner(active: bool, kill_path: Path) -> str:
+    if not active:
+        return (
+            f'<p class="dim">Kill switch: <em>not active</em> '
+            f'(<code>{escape(str(kill_path))}</code>).</p>'
+        )
+    return (
+        f'<div class="warn"><strong>KILL SWITCH ACTIVE</strong> — '
+        f'<code>{escape(str(kill_path))}</code> exists; all auto-trade orders '
+        f"are being refused. Delete that file to resume.</div>"
+    )
+
+
+def _auto_trade_summary(summary, audit_path: Path) -> str:
+    """Render the audit summary as the auto-trade dashboard panel."""
+    if not summary.days:
+        return (
+            f'<p class="dim">No auto-trade activity yet. Audit log: '
+            f'<code>{escape(str(audit_path))}</code>.</p>'
+        )
+    rows = []
+    for day in summary.days:
+        rows.append(f"<h2>{day.day.isoformat()}</h2>")
+        rows.append(
+            f"<p>"
+            f"<strong>{day.total_attempts}</strong> attempts: "
+            f'<span class="pnl-pos">{day.placed} placed</span>, '
+            f'<span class="pnl-neg">{day.refused} refused</span>. '
+            f"Paper={day.placed_paper}, full-fill={day.placed_live_filled_full}, "
+            f"partial={day.placed_live_partial}. "
+            f"Cost deployed: ${day.total_cost_cents / 100:.2f}."
+            f"</p>"
+        )
+        if day.refusal_breakdown:
+            rows.append("<h3>Refusal reasons</h3><table>")
+            rows.append("<tr><th>Reason</th><th>Count</th></tr>")
+            for reason, count in day.refusal_breakdown.most_common():
+                rows.append(
+                    f"<tr><td>{escape(reason)}</td><td>{count}</td></tr>"
+                )
+            rows.append("</table>")
+        if day.recent_placed:
+            rows.append(f"<h3>Recent placed (last {len(day.recent_placed)})</h3>")
+            rows.append("<table>")
+            rows.append(
+                "<tr><th>Time UTC</th><th>Ticker</th><th>Side</th>"
+                "<th>Size</th><th>Price</th><th>Tag</th></tr>"
+            )
+            for e in day.recent_placed:
+                tag = (
+                    "paper" if e.paper
+                    else (f"order={escape(e.order_id)}" if e.order_id else "—")
+                )
+                rows.append(
+                    f"<tr>"
+                    f"<td>{e.fired_at_utc.strftime('%H:%M:%S')}</td>"
+                    f"<td>{escape(e.market_ticker)}</td>"
+                    f"<td>{escape(e.side)}</td>"
+                    f"<td>{e.size_contracts}</td>"
+                    f"<td>{e.price_cents}c</td>"
+                    f"<td>{tag}</td>"
+                    f"</tr>"
+                )
+            rows.append("</table>")
+        if day.recent_refused:
+            rows.append(f"<h3>Recent refused (last {len(day.recent_refused)})</h3>")
+            rows.append("<table>")
+            rows.append(
+                "<tr><th>Time UTC</th><th>Ticker</th><th>Side</th>"
+                "<th>Reason</th></tr>"
+            )
+            for e in day.recent_refused:
+                rows.append(
+                    f"<tr>"
+                    f"<td>{e.fired_at_utc.strftime('%H:%M:%S')}</td>"
+                    f"<td>{escape(e.market_ticker)}</td>"
+                    f"<td>{escape(e.side)}</td>"
+                    f"<td>{escape(e.reason)}</td>"
+                    f"</tr>"
+                )
+            rows.append("</table>")
+    return "\n".join(rows)

@@ -109,6 +109,87 @@ def test_risk_page_renders(client: TestClient):
     assert "Open position risk" in resp.text
 
 
+# -- Auto-trade panel --------------------------------------------------------
+
+def test_auto_trade_page_empty_log_shows_friendly_message(client: TestClient):
+    """No audit log yet → page renders the 'no activity yet' state without
+    error. Operators hit this immediately after first install."""
+    resp = client.get("/auto-trade")
+    assert resp.status_code == 200
+    assert "Auto-trade activity" in resp.text
+    assert "No auto-trade activity yet" in resp.text
+
+
+def test_auto_trade_page_renders_audit_log(tmp_path: Path):
+    """A non-empty audit log surfaces the per-day summary + recent entries."""
+    db = tmp_path / "dash.db"
+    _seed_store(db)
+    audit = tmp_path / "auto-trade.jsonl"
+    import json
+    from datetime import datetime, timezone
+    fired = datetime.now(timezone.utc)
+    rows = [
+        {
+            "fired_at_utc": fired.isoformat(),
+            "market_ticker": "KXLOWTDC-26MAY30-T62",
+            "event_ticker": "KXLOWTDC-26MAY30",
+            "side": "no", "price_cents": 89, "size_contracts": 1,
+            "cost_cents": 89, "placed": True, "paper": True,
+            "reason": "placed (paper)", "order_id": None,
+            "position_id": 1, "snap_id": 1, "grade": "A+",
+        },
+        {
+            "fired_at_utc": fired.isoformat(),
+            "market_ticker": "KXHIGHTHOU-26MAY30-B95.5",
+            "event_ticker": "KXHIGHTHOU-26MAY30",
+            "side": "yes", "price_cents": 15, "size_contracts": 1,
+            "cost_cents": 15, "placed": False, "paper": False,
+            "reason": "rounding risk: HIGH running_max 95.3 only 0.3°F above...",
+            "order_id": None, "position_id": None,
+            "snap_id": 2, "grade": "A+",
+        },
+    ]
+    with audit.open("w") as f:
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
+    client = TestClient(create_app(db, audit_log_path=audit))
+    resp = client.get("/auto-trade")
+    assert resp.status_code == 200
+    body = resp.text
+    assert "KXLOWTDC-26MAY30-T62" in body
+    assert "rounding risk" in body
+    # Refusal breakdown table.
+    assert "Refusal reasons" in body
+
+
+def test_auto_trade_page_warns_when_kill_switch_active(tmp_path: Path):
+    db = tmp_path / "dash.db"
+    _seed_store(db)
+    kill = tmp_path / "scout.kill"
+    kill.write_text("")
+    audit = tmp_path / "auto-trade.jsonl"
+    client = TestClient(create_app(db, audit_log_path=audit))
+    resp = client.get("/auto-trade")
+    assert resp.status_code == 200
+    assert "KILL SWITCH ACTIVE" in resp.text
+
+
+def test_api_auto_trade_returns_json_summary(tmp_path: Path):
+    """The JSON endpoint mirrors AuditSummary.to_dict + the kill-switch
+    flag — for the operator's own dashboards / Slack bot."""
+    db = tmp_path / "dash.db"
+    _seed_store(db)
+    audit = tmp_path / "auto-trade.jsonl"
+    audit.write_text("")
+    client = TestClient(create_app(db, audit_log_path=audit))
+    resp = client.get("/api/auto-trade")
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert "total_attempts" in payload
+    assert "kill_switch_active" in payload
+    assert payload["audit_log"] == str(audit)
+
+
 # -- JSON API ----------------------------------------------------------------
 
 def test_api_snapshots_returns_seeded_row(client: TestClient):

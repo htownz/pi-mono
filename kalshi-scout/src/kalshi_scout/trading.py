@@ -48,6 +48,7 @@ import httpx
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
+from kalshi_scout.kalshi import KalshiClient
 from kalshi_scout.notify import Alert
 from kalshi_scout.store import SnapshotRow, SnapshotStore
 
@@ -443,6 +444,7 @@ class AutoTrader:
         order_type: str = "limit",
         paper: bool = False,
         audit_log_path: Optional[Path] = None,
+        kalshi_client: Optional[KalshiClient] = None,
     ):
         if not paper and client is None:
             raise ValueError("client is required when paper=False")
@@ -453,6 +455,12 @@ class AutoTrader:
         self.order_type = order_type
         self.paper = paper
         self.audit_log_path = Path(audit_log_path) if audit_log_path else None
+        # Read-only Kalshi client (unauthenticated, separate from trading
+        # client) used to refresh the quote right before placement when
+        # `refresh_quote=True` is passed to maybe_trade. Snapshots are
+        # typically 5+ minutes old and the book can move significantly in
+        # that window.
+        self.kalshi_client = kalshi_client
         if self.audit_log_path:
             self.audit_log_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -464,6 +472,7 @@ class AutoTrader:
         *,
         side_override: Optional[str] = None,
         price_override: Optional[int] = None,
+        refresh_quote: bool = False,
     ) -> TradeAttempt:
         """Single-alert entry. Returns the TradeAttempt regardless of
         outcome; the audit log captures it for replay.
@@ -474,12 +483,38 @@ class AutoTrader:
         confirmation prompt). Without these the caller is at the mercy of
         the snapshot, which may be stale or disagree with the operator's
         intent.
+
+        `refresh_quote=True` makes a live `KalshiClient.get_market()` call
+        immediately before placement and uses the live ask instead of the
+        snapshot's. This guards against acting on a snapshot that's 5+
+        minutes old when the book has moved. When the live price differs
+        from the snapshot's by more than 5c, a "stale-snapshot drift" note
+        is appended to the audit reason so the operator can see the
+        snapshot pipeline is falling behind. `price_override` (when set)
+        takes precedence over the live refresh.
         """
         size = size if size is not None else self.default_size
+        stale_note: Optional[str] = None
         if side_override is not None and price_override is not None:
             side, price = side_override, price_override
         else:
-            side, price = self._derive_side_and_price(snap)
+            side, snap_price = self._derive_side_and_price(snap)
+            price = snap_price
+            if (
+                refresh_quote
+                and side is not None
+                and self.kalshi_client is not None
+            ):
+                live_price = self._fetch_live_ask(alert.market_ticker, side)
+                if live_price is not None and live_price > 0:
+                    if snap_price is not None:
+                        drift = live_price - snap_price
+                        if abs(drift) > 5:
+                            stale_note = (
+                                f"stale-snapshot drift: snap {snap_price}c "
+                                f"→ live {live_price}c ({drift:+d}c)"
+                            )
+                    price = live_price
 
         attempt_base = dict(
             fired_at_utc=alert.fired_at_utc,
@@ -566,6 +601,8 @@ class AutoTrader:
             note_parts.append(
                 f"PARTIAL fill: {filled_count}/{size} (rest may be resting)"
             )
+        if stale_note:
+            note_parts.append(stale_note)
         position_id = self.store.add_position(
             market_ticker=alert.market_ticker,
             event_ticker=alert.event_ticker,
@@ -576,6 +613,8 @@ class AutoTrader:
         reason = "placed" + (" (paper)" if self.paper else "")
         if filled_count < size:
             reason += f" — partial fill {filled_count}/{size}"
+        if stale_note:
+            reason += f"; {stale_note}"
         attempt = TradeAttempt(
             **attempt_base, side=side, price_cents=price,
             size_contracts=filled_count, placed=True, reason=reason,
@@ -583,6 +622,17 @@ class AutoTrader:
         )
         self._audit(attempt)
         return attempt
+
+    def _fetch_live_ask(self, ticker: str, side: str) -> Optional[int]:
+        """Pull the live `yes_ask` / `no_ask` for `ticker` from the read-only
+        Kalshi client. Returns None on any failure — the caller falls back
+        to the snapshot's ask, with a "no live quote" note in the audit log.
+        """
+        try:
+            market = self.kalshi_client.get_market(ticker)
+        except Exception:
+            return None
+        return market.yes_ask if side == "yes" else market.no_ask
 
     @staticmethod
     def _fill_count_from_response(order: dict, *, requested: int) -> int:

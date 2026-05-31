@@ -580,6 +580,149 @@ def test_auto_trader_overrides_still_pass_through_risk_guard(store, tmp_path):
     assert store.query_positions(open_only=True) == []
 
 
+# -- refresh_quote (live-quote re-fetch before placement) --------------------
+
+class _StubKalshiClient:
+    """Drop-in for KalshiClient.get_market() in the refresh_quote path.
+    Avoids respx-mocking the full Kalshi GET /markets/{ticker} response
+    when we only care about which ask the trader uses."""
+    def __init__(self, yes_ask: int | None = None, no_ask: int | None = None,
+                 raises: Exception | None = None):
+        self._yes_ask = yes_ask
+        self._no_ask = no_ask
+        self._raises = raises
+        self.calls: list[str] = []
+
+    def get_market(self, ticker: str):
+        self.calls.append(ticker)
+        if self._raises:
+            raise self._raises
+        from kalshi_scout.models import KalshiMarket
+        return KalshiMarket(
+            ticker=ticker, event_ticker="", title="", yes_sub_title="",
+            status="active", close_time=None,
+            yes_bid=None, yes_ask=self._yes_ask,
+            no_bid=None, no_ask=self._no_ask,
+            last_price=None, volume=0, open_interest=0,
+        )
+
+    def close(self) -> None:
+        pass
+
+
+def test_refresh_quote_uses_live_ask_in_place_of_snapshot(store, tmp_path):
+    """When refresh_quote=True and a kalshi_client is wired, the order is
+    placed at the live ask, not the snapshot's. The snapshot's ask is
+    used only when refresh fails."""
+    guard = RiskGuard(RiskLimits(min_edge_cents=0), store,
+                      KillSwitch(tmp_path / "kill"))
+    rt_client = _StubKalshiClient(no_ask=82)  # live ask is 82, snap is 89
+    trader = AutoTrader(
+        client=None, guard=guard, store=store,
+        default_size=1, paper=True,
+        audit_log_path=tmp_path / "audit.jsonl",
+        kalshi_client=rt_client,
+    )
+    attempt = trader.maybe_trade(_alert(), _snap(), refresh_quote=True)
+    assert attempt.placed is True
+    assert attempt.price_cents == 82          # live, not snapshot's 89
+    assert rt_client.calls == ["KXLOWTDC-26MAY30-T62"]
+
+
+def test_refresh_quote_falls_back_to_snapshot_when_live_fetch_fails(store, tmp_path):
+    """A network error on the live refresh shouldn't kill the order — the
+    trader silently falls back to the snapshot ask. The audit log shows the
+    snapshot price was used."""
+    guard = RiskGuard(RiskLimits(min_edge_cents=0), store,
+                      KillSwitch(tmp_path / "kill"))
+    rt_client = _StubKalshiClient(raises=httpx.ConnectError("net down"))
+    trader = AutoTrader(
+        client=None, guard=guard, store=store,
+        default_size=1, paper=True,
+        audit_log_path=tmp_path / "audit.jsonl",
+        kalshi_client=rt_client,
+    )
+    attempt = trader.maybe_trade(_alert(), _snap(), refresh_quote=True)
+    assert attempt.placed is True
+    assert attempt.price_cents == 89          # back to snapshot's
+
+
+def test_refresh_quote_records_stale_drift_when_price_diverges(store, tmp_path):
+    """If the live price differs from the snapshot's by more than 5c, the
+    audit reason carries a 'stale-snapshot drift' note so the operator can
+    spot a slow snapshot pipeline."""
+    guard = RiskGuard(RiskLimits(min_edge_cents=0), store,
+                      KillSwitch(tmp_path / "kill"))
+    rt_client = _StubKalshiClient(no_ask=70)   # snap=89, drift -19c
+    trader = AutoTrader(
+        client=None, guard=guard, store=store,
+        default_size=1, paper=True,
+        audit_log_path=tmp_path / "audit.jsonl",
+        kalshi_client=rt_client,
+    )
+    attempt = trader.maybe_trade(_alert(), _snap(), refresh_quote=True)
+    assert attempt.placed is True
+    assert "stale-snapshot drift" in attempt.reason
+    assert "snap 89c → live 70c" in attempt.reason
+
+
+def test_refresh_quote_no_drift_note_when_within_tolerance(store, tmp_path):
+    """A 3c drift is within tolerance (default 5c); no audit warning."""
+    guard = RiskGuard(RiskLimits(min_edge_cents=0), store,
+                      KillSwitch(tmp_path / "kill"))
+    rt_client = _StubKalshiClient(no_ask=86)   # snap=89, drift -3c
+    trader = AutoTrader(
+        client=None, guard=guard, store=store,
+        default_size=1, paper=True,
+        audit_log_path=tmp_path / "audit.jsonl",
+        kalshi_client=rt_client,
+    )
+    attempt = trader.maybe_trade(_alert(), _snap(), refresh_quote=True)
+    assert attempt.placed is True
+    assert "stale-snapshot drift" not in attempt.reason
+
+
+def test_refresh_quote_off_uses_snapshot_unchanged(store, tmp_path):
+    """Default (refresh_quote=False) preserves the V1 snapshot-based
+    behavior — no live call is made, even if kalshi_client is wired."""
+    guard = RiskGuard(RiskLimits(min_edge_cents=0), store,
+                      KillSwitch(tmp_path / "kill"))
+    rt_client = _StubKalshiClient(no_ask=70)   # would have been used if refresh on
+    trader = AutoTrader(
+        client=None, guard=guard, store=store,
+        default_size=1, paper=True,
+        audit_log_path=tmp_path / "audit.jsonl",
+        kalshi_client=rt_client,
+    )
+    # No refresh_quote=True passed.
+    attempt = trader.maybe_trade(_alert(), _snap())
+    assert attempt.placed is True
+    assert attempt.price_cents == 89    # snapshot wins
+    assert rt_client.calls == []        # live client was never called
+
+
+def test_refresh_quote_ignored_when_overrides_passed(store, tmp_path):
+    """If the operator passed --price explicitly via `fire`, the override
+    wins over any live refresh. We don't second-guess them at this layer."""
+    guard = RiskGuard(RiskLimits(min_edge_cents=0), store,
+                      KillSwitch(tmp_path / "kill"))
+    rt_client = _StubKalshiClient(no_ask=70)
+    trader = AutoTrader(
+        client=None, guard=guard, store=store,
+        default_size=1, paper=True,
+        audit_log_path=tmp_path / "audit.jsonl",
+        kalshi_client=rt_client,
+    )
+    attempt = trader.maybe_trade(
+        _alert(), _snap(),
+        side_override="no", price_override=85,
+        refresh_quote=True,
+    )
+    assert attempt.placed is True
+    assert attempt.price_cents == 85    # operator override wins
+    assert rt_client.calls == []        # refresh path is skipped under overrides
+
+
 def test_auto_trader_handles_api_error(store, tmp_path, keypair):
     """A 4xx/5xx from Kalshi is captured in the attempt as `placed=False`
     with the exception text — no position is recorded."""

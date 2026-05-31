@@ -17,6 +17,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from kalshi_scout.audit import AuditSummary, read_audit_log, summarize as summarize_audit
 from kalshi_scout.arbitrage import (
     MUTUALLY_EXCLUSIVE_SERIES,
     _parse_interval,
@@ -1375,6 +1376,250 @@ def backtest(store_path: str, min_grade: str, since: Optional[str]) -> None:
 
 @main.command()
 @click.option("--store", "store_path", required=True, type=click.Path())
+@click.option("--audit-log", "audit_log_path", type=click.Path(), default=None,
+              help="Path to the auto-trader's JSONL audit log. "
+                   "Defaults to <store-dir>/auto-trade.jsonl.")
+@click.option("--since", "since_str", default=None,
+              help="Lower bound on entry timestamps (YYYY-MM-DD or "
+                   "YYYY-MM-DDTHH:MM). Default: 24 hours ago.")
+@click.option("--until", "until_str", default=None,
+              help="Upper bound (same format as --since).")
+@click.option("--ticker", "market_ticker", default=None,
+              help="Filter to one market ticker.")
+@click.option("--json", "as_json", is_flag=True,
+              help="Emit JSON instead of formatted panels.")
+def audit(store_path: str, audit_log_path: Optional[str],
+          since_str: Optional[str], until_str: Optional[str],
+          market_ticker: Optional[str], as_json: bool) -> None:
+    """Summarize the auto-trader's audit JSONL by day.
+
+    Shows attempts placed vs refused, refusal breakdown by category,
+    realized cost deployed, and the last few placed / refused entries
+    per day. Use this to answer "what did the bot do today?" after a
+    `serve --auto-trade --paper` soak.
+    """
+    audit_path = (
+        Path(audit_log_path) if audit_log_path
+        else Path(store_path).resolve().parent / "auto-trade.jsonl"
+    )
+    since = _parse_utc(since_str) if since_str else (
+        datetime.now(timezone.utc) - timedelta(hours=24)
+    )
+    until = _parse_utc(until_str) if until_str else None
+
+    entries = list(read_audit_log(audit_path))
+    summary = summarize_audit(
+        entries, since=since, until=until, ticker=market_ticker, recent_n=5,
+    )
+
+    if as_json:
+        out = summary.to_dict()
+        out["audit_log"] = str(audit_path)
+        out["since"] = since.isoformat() if since else None
+        out["until"] = until.isoformat() if until else None
+        click.echo(json.dumps(out, indent=2))
+        return
+
+    if not summary.days:
+        console.print(
+            f"[yellow]no audit entries in {audit_path} "
+            f"(since {since.isoformat(timespec='minutes') if since else 'forever'}"
+            f"{f' filtered to {market_ticker}' if market_ticker else ''})[/yellow]"
+        )
+        return
+
+    console.print(
+        f"[bold]auto-trade audit[/bold]  source={audit_path}  "
+        f"window={since.isoformat(timespec='minutes') if since else 'forever'} → "
+        f"{until.isoformat(timespec='minutes') if until else 'now'}"
+        f"{f'  ticker={market_ticker}' if market_ticker else ''}"
+    )
+    for day in summary.days:
+        body_lines = [
+            f"[bold]Attempts: {day.total_attempts}[/bold]  "
+            f"placed=[green]{day.placed}[/green]  "
+            f"refused=[red]{day.refused}[/red]",
+        ]
+        if day.placed:
+            body_lines.append(
+                f"  filled-full={day.placed_live_filled_full}  "
+                f"filled-partial={day.placed_live_partial}  "
+                f"paper={day.placed_paper}"
+            )
+            body_lines.append(
+                f"  total cost: ${day.total_cost_cents / 100:.2f}"
+            )
+        if day.refusal_breakdown:
+            body_lines.append("[bold]Refusal reasons:[/bold]")
+            for reason, count in day.refusal_breakdown.most_common():
+                body_lines.append(f"  {reason:<26}  {count}")
+        if day.by_grade:
+            grades = "  ".join(
+                f"{g}={n}" for g, n in sorted(day.by_grade.items())
+            )
+            body_lines.append(f"[bold]By grade:[/bold]  {grades}")
+        if day.recent_placed:
+            body_lines.append(f"[bold]Recent placed (last {len(day.recent_placed)}):[/bold]")
+            for e in day.recent_placed:
+                tag = "(paper)" if e.paper else (
+                    f"order={e.order_id}" if e.order_id else "—"
+                )
+                body_lines.append(
+                    f"  {e.fired_at_utc.strftime('%H:%M:%S')} "
+                    f"{e.market_ticker:<40} {e.side} "
+                    f"{e.size_contracts}@{e.price_cents}c  {tag}"
+                )
+        if day.recent_refused:
+            body_lines.append(f"[bold]Recent refused (last {len(day.recent_refused)}):[/bold]")
+            for e in day.recent_refused:
+                body_lines.append(
+                    f"  {e.fired_at_utc.strftime('%H:%M:%S')} "
+                    f"{e.market_ticker:<40} {e.side} — {e.reason}"
+                )
+        console.print(Panel(
+            "\n".join(body_lines),
+            title=f"Day {day.day.isoformat()}",
+            border_style="cyan",
+        ))
+
+
+@main.command()
+@click.option("--store", "store_path", required=True, type=click.Path())
+@click.option("--api-key-id", envvar="KALSHI_API_KEY_ID", default=None,
+              help="Kalshi API key ID. Required unless --paper.")
+@click.option("--api-key-path", envvar="KALSHI_API_KEY_PATH", default=None,
+              type=click.Path(exists=True),
+              help="Path to Kalshi API private key PEM. Required unless --paper.")
+@click.option("--paper", is_flag=True,
+              help="Skip the live Kalshi auth round-trip (use to validate "
+                   "kill-switch / store / NWS plumbing without a key).")
+@click.option("--kill-file", type=click.Path(), default=None,
+              help="Kill-switch path to verify writability. "
+                   "Default <store-dir>/scout.kill.")
+@click.option("--audit-log", type=click.Path(), default=None,
+              help="Audit log path to verify writability. "
+                   "Default <store-dir>/auto-trade.jsonl.")
+def doctor(store_path: str, api_key_id: Optional[str],
+           api_key_path: Optional[str], paper: bool,
+           kill_file: Optional[str], audit_log: Optional[str]) -> None:
+    """One-shot go-live validator. Runs every check needed before turning
+    on `serve --auto-trade` live. Exits non-zero on any FAIL so this can
+    be wired into deploy scripts.
+
+    Without --paper, this is the FIRST real validation of a new Kalshi key:
+    it performs an authenticated balance round-trip, which proves the PEM
+    signs correctly and Kalshi accepts the signature. The balance is shown
+    so the operator confirms they're hitting the right account.
+    """
+    store_dir = Path(store_path).resolve().parent
+    kill_path = Path(kill_file) if kill_file else store_dir / "scout.kill"
+    audit_path = Path(audit_log) if audit_log else store_dir / "auto-trade.jsonl"
+
+    results: list[tuple[str, bool, str]] = []   # (check, passed, detail)
+
+    # 1. Snapshot store.
+    try:
+        with SnapshotStore(store_path) as store:
+            n = store.count_snapshots()
+        results.append(("snapshot store readable", True, f"{n} snapshots"))
+    except Exception as exc:
+        results.append(("snapshot store readable", False, str(exc)))
+
+    # 2. Kill-switch path writable.
+    try:
+        kill_path.parent.mkdir(parents=True, exist_ok=True)
+        probe = kill_path.parent / ".kalshi-scout-doctor-probe"
+        probe.write_text("")
+        probe.unlink()
+        results.append(("kill-switch path writable", True, str(kill_path)))
+    except Exception as exc:
+        results.append(("kill-switch path writable", False, str(exc)))
+
+    # 3. Audit log path writable.
+    try:
+        audit_path.parent.mkdir(parents=True, exist_ok=True)
+        probe = audit_path.parent / ".kalshi-scout-doctor-probe-audit"
+        probe.write_text("")
+        probe.unlink()
+        results.append(("audit log path writable", True, str(audit_path)))
+    except Exception as exc:
+        results.append(("audit log path writable", False, str(exc)))
+
+    # 4. NWS observations (known-good station — KHOU).
+    try:
+        with NwsClient() as nclient:
+            latest = nclient.latest_observation("KHOU")
+        if latest is None:
+            results.append(("NWS observations reachable", False, "KHOU returned no obs"))
+        else:
+            results.append((
+                "NWS observations reachable", True,
+                f"KHOU latest: {latest.temperature_f:g}°F at "
+                f"{latest.observed_at.isoformat(timespec='minutes')}",
+            ))
+    except Exception as exc:
+        results.append(("NWS observations reachable", False, str(exc)))
+
+    # 5. NWS CLI report.
+    try:
+        with NwsClient() as nclient:
+            cli = nclient.latest_cli("CLIHOU")
+        results.append((
+            "NWS CLI reachable", cli is not None,
+            f"CLIHOU report_date={cli.report_date}" if cli else "no CLI returned",
+        ))
+    except Exception as exc:
+        results.append(("NWS CLI reachable", False, str(exc)))
+
+    # 6. Kalshi auth round-trip (skipped in paper mode).
+    if paper:
+        results.append((
+            "Kalshi auth round-trip", True,
+            "[dim]skipped (--paper)[/dim]",
+        ))
+    elif not api_key_id or not api_key_path:
+        results.append((
+            "Kalshi auth round-trip", False,
+            "missing --api-key-id / --api-key-path (or env vars). Use --paper to skip.",
+        ))
+    else:
+        try:
+            client = KalshiTradingClient(
+                key_id=api_key_id, private_key_path=Path(api_key_path),
+            )
+            balance = client.get_balance_cents()
+            client.close()
+            results.append((
+                "Kalshi auth round-trip", True,
+                f"balance ${balance / 100:.2f}",
+            ))
+        except Exception as exc:
+            results.append(("Kalshi auth round-trip", False, str(exc)))
+
+    table = Table(title="kalshi-scout doctor", header_style="bold cyan")
+    table.add_column("Check")
+    table.add_column("Status", justify="center")
+    table.add_column("Detail")
+    all_pass = True
+    for check, passed, detail in results:
+        status = "[green]PASS[/green]" if passed else "[red]FAIL[/red]"
+        table.add_row(check, status, detail)
+        if not passed:
+            all_pass = False
+    console.print(table)
+
+    if all_pass:
+        console.print("[bold green]All checks passed.[/bold green] Ready to trade.")
+    else:
+        console.print(
+            "[bold red]One or more checks failed. Fix before turning on "
+            "`serve --auto-trade` (live).[/bold red]"
+        )
+        sys.exit(1)
+
+
+@main.command()
+@click.option("--store", "store_path", required=True, type=click.Path())
 @click.option("--since", default=None,
               help="Only include snapshots scanned after this date (YYYY-MM-DD).")
 @click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of a table.")
@@ -1533,6 +1778,11 @@ def replay(store_path: str, snapshot_id: int) -> None:
               default=None,
               help="JSONL file capturing every trade attempt. Default "
                    "<store-dir>/auto-trade.jsonl.")
+@click.option("--refresh-quote", is_flag=True,
+              help="Before each auto-trade placement, re-fetch the live "
+                   "Kalshi quote and use that ask instead of the stored "
+                   "snapshot's. Catches stale-snapshot drift on books "
+                   "that moved since the last scan.")
 def serve(store_path: str, interval: int, min_grade: str,
           notify_specs: tuple[str, ...], notify_min_grade: str,
           config_path: Optional[str], once: bool,
@@ -1542,7 +1792,7 @@ def serve(store_path: str, interval: int, min_grade: str,
           max_position_cost: int, max_daily_loss: int,
           max_concentration_per_event: int, min_edge_cents_opt: int,
           rounding_buffer: float, kill_file: Optional[str],
-          audit_log: Optional[str]) -> None:
+          audit_log: Optional[str], refresh_quote: bool) -> None:
     """Run the universe scanner on a loop.
 
     Equivalent to running `scan --store ... --notify ...` in a `while sleep`
@@ -1656,10 +1906,16 @@ def serve(store_path: str, interval: int, min_grade: str,
                 n_placed = n_refused = 0
                 if auto_trade and fired:
                     guard = RiskGuard(risk_limits, store, KillSwitch(kill_path))
+                    # Read-only KalshiClient is shared across the trader's
+                    # refresh-quote calls within this scan; cheap to
+                    # re-create per iteration since httpx connection pools
+                    # are managed inside the client.
+                    rt_kalshi_client = KalshiClient() if refresh_quote else None
                     trader = AutoTrader(
                         client=trading_client, guard=guard, store=store,
                         default_size=default_size, paper=paper,
                         audit_log_path=audit_path,
+                        kalshi_client=rt_kalshi_client,
                     )
                     for alert in fired:
                         snaps = store.query_snapshots(
@@ -1670,7 +1926,9 @@ def serve(store_path: str, interval: int, min_grade: str,
                                 f"auto-trade: no snapshot for {alert.market_ticker} — skipping"
                             )
                             continue
-                        attempt = trader.maybe_trade(alert, snaps[0])
+                        attempt = trader.maybe_trade(
+                            alert, snaps[0], refresh_quote=refresh_quote,
+                        )
                         if attempt.placed:
                             n_placed += 1
                             log.info(
@@ -1683,6 +1941,8 @@ def serve(store_path: str, interval: int, min_grade: str,
                             log.info(
                                 f"auto-trade REFUSED: {attempt.market_ticker} — {attempt.reason}"
                             )
+                    if rt_kalshi_client is not None:
+                        rt_kalshi_client.close()
 
                 trade_summary = (
                     f", auto-trade {n_placed} placed / {n_refused} refused"
@@ -1711,7 +1971,11 @@ def serve(store_path: str, interval: int, min_grade: str,
 @click.option("--store", "store_path", required=True, type=click.Path())
 @click.option("--host", default="127.0.0.1")
 @click.option("--port", type=int, default=8080)
-def dashboard(store_path: str, host: str, port: int) -> None:
+@click.option("--audit-log", "audit_log_path", type=click.Path(), default=None,
+              help="Path to the auto-trader's JSONL audit log for the "
+                   "/auto-trade panel. Default <store-dir>/auto-trade.jsonl.")
+def dashboard(store_path: str, host: str, port: int,
+              audit_log_path: Optional[str]) -> None:
     """Start the FastAPI dashboard reading scout.db.
 
     Default binds to 127.0.0.1 so it isn't exposed without an explicit
@@ -1719,7 +1983,7 @@ def dashboard(store_path: str, host: str, port: int) -> None:
     """
     import uvicorn
     from kalshi_scout.server import create_app
-    app = create_app(store_path)
+    app = create_app(store_path, audit_log_path=audit_log_path)
     console.print(
         f"[bold green]kalshi-scout dashboard[/bold green] -> http://{host}:{port}"
     )
@@ -1976,6 +2240,11 @@ def take(store_path: str, market_ticker: str, size: int,
 @click.option("--rounding-buffer", type=float, default=0.5)
 @click.option("--kill-file", type=click.Path(), default=None)
 @click.option("--audit-log", type=click.Path(), default=None)
+@click.option("--refresh-quote", is_flag=True,
+              help="Pull the live Kalshi quote right before placement and "
+                   "use it as the ask instead of the snapshot's. Guards "
+                   "against acting on a 5+-minute-old snapshot when the "
+                   "book has moved. `--price` (if passed) still wins.")
 def fire(market_ticker: str, store_path: str, size: int,
          api_key_id: Optional[str], api_key_path: Optional[str],
          side: Optional[str], price: Optional[int],
@@ -1983,7 +2252,8 @@ def fire(market_ticker: str, store_path: str, size: int,
          max_position_size: int, max_position_cost: int,
          max_daily_loss: int, max_concentration_per_event: int,
          min_edge_cents_opt: int, rounding_buffer: float,
-         kill_file: Optional[str], audit_log: Optional[str]) -> None:
+         kill_file: Optional[str], audit_log: Optional[str],
+         refresh_quote: bool) -> None:
     """Single-shot manual order through the same risk-guard + audit pipeline
     as `serve --auto-trade`.
 
@@ -2078,11 +2348,13 @@ def fire(market_ticker: str, store_path: str, size: int,
             trading_client = KalshiTradingClient(
                 key_id=api_key_id, private_key_path=Path(api_key_path),
             )
+        rt_kalshi_client = KalshiClient() if refresh_quote else None
         try:
             guard = RiskGuard(limits, store, KillSwitch(kill_path))
             trader = AutoTrader(
                 client=trading_client, guard=guard, store=store,
                 default_size=size, paper=paper, audit_log_path=audit_path,
+                kalshi_client=rt_kalshi_client,
             )
             # Pass the operator's explicit side/price through so the order
             # placed matches the one shown in the confirmation panel.
@@ -2091,10 +2363,13 @@ def fire(market_ticker: str, store_path: str, size: int,
             attempt = trader.maybe_trade(
                 alert, snap, size=size,
                 side_override=side, price_override=price,
+                refresh_quote=refresh_quote,
             )
         finally:
             if trading_client is not None:
                 trading_client.close()
+            if rt_kalshi_client is not None:
+                rt_kalshi_client.close()
 
     if attempt.placed:
         order_str = f" order_id={attempt.order_id}" if attempt.order_id else ""
