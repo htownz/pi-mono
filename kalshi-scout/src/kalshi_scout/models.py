@@ -101,7 +101,16 @@ class Bracket:
 
 @dataclass(frozen=True)
 class Station:
-    """An NWS observation station that serves as the official settlement source."""
+    """An NWS observation station that serves as the official settlement source.
+
+    `neighbors` is a tuple of nearby ICAO codes used as a cross-check + fallback
+    for the primary station. The neighbors do NOT settle the contract — only the
+    primary's CLI does — but their observations provide a redundancy signal
+    when the primary's ASOS goes offline and a microclimate-divergence signal
+    when the primary diverges from the surrounding network (sea breeze pinching
+    KHOU vs KIAH, marine layer pinching KLAX vs KBUR, lake breeze pinching
+    KORD vs KDPA, etc).
+    """
     icao: str               # e.g. "KHOU"
     name: str               # e.g. "Houston Hobby Airport"
     city_slug: str          # matches Kalshi market grouping, e.g. "HOUSTON"
@@ -109,6 +118,7 @@ class Station:
     cli_product: str        # NWS CLI product ID, e.g. "CLIHOU"
     latitude: float
     longitude: float
+    neighbors: tuple[str, ...] = ()   # supporting ICAO codes; cross-check only
 
 
 class SettlementProvenance(str, Enum):
@@ -195,6 +205,23 @@ class StationState:
     `running_max_f` / `running_min_f` are the highest/lowest values observed so
     far within the market day's local window. They are the only values that
     affect a high/low contract's settlement once they cross a strike.
+
+    `neighbor_running_max_f` / `neighbor_running_min_f` aggregate the same
+    window's extrema across the primary's `Station.neighbors`. They are NOT
+    settlement-conclusive — the contract still settles on the primary's CLI —
+    but they expose two operational signals:
+
+      1. Fallback: if the primary's ASOS is offline (`running_max_f is None`
+         but neighbors have data), the engine can fall back to the neighbor
+         median as a best-effort estimate, with a note attached.
+      2. Microclimate divergence: when the primary diverges from the neighbor
+         median by a large margin (sea breeze, marine layer, lake breeze),
+         the engine widens its uncertainty band to reflect lower forecast
+         skill in that regime.
+
+    `neighbor_sample_count` is the total number of neighbor readings inside
+    the window (across all neighbor stations), useful for gauging signal
+    confidence in the divergence check.
     """
     station: Station
     market_date: date
@@ -207,10 +234,33 @@ class StationState:
     cli_max_f: Optional[float]
     cli_min_f: Optional[float]
     observations: list[StationReading] = field(default_factory=list)
+    neighbor_running_max_f: Optional[float] = None
+    neighbor_running_min_f: Optional[float] = None
+    neighbor_sample_count: int = 0
+    neighbor_icaos: tuple[str, ...] = ()   # neighbors actually queried
 
     @property
     def cli_matches_market_date(self) -> bool:
         return self.cli_report_date == self.market_date
+
+    @property
+    def effective_running_max_f(self) -> Optional[float]:
+        """Primary's running max, or the neighbor's if the primary is missing.
+
+        Used by fair_probability so a transient ASOS outage on the primary
+        doesn't collapse fair_prob to the no-data fallback. The neighbor value
+        is NEVER used to lock a contract (LOCKED_YES / DEAD_NO) — only the
+        primary's reading does that.
+        """
+        if self.running_max_f is not None:
+            return self.running_max_f
+        return self.neighbor_running_max_f
+
+    @property
+    def effective_running_min_f(self) -> Optional[float]:
+        if self.running_min_f is not None:
+            return self.running_min_f
+        return self.neighbor_running_min_f
 
 
 class ContractState(str, Enum):

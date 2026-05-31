@@ -85,7 +85,46 @@ def _regime_key(regime: str, metric: str, bracket_kind: str) -> str:
 #: Default uncertainty band half-width for the daily-extremum projection,
 #: in °F. The 2.0°F number is the historical V0.3-V0.9 magic constant from
 #: state.py; per-station calibration overrides it via ForecastResidual.
+#: Used as the lead-time-agnostic fallback when no `lead_hours` is supplied
+#: to `forecast_residual_for`.
 DEFAULT_FORECAST_RESIDUAL_F = 2.0
+
+
+#: Lead-time-tiered residual defaults. NWS hourly forecast skill degrades
+#: monotonically with horizon — a 2h-out temp forecast typically beats the
+#: 12h-out one by a wide margin, but the V0.3-V0.9 model treated them
+#: identically (flat 2.0°F). These tiers replace the flat default whenever a
+#: lead time is known, tightening the band on near-settlement trades and
+#: widening it on speculative early-day positions.
+#:
+#: Numbers are rough medians of typical NAM/HRRR temp errors at each horizon
+#: from public skill stats; per-(station, metric) calibration in tuning.py
+#: still wins when sufficient samples exist.
+#:
+#: Format: ((max_hours_inclusive, residual_f), ...) — first match wins, in
+#: order. The final entry's `max_hours_inclusive` is unused (catch-all).
+DEFAULT_RESIDUAL_TIERS: tuple[tuple[float, float], ...] = (
+    (2.0, 0.8),       # 0-2h out: near settlement, very tight
+    (6.0, 1.5),       # 2-6h out: short-term, still good
+    (12.0, 2.5),      # 6-12h out: mid-day → afternoon, fair
+    (24.0, 3.5),      # 12-24h out: overnight → next-day, loose
+    (float("inf"), 4.5),  # 24h+ out: speculative, very loose
+)
+
+
+def _residual_for_lead(lead_hours: float) -> float:
+    """Look up the default residual for a forecast lead time, in °F.
+
+    `lead_hours` is the time from now to the forecast point that drives the
+    projected extremum. Negative or zero values clamp to the tightest tier.
+    """
+    if lead_hours < 0:
+        lead_hours = 0.0
+    for max_h, res in DEFAULT_RESIDUAL_TIERS:
+        if lead_hours <= max_h:
+            return res
+    # Unreachable: the last tier has max_h=inf
+    return DEFAULT_RESIDUAL_TIERS[-1][1]
 
 
 @dataclass(frozen=True)
@@ -167,17 +206,33 @@ class RankerConfig:
             return 0.0
         return shift.delta
 
-    def forecast_residual_for(self, station_icao: str, metric: str) -> float:
+    def forecast_residual_for(
+        self,
+        station_icao: str,
+        metric: str,
+        lead_hours: Optional[float] = None,
+    ) -> float:
         """Return the °F half-width to use for the projected uncertainty band.
 
-        Falls back to DEFAULT_FORECAST_RESIDUAL_F when:
-          - the (station, metric) pair isn't present in the config
-          - the calibration's sample size was below threshold
+        Resolution order:
+          1. Calibrated `(station, metric)` value from backtest, if `applied`.
+          2. Lead-time-tiered default via `DEFAULT_RESIDUAL_TIERS`, if
+             `lead_hours` is supplied.
+          3. The flat 2.0°F default, for backward compatibility when no lead
+             time is known.
+
+        The calibrated value still wins even when `lead_hours` is provided —
+        per-station backtest evidence beats a generic tier default. A future
+        PR can extend the calibrator to be tier-aware, but the gains from
+        lead-time-tiering hit hardest in the uncalibrated case (most new
+        stations) where the flat 2.0°F was always crude.
         """
         res = self.forecast_residuals.get(_residual_key(station_icao, metric))
-        if res is None or not res.applied:
-            return DEFAULT_FORECAST_RESIDUAL_F
-        return res.residual_f
+        if res is not None and res.applied:
+            return res.residual_f
+        if lead_hours is not None:
+            return _residual_for_lead(lead_hours)
+        return DEFAULT_FORECAST_RESIDUAL_F
 
     def to_dict(self) -> dict:
         return {

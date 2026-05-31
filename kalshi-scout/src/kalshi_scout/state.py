@@ -39,6 +39,10 @@ def build_station_state(
     Crucially, we discard CLI values whose `report_date` does not match the
     market date. Stale CLIs (e.g. yesterday's report still on file at 1 AM)
     are a known trap.
+
+    Also queries `station.neighbors` (when defined) for the same window. The
+    neighbor data is a cross-check signal and an ASOS-outage fallback only —
+    no neighbor reading can lock a contract; only the primary's CLI does.
     """
     now_utc = now_utc or datetime.now(timezone.utc)
     window_start_local, window_end_local = market_day_window(market_date, station.tz)
@@ -84,6 +88,37 @@ def build_station_state(
         if cli_min_f is not None:
             running_min = cli_min_f if running_min is None else min(running_min, cli_min_f)
 
+    # -- Neighbor cross-check --------------------------------------------------
+    # Per-neighbor failures are tolerated individually; one offline ASOS in
+    # the neighbor set must not collapse the primary's path.
+    neighbor_max: Optional[float] = None
+    neighbor_min: Optional[float] = None
+    neighbor_sample_count = 0
+    neighbor_icaos_queried: list[str] = []
+    if station.neighbors and start_utc < end_utc:
+        per_station_max: list[float] = []
+        per_station_min: list[float] = []
+        for neighbor_icao in station.neighbors:
+            try:
+                n_obs = nws.observations(neighbor_icao, start=start_utc, end=end_utc)
+            except Exception:
+                continue
+            if not n_obs:
+                continue
+            neighbor_icaos_queried.append(neighbor_icao)
+            neighbor_sample_count += len(n_obs)
+            per_station_max.append(max(r.temperature_f for r in n_obs))
+            per_station_min.append(min(r.temperature_f for r in n_obs))
+        # Aggregate across neighbors: max-of-maxes / min-of-mins gives the
+        # most aggressive bound (a neighbor saw it hotter than the primary).
+        # The median would be a "consensus" but max/min is what matters for
+        # the lock-side risk question. Use the median when computing
+        # divergence signal — that's a future enhancement.
+        if per_station_max:
+            neighbor_max = max(per_station_max)
+        if per_station_min:
+            neighbor_min = min(per_station_min)
+
     return StationState(
         station=station,
         market_date=market_date,
@@ -96,6 +131,10 @@ def build_station_state(
         cli_max_f=cli_max_f,
         cli_min_f=cli_min_f,
         observations=obs,
+        neighbor_running_max_f=neighbor_max,
+        neighbor_running_min_f=neighbor_min,
+        neighbor_sample_count=neighbor_sample_count,
+        neighbor_icaos=tuple(neighbor_icaos_queried),
     )
 
 
@@ -239,6 +278,33 @@ def _remaining_extrema_from_forecast(
     return min(temps), max(temps)
 
 
+def _lead_hours_to_extremum(
+    metric: Metric,
+    forecast: list[HourlyPoint],
+    state: StationState,
+    now_utc: datetime,
+) -> Optional[float]:
+    """Return hours from `now_utc` to the forecast point that defines the
+    projected extremum (max temp for HIGH metric, min for LOW), inside the
+    market-day window. Returns None when no forecast point covers the window
+    — caller must fall back to the lead-time-agnostic default.
+
+    The lead time of the *extremum* (not the average forecast point) is what
+    drives forecast skill on that side of the bracket — a 4pm-peak forecast
+    at noon has 4h skill, regardless of the rest of the day's points.
+    """
+    end_utc = state.window_end.astimezone(timezone.utc)
+    in_window = [p for p in forecast if now_utc <= p.start <= end_utc]
+    if not in_window:
+        return None
+    if metric is Metric.HIGH:
+        target = max(in_window, key=lambda p: p.temperature_f)
+    else:
+        target = min(in_window, key=lambda p: p.temperature_f)
+    delta = target.start - now_utc
+    return max(0.0, delta.total_seconds() / 3600.0)
+
+
 def project_extremum(
     metric: Metric,
     forecast: Optional[list[HourlyPoint]],
@@ -309,18 +375,35 @@ def fair_probability(
             return lo, hi
         return max(0.0, min(1.0, lo + shift)), max(0.0, min(1.0, hi + shift))
 
-    # Override the default 2.0°F residual with a per-(station, metric) calibrated
-    # value when one is available. The calibration is gated on sample size in
-    # tuning.derive_forecast_residuals; if uncalibrated, the lookup returns the
-    # 2.0°F default and the math is identical to the V0.9 behavior.
+    now_utc = now_utc or datetime.now(timezone.utc)
+    bracket = contract.bracket
+
+    # Compute lead time to the forecast extremum so the residual lookup can
+    # use a tighter band for near-settlement trades and a wider one for
+    # speculative early-day positions. Falls back to lead-time-agnostic when
+    # the forecast covers nothing inside the window (handled below).
+    lead_hours: Optional[float] = None
+    if forecast is not None:
+        lead_hours = _lead_hours_to_extremum(
+            contract.metric, forecast, station_state, now_utc
+        )
+
+    # Override the default residual with a per-(station, metric) calibrated
+    # value when one is available; otherwise use the lead-time tier default
+    # (config._residual_for_lead) when lead_hours is known. The calibration
+    # gate (sample size) is enforced in config.forecast_residual_for.
     if config is not None and station_state.station is not None:
         forecast_residual_f = config.forecast_residual_for(
             station_icao=station_state.station.icao,
             metric=contract.metric.value,
+            lead_hours=lead_hours,
         )
-
-    now_utc = now_utc or datetime.now(timezone.utc)
-    bracket = contract.bracket
+    elif lead_hours is not None:
+        # No config object at all — still apply tier defaults so the
+        # uncalibrated path benefits from lead-time awareness. Import
+        # lazily to avoid a hard dependency in the no-config path.
+        from kalshi_scout.config import _residual_for_lead
+        forecast_residual_f = _residual_for_lead(lead_hours)
 
     if state is ContractState.BRACKET_HIT_VULNERABLE:
         # Already in the bracket (only BETWEEN kinds reach this state); need
@@ -351,16 +434,20 @@ def fair_probability(
     if f_lo is None or f_hi is None:
         return _shifted(0.25, 0.75)
 
+    # Use the neighbor fallback when the primary's ASOS is silent — keeps
+    # us from collapsing to the no-data prior on transient outages. Never
+    # used to lock a contract (LOCKED_YES/DEAD_NO short-circuited above).
     if contract.metric is Metric.HIGH:
-        # Projected day-high is max(running_max, max(forecast in window))
-        proj_lo = max(station_state.running_max_f or -999, f_hi) - forecast_residual_f
-        proj_hi = max(station_state.running_max_f or -999, f_hi) + forecast_residual_f
+        observed = station_state.effective_running_max_f
+        proj_lo = max(observed if observed is not None else -999, f_hi) - forecast_residual_f
+        proj_hi = max(observed if observed is not None else -999, f_hi) + forecast_residual_f
         lo, hi = _bracket_overlap_prob(bracket, proj_lo, proj_hi)
         return _shifted(lo, hi)
 
     # LOW
-    proj_lo = min(station_state.running_min_f or 999, f_lo) - forecast_residual_f
-    proj_hi = min(station_state.running_min_f or 999, f_lo) + forecast_residual_f
+    observed = station_state.effective_running_min_f
+    proj_lo = min(observed if observed is not None else 999, f_lo) - forecast_residual_f
+    proj_hi = min(observed if observed is not None else 999, f_lo) + forecast_residual_f
     lo, hi = _bracket_overlap_prob(bracket, proj_lo, proj_hi)
     return _shifted(lo, hi)
 
