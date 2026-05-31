@@ -295,8 +295,15 @@ def derive_forecast_residuals(
     snapshots whose market quote was unfillable. Liquidity has no bearing
     on whether the underlying day settled, and using it as a gate would
     bias the residual estimate (and drop valid days from the sample count).
+
+    For the same reason no grade filter is applied: an F-graded snapshot
+    (forced by `_make_unverified_eval`, or when `ranker._grade_value`
+    couldn't compute an edge from missing prices on a LOCKED_YES/DEAD_NO)
+    can still carry a valid station, projection, and settled CLI value.
+    The only eligibility gates are projection-present + station-present
+    + settlement-present.
     """
-    all_snapshots = store.query_snapshots(min_grade="D", since=since)
+    all_snapshots = store.query_snapshots(since=since)
 
     # Group |residual| by (station_icao, metric). One day's max contract
     # contributes one residual; same-day siblings would double-count, so

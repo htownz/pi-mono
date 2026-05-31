@@ -330,6 +330,56 @@ def test_derive_forecast_residuals_applies_when_enough_samples(store: SnapshotSt
     assert round(residuals[key].residual_f, 1) == expected_median
 
 
+def test_derive_forecast_residuals_counts_F_graded_settled_days(store: SnapshotStore):
+    """Codex P2 round 2: the residual tuner must not filter by grade.
+    An F-graded snapshot (e.g. `_make_unverified_eval` output, or a
+    LOCKED_YES/DEAD_NO with no fillable price) can still carry a station,
+    a projection, and a settled CLI value. Excluding those days biases
+    the sample toward thicker-quoted markets."""
+    day = date(2026, 5, 27)
+    ticker = "KXHIGHHOUSTON-FGRADE-B79-80"
+    contract = ParsedContract(
+        market_ticker=ticker, event_ticker="KXHIGHHOUSTON-FGRADE",
+        city_slug="HOUSTON", metric=Metric.HIGH, market_date=day,
+        bracket=Bracket(BracketKind.BETWEEN, lo=79.0, hi=80.0),
+    )
+    market = KalshiMarket(
+        ticker=ticker, event_ticker="KXHIGHHOUSTON-FGRADE",
+        title="", yes_sub_title="", status="open", close_time=None,
+        yes_bid=40, yes_ask=42, no_bid=58, no_ask=60,
+        last_price=None, volume=10, open_interest=100,
+    )
+    eval_ = ContractEvaluation(
+        contract=contract, market=market,
+        state=ContractState.FORECAST_DEPENDENT, reason="unverified",
+        fair_prob_low=0.25, fair_prob_high=0.75,
+        yes_ask_cents=42, no_ask_cents=60,
+        edge_yes=-0.10, edge_no=0.05,
+        grade="F",
+        notes=["invariant I4: settlement source not verified"],
+    )
+    store.record_scan(
+        evaluations=[eval_],
+        station_state_map={
+            ticker: {
+                "station_icao": "KHOU", "cli_product": "CLIHOU",
+                "source_provenance": "resolver", "regime": "clear_and_dry",
+                "running_max_f": 84.0, "running_min_f": None,
+                "projected_extremum_f": 85.0,
+                "cli_report_date": None, "cli_max_f": None, "cli_min_f": None,
+            },
+        },
+    )
+    _settle(store, ticker, "KXHIGHHOUSTON-FGRADE", day, cli_value_f=84.5)
+
+    residuals, _ = derive_forecast_residuals(store)
+    key = residual_key("KHOU", "high")
+    # Old (min_grade="D") implementation would drop this F-graded snapshot;
+    # the fix counts it because the grade filter has been removed.
+    assert key in residuals
+    assert residuals[key].n_samples == 1
+
+
 def test_derive_forecast_residuals_counts_unfillable_market_days(store: SnapshotStore):
     """Regression for the Codex/Copilot finding on PR #4: residual calibration
     must not depend on whether the market had a tradable quote at scan time.
