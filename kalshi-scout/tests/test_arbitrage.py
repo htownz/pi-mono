@@ -13,7 +13,9 @@ and the >2-bracket eligibility check.
 """
 
 from kalshi_scout.arbitrage import (
+    _parse_interval,
     compute_event_arbitrage,
+    detect_numeric_partition,
     is_mutually_exclusive_event,
     rank_arbitrage_opportunities,
 )
@@ -231,3 +233,290 @@ def test_mex_detection_derives_series_from_event_ticker():
         title="", sub_title="", markets=[],
     )
     assert is_mutually_exclusive_event(e) is True
+
+
+# -- Algorithmic MEX detection -----------------------------------------------
+
+def _typed_market(ticker: str, yes_sub_title: str,
+                  yes_ask: int = 10, yes_bid: int = 9) -> KalshiMarket:
+    """Variant of _market that lets the test set yes_sub_title — the field
+    the algorithmic detector parses to extract numeric intervals."""
+    return KalshiMarket(
+        ticker=ticker, event_ticker="E", title="", yes_sub_title=yes_sub_title,
+        status="open", close_time=None,
+        yes_bid=yes_bid, yes_ask=yes_ask,
+        no_bid=100 - yes_ask, no_ask=100 - yes_bid,
+        last_price=None, volume=0, open_interest=0,
+    )
+
+
+def _typed_event(sub_titles: list[str], series_ticker: str = "KXUNKNOWN",
+                 event_ticker: str = "KXUNKNOWN-26MAY29") -> KalshiEvent:
+    markets = [
+        _typed_market(f"{event_ticker}-B{i}", s) for i, s in enumerate(sub_titles)
+    ]
+    return KalshiEvent(
+        event_ticker=event_ticker, series_ticker=series_ticker,
+        title="", sub_title="", markets=markets,
+    )
+
+
+def test_detector_passes_clean_weather_partition():
+    """5 weather-bucket markets tiling 60-65° with tail brackets at each end.
+    `KXUNKNOWN` series isn't in the whitelist, so this only passes via the
+    algorithmic detector."""
+    event = _typed_event([
+        "60° or below",      # LT tail
+        "60° to 61°", "61° to 62°", "62° to 63°", "63° to 64°", "64° to 65°",
+        "65° or above",      # GT tail
+    ])
+    result = detect_numeric_partition(event)
+    assert result.is_mex is True
+    assert result.n_parsed == result.n_markets
+    # And the public gate also accepts it (since the series isn't whitelisted,
+    # acceptance comes from the detector specifically).
+    assert is_mutually_exclusive_event(event) is True
+
+
+def test_detector_rejects_event_with_unparseable_sub_titles():
+    """Artist-streams-style events have non-numeric labels like 'Beyoncé wins'.
+    No interval parses → detector returns False → gate rejects."""
+    event = _typed_event([
+        "Beyoncé has most streams",
+        "Taylor Swift has most streams",
+        "Drake has most streams",
+    ])
+    result = detect_numeric_partition(event)
+    assert result.is_mex is False
+    assert result.n_parsed == 0
+    assert "no parseable numeric range" in result.reason
+    assert is_mutually_exclusive_event(event) is False
+
+
+def test_detector_rejects_overlapping_ranges():
+    """Tails-present event whose finite buckets overlap must be rejected
+    — the no-arb math is invalid even if labels parse and tails exist."""
+    event = _typed_event([
+        "10 or below",
+        "10 to 20", "15 to 25", "20 to 30",
+        "30 or above",
+    ])
+    result = detect_numeric_partition(event)
+    assert result.is_mex is False
+    assert "overlap" in result.reason
+
+
+def test_detector_rejects_large_gap():
+    """Tails-present event with a missing middle bucket: finite intervals
+    don't tile adjacently, so settlement in the gap has no winning bracket."""
+    event = _typed_event([
+        "60 or below",
+        "60 to 65", "70 to 75",   # 5-unit gap between 65 and 70
+        "75 or above",
+    ])
+    result = detect_numeric_partition(event)
+    assert result.is_mex is False
+    assert "gap" in result.reason
+
+
+def test_detector_rejects_single_market_event():
+    """A 1-market event isn't a partition by construction."""
+    event = _typed_event(["60 to 61"])
+    assert detect_numeric_partition(event).is_mex is False
+
+
+def test_detector_accepts_mixed_inclusive_exclusive_boundaries():
+    """Weather-style buckets share endpoints (`60-61` then `61-62`) with
+    gap=0 between them. With tail brackets at both ends, this passes."""
+    event = _typed_event([
+        "60 or below",
+        "60 to 61", "61 to 62", "62 to 63",
+        "63 or above",
+    ])
+    assert detect_numeric_partition(event).is_mex is True
+
+
+def test_detector_accepts_dollar_denominated_brackets():
+    """Natural-gas-style $-denominated brackets, with tails covering prices
+    below the lowest and above the highest finite bucket."""
+    event = _typed_event([
+        "$2.99 or below",
+        "$3.00 to $3.25", "$3.25 to $3.50", "$3.50 to $3.75",
+        "$3.75 or above",
+    ])
+    assert detect_numeric_partition(event).is_mex is True
+
+
+def test_detector_rejects_finite_only_partition_without_tails():
+    """Codex P1: finite-only `$3.00-$3.25, $3.25-$3.50, $3.50-$3.75` has
+    no bracket for prices below $3.00 or above $3.75. A settlement at $4
+    would lose every Yes leg, so the no-arb math is invalid."""
+    event = _typed_event([
+        "$3.00 to $3.25", "$3.25 to $3.50", "$3.50 to $3.75",
+    ])
+    result = detect_numeric_partition(event)
+    assert result.is_mex is False
+    assert "finite-only" in result.reason
+
+
+def test_detector_rejects_partition_missing_only_high_tail():
+    """A below-tail covers prices below the lowest finite bucket, but the
+    top is still unbounded — a settlement above the last finite bucket
+    has no winning bracket."""
+    event = _typed_event([
+        "2 or below", "2 to 3", "3 to 4",
+    ])
+    result = detect_numeric_partition(event)
+    assert result.is_mex is False
+    assert "above-tail" in result.reason
+
+
+def test_detector_rejects_decimal_gap_below_old_blanket_tolerance():
+    """Codex P2: `$3.00-$3.25` + `$4.70-$5.00` has a 1.45 gap that the old
+    1.5-unit blanket tolerance accepted. With strict 0.01 epsilon between
+    finite intervals, the missing $3.25-$4.70 span is now rejected."""
+    event = _typed_event([
+        "$2.99 or below",
+        "$3.00 to $3.25", "$4.70 to $5.00",
+        "$5.00 or above",
+    ])
+    result = detect_numeric_partition(event)
+    assert result.is_mex is False
+    assert "gap" in result.reason
+
+
+def test_strict_mex_disables_algorithmic_fallback():
+    """`--strict-mex` returns the V1.1 whitelist-only behavior."""
+    event = _typed_event([
+        "60 or below",
+        "60 to 61", "61 to 62", "62 to 63",
+        "63 or above",
+    ], series_ticker="KXTOTALLYNEW")
+    assert is_mutually_exclusive_event(event) is True
+    assert is_mutually_exclusive_event(event, strict=True) is False
+
+
+def test_ranker_strict_mex_rejects_algorithmically_detected_events():
+    """End-to-end: an event the detector promotes shows up in `rank` with
+    default args but disappears under `strict_mex=True`."""
+    sub_titles = [
+        "60 or below",
+        "60 to 61", "61 to 62", "62 to 63", "63 to 64", "64 to 65",
+        "65 or above",
+    ]
+    markets = [
+        _typed_market(f"E-B{i}", s, yes_ask=12, yes_bid=11)
+        for i, s in enumerate(sub_titles)
+    ]
+    event = KalshiEvent(
+        event_ticker="KXTOTALLYNEW-26MAY29", series_ticker="KXTOTALLYNEW",
+        title="", sub_title="", markets=markets,
+    )
+    permissive = rank_arbitrage_opportunities([event])
+    strict = rank_arbitrage_opportunities([event], strict_mex=True)
+    assert len(permissive) == 1
+    assert len(strict) == 0
+
+
+def test_detector_handles_above_below_tail_brackets():
+    """Tail brackets extend coverage to ±inf so the contiguous-axis check
+    passes for finite intervals between them."""
+    event = _typed_event([
+        "60° or below",
+        "60° to 61°", "61° to 62°", "62° to 63°",
+        "63° or above",
+    ])
+    assert detect_numeric_partition(event).is_mex is True
+
+
+def test_detector_does_not_fall_back_to_title():
+    """Copilot P2: the detector reads yes_sub_title only. An event whose
+    bracket labels are non-numeric but whose titles contain numbers (e.g.
+    'Will price be above $80?') must NOT be promoted."""
+    markets = [
+        KalshiMarket(
+            ticker=f"E-B{i}", event_ticker="E",
+            title=f"Will the price be above ${30 + i}?",  # numeric title
+            yes_sub_title="Yes",                          # non-numeric label
+            status="open", close_time=None,
+            yes_bid=20, yes_ask=21, no_bid=79, no_ask=80,
+            last_price=None, volume=0, open_interest=0,
+        )
+        for i in range(5)
+    ]
+    event = KalshiEvent(
+        event_ticker="KXNUMERICTITLE", series_ticker="KXNUMERICTITLE",
+        title="", sub_title="", markets=markets,
+    )
+    result = detect_numeric_partition(event)
+    assert result.is_mex is False
+    assert "no parseable numeric range" in result.reason
+
+
+def test_detector_rejects_gap_between_low_tail_and_first_finite():
+    """Codex P1: `2 or below` + `3 to 4` + `4 or above` has a (2, 3) gap
+    that no bracket covers. The detector now verifies tail-finite adjacency
+    in addition to finite-finite gaps."""
+    event = _typed_event([
+        "2 or below", "3 to 4", "4 or above",
+    ])
+    result = detect_numeric_partition(event)
+    assert result.is_mex is False
+    assert "low-tail" in result.reason
+    assert "gap" in result.reason
+
+
+def test_detector_rejects_gap_between_last_finite_and_high_tail():
+    """Mirror of the above on the high side: `0 or below`, `0-1`, `5 or above`
+    has a (1, 5) gap between the last finite bucket and the high tail."""
+    event = _typed_event([
+        "0 or below", "0 to 1", "5 or above",
+    ])
+    result = detect_numeric_partition(event)
+    assert result.is_mex is False
+    assert "high-tail" in result.reason
+    assert "gap" in result.reason
+
+
+def test_detector_rejects_low_tail_overlapping_first_finite():
+    """`5 or below` overlaps `3 to 7` (the finite bucket starts at 3,
+    below 5). A settlement at 4 has two Yes brackets, which is the
+    overlap case the gate must reject."""
+    event = _typed_event([
+        "5 or below", "3 to 7", "7 or above",
+    ])
+    result = detect_numeric_partition(event)
+    assert result.is_mex is False
+    assert "overlap" in result.reason
+
+
+def test_detector_rejects_pure_tails_event():
+    """Codex P2 round 2: a 2-market event with ONLY tails (`50 or below` +
+    `50 or above`) is never a valid partition. With inclusive labels the
+    boundary value 50 is in both brackets; with strict labels it's in
+    neither. Either way it's not a true partition, so the detector rejects."""
+    event = _typed_event([
+        "50 or below", "50 or above",
+    ])
+    result = detect_numeric_partition(event)
+    assert result.is_mex is False
+    assert "pure-tails" in result.reason
+
+
+def test_parse_interval_rejects_strict_prefix_operators():
+    """Codex P2 round 2: strict-open operators (`above N`, `below N`,
+    `>N`, `<N`) are ambiguous at the boundary. The detector drops them
+    so events with strict labels can't be promoted as MEX."""
+    # Inclusive forms still work.
+    assert _parse_interval(">= 60") == (60.0, float("inf"))
+    assert _parse_interval("<= 50") == (float("-inf"), 50.0)
+    assert _parse_interval("at least 60") == (60.0, float("inf"))
+    assert _parse_interval("at most 50") == (float("-inf"), 50.0)
+    assert _parse_interval("= 75") == (75.0, 75.0)
+    # Strict forms are rejected (no fallback inclusive interpretation).
+    assert _parse_interval("above 60") is None
+    assert _parse_interval("below 50") is None
+    assert _parse_interval(">60") is None
+    assert _parse_interval("<50") is None
+    assert _parse_interval("greater than 60") is None
+    assert _parse_interval("less than 50") is None

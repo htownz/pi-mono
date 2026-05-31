@@ -16,7 +16,13 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from kalshi_scout.arbitrage import rank_arbitrage_opportunities
+from kalshi_scout.arbitrage import (
+    MUTUALLY_EXCLUSIVE_SERIES,
+    _parse_interval,
+    detect_numeric_partition,
+    is_mutually_exclusive_event,
+    rank_arbitrage_opportunities,
+)
 from kalshi_scout.coherence import enforce_coherence
 from kalshi_scout.calibrate import calibrate as run_calibrate, report_to_dict
 from kalshi_scout.config import RankerConfig
@@ -1719,10 +1725,13 @@ def risk(store_path: str, as_json: bool) -> None:
               help="Diagnostic: include events whose brackets aren't verified "
                    "mutually exclusive. Most hits will be FALSE POSITIVES. "
                    "Do not trade off this output.")
+@click.option("--strict-mex", is_flag=True,
+              help="Whitelist-only MEX gating (the pre-detector V1.1 behavior). "
+                   "Disables the algorithmic numeric-partition fallback.")
 @click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of a table.")
 def arbitrage(fee_per_leg: int, min_edge: int, min_brackets: int,
               limit: int, max_markets: Optional[int],
-              all_events: bool, as_json: bool) -> None:
+              all_events: bool, strict_mex: bool, as_json: bool) -> None:
     """Cross-bracket arbitrage scan across ALL open Kalshi events.
 
     Category-agnostic — works on weather, sports, politics, econ data, etc.
@@ -1761,7 +1770,7 @@ def arbitrage(fee_per_leg: int, min_edge: int, min_brackets: int,
         )
     arbs = rank_arbitrage_opportunities(
         events, fee_per_leg_cents=fee_per_leg, min_net_edge_cents=min_edge,
-        require_mex=not all_events,
+        require_mex=not all_events, strict_mex=strict_mex,
     )
 
     if as_json:
@@ -1820,6 +1829,118 @@ def arbitrage(fee_per_leg: int, min_edge: int, min_brackets: int,
         f"[dim]To act: buy 1 contract on every bracket of the chosen event "
         f"on the SIDE column. Profit = {{Net edge}} × basket_size.[/dim]"
     )
+
+
+@main.command(name="mex-check")
+@click.argument("event_ticker")
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of a panel.")
+def mex_check(event_ticker: str, as_json: bool) -> None:
+    """Inspect one event's MEX (mutually-exclusive) eligibility.
+
+    Reports whether the event passes the curated `MUTUALLY_EXCLUSIVE_SERIES`
+    whitelist, what the algorithmic numeric-partition detector decides and
+    why, and the parsed yes_sub_title interval for each market.
+
+    Use when deciding whether to trust a new series' arbitrage signal —
+    or to debug why a known-MEX event is being rejected.
+    """
+    with KalshiClient() as kclient:
+        markets = list(kclient.iter_markets(event_ticker=event_ticker))
+    if not markets:
+        console.print(f"[red]no markets found for event {event_ticker}[/red]")
+        sys.exit(1)
+    event = KalshiEvent(
+        event_ticker=event_ticker, series_ticker="",
+        title="", sub_title="", markets=markets,
+    )
+    series = (event.event_ticker.split("-", 1)[0] if event.event_ticker else "").upper()
+    in_whitelist = series in MUTUALLY_EXCLUSIVE_SERIES
+    detection = detect_numeric_partition(event)
+    accepted = is_mutually_exclusive_event(event)
+
+    parsed_intervals = [_parse_interval(m.yes_sub_title) for m in markets]
+
+    if as_json:
+        click.echo(json.dumps({
+            "event_ticker": event_ticker,
+            "series": series,
+            "n_markets": len(markets),
+            "in_whitelist": in_whitelist,
+            "detector": {
+                "is_mex": detection.is_mex,
+                "reason": detection.reason,
+                "n_parsed": detection.n_parsed,
+            },
+            "accepted_by_default_gate": accepted,
+            "accepted_by_strict_gate": in_whitelist,
+            "markets": [
+                {
+                    "ticker": m.ticker,
+                    "yes_sub_title": m.yes_sub_title,
+                    "parsed_interval": _interval_for_json(iv),
+                }
+                for m, iv in zip(markets, parsed_intervals)
+            ],
+        }, indent=2))
+        return
+
+    verdict = "[green]ACCEPTED[/green]" if accepted else "[red]REJECTED[/red]"
+    body = (
+        f"[bold]{event_ticker}[/bold]   series={series}   n_markets={len(markets)}\n"
+        f"\n"
+        f"whitelist match:  {'[green]yes[/green]' if in_whitelist else '[dim]no[/dim]'}\n"
+        f"detector verdict: "
+        f"{'[green]is_mex=True[/green]' if detection.is_mex else '[red]is_mex=False[/red]'}"
+        f"  ({detection.n_parsed}/{detection.n_markets} parsed)\n"
+        f"reason:           {detection.reason}\n"
+        f"\n"
+        f"default gate:     {verdict}\n"
+        f"strict gate:      {'[green]ACCEPTED[/green]' if in_whitelist else '[red]REJECTED[/red]'}"
+    )
+    console.print(Panel(body, title="MEX check", border_style="cyan"))
+
+    sample_table = Table(title="Markets (first 10)", header_style="bold cyan")
+    sample_table.add_column("Ticker")
+    sample_table.add_column("yes_sub_title")
+    sample_table.add_column("Parsed interval")
+    for m, iv in zip(markets[:10], parsed_intervals[:10]):
+        sample_table.add_row(
+            m.ticker,
+            m.yes_sub_title or "[dim]—[/dim]",
+            _interval_for_display(iv),
+        )
+    console.print(sample_table)
+    if len(markets) > 10:
+        console.print(f"[dim]  (+{len(markets) - 10} more markets)[/dim]")
+
+
+def _interval_for_json(iv: Optional[tuple[float, float]]) -> Optional[dict]:
+    """JSON-safe encoding of a parsed interval. Infinite endpoints become
+    the strings "-inf" / "+inf" since json.dumps refuses non-finite floats."""
+    if iv is None:
+        return None
+    return {
+        "lo": _endpoint_for_json(iv[0]),
+        "hi": _endpoint_for_json(iv[1]),
+    }
+
+
+def _endpoint_for_json(v: float):
+    if v == float("-inf"):
+        return "-inf"
+    if v == float("inf"):
+        return "+inf"
+    return v
+
+
+def _interval_for_display(iv: Optional[tuple[float, float]]) -> str:
+    if iv is None:
+        return "[red]unparseable[/red]"
+    lo = "−∞" if iv[0] == float("-inf") else f"{iv[0]:g}"
+    hi = "+∞" if iv[1] == float("inf") else f"{iv[1]:g}"
+    if iv[0] == iv[1]:
+        return f"= {lo}"
+    return f"[{lo}, {hi}]"
 
 
 if __name__ == "__main__":
