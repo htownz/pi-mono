@@ -1425,7 +1425,8 @@ def replay(store_path: str, snapshot_id: int) -> None:
               help="Skip results worse than this grade.")
 @click.option("--notify", "notify_specs", multiple=True,
               help="Alert sink spec: 'stdout', 'jsonl:PATH', 'webhook:URL', "
-                   "'ntfy:TOPIC', or 'discord:WEBHOOK_URL'.")
+                   "'ntfy:TOPIC' (or 'ntfy:https://self-hosted/topic'), "
+                   "or 'discord:WEBHOOK_URL'.")
 @click.option("--notify-min-grade", default="A",
               help="Only fire alerts at this grade or better.")
 @click.option("--config", "config_path", type=click.Path(exists=True), default=None,

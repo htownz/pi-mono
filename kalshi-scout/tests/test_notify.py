@@ -246,7 +246,9 @@ def test_ntfy_sink_sets_priority_and_title_headers():
     """A+ -> priority 5; title carries the grade so the lockscreen shows it."""
     with respx.mock(base_url="https://ntfy.sh") as mock:
         route = mock.post("/topic").respond(200)
-        NtfySink(topic_or_url="topic").emit(_alert(grade="A+"))
+        sink = NtfySink(topic_or_url="topic")
+        sink.emit(_alert(grade="A+"))
+        sink.close()
         req = route.calls.last.request
         assert req.headers["Priority"] == "5"
         assert "[A+]" in req.headers["Title"]
@@ -255,7 +257,9 @@ def test_ntfy_sink_sets_priority_and_title_headers():
 def test_ntfy_sink_lower_priority_for_b_grade():
     with respx.mock(base_url="https://ntfy.sh") as mock:
         route = mock.post("/topic").respond(200)
-        NtfySink(topic_or_url="topic").emit(_alert(grade="B"))
+        sink = NtfySink(topic_or_url="topic")
+        sink.emit(_alert(grade="B"))
+        sink.close()
         assert route.calls.last.request.headers["Priority"] == "3"
 
 
@@ -284,11 +288,15 @@ def test_ntfy_sink_swallows_failures():
 # -- DiscordSink -------------------------------------------------------------
 
 def test_discord_sink_posts_rich_embed():
-    """Discord webhook gets a structured embed, not raw alert JSON."""
+    """Discord webhook gets a structured embed, not raw alert JSON. The
+    price field is named after the actionable side (`yes_ask` here since
+    edge_yes is the operative edge)."""
     url = "https://discord.com/api/webhooks/123/abc"
     with respx.mock() as mock:
         route = mock.post(url).respond(204)
-        DiscordSink(webhook_url=url).emit(_alert())
+        sink = DiscordSink(webhook_url=url)
+        sink.emit(_alert())
+        sink.close()
         body = json.loads(route.calls.last.request.content)
 
     assert body["username"] == "kalshi-scout"
@@ -307,10 +315,13 @@ def test_discord_sink_posts_rich_embed():
 
 
 def test_discord_sink_uses_no_side_when_no_edge_larger():
-    """When edge_no exceeds edge_yes, the embed reports the no side."""
+    """Codex P2: when edge_no > edge_yes (DEAD_NO opportunities), the
+    actionable side is `no` and the embed must report the no side's
+    tradable price (`no_ask`) — not `yes_ask: —` like the V1 code did."""
     url = "https://discord.com/api/webhooks/x/y"
     with respx.mock() as mock:
         route = mock.post(url).respond(204)
+        sink = DiscordSink(webhook_url=url)
         alert = Alert(
             fired_at_utc=datetime.now(timezone.utc),
             market_ticker="X", event_ticker="Y", city_slug="DC",
@@ -320,9 +331,15 @@ def test_discord_sink_uses_no_side_when_no_edge_larger():
             edge_yes=None, edge_no=0.45,
             fair_prob_low=0.0, fair_prob_high=0.02, notes=[],
         )
-        DiscordSink(webhook_url=url).emit(alert)
+        sink.emit(alert)
+        sink.close()
         body = json.loads(route.calls.last.request.content)
     field_map = {f["name"]: f["value"] for f in body["embeds"][0]["fields"]}
+    # The field is now named `no_ask` (not `yes_ask`) and carries the
+    # tradable price.
+    assert "no_ask" in field_map
+    assert field_map["no_ask"] == "7c"
+    assert "yes_ask" not in field_map
     assert "no" in field_map["edge"]
     assert "+0.45" in field_map["edge"]
 

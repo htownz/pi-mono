@@ -252,6 +252,28 @@ def _discord_color(grade: str) -> int:
     }.get(grade, 0x95A5A6)  # gray for C/D
 
 
+def _embed_side(alert: Alert) -> tuple[str, str, str]:
+    """Pick the (side_label, price_string, edge_string) the alert's
+    actionable side. The ranker grades LOCKED_YES off edge_yes and DEAD_NO
+    off edge_no, so the side with the larger edge is the tradable one and
+    that side's ask is the fillable price the operator needs.
+    """
+    # Default: yes side. Switch to no when edge_no clearly wins.
+    side = "yes"
+    edge: Optional[float] = alert.edge_yes
+    if alert.edge_no is not None and (
+        alert.edge_yes is None or alert.edge_no > alert.edge_yes
+    ):
+        side = "no"
+        edge = alert.edge_no
+    if side == "yes":
+        price = f"{alert.yes_ask_cents}c" if alert.yes_ask_cents is not None else "—"
+    else:
+        price = f"{alert.no_ask_cents}c" if alert.no_ask_cents is not None else "—"
+    edge_str = f"{side} {edge:+.2f}" if edge is not None else "—"
+    return side, price, edge_str
+
+
 class DiscordSink:
     """Rich-embed alert via Discord webhook.
 
@@ -272,19 +294,19 @@ class DiscordSink:
 
     def emit(self, alert: Alert) -> None:
         prev = f" (was {alert.previous_grade})" if alert.previous_grade else ""
-        edge_value = "—"
-        if alert.edge_yes is not None and (alert.edge_no is None or alert.edge_yes >= alert.edge_no):
-            edge_value = f"yes {alert.edge_yes:+.2f}"
-        elif alert.edge_no is not None:
-            edge_value = f"no {alert.edge_no:+.2f}"
-        ya = f"{alert.yes_ask_cents}c" if alert.yes_ask_cents is not None else "—"
+        # Pick the actionable side from the edges so the embed reports the
+        # tradable price for THAT side. DEAD_NO alerts have edge_no > edge_yes
+        # and a populated no_ask — showing yes_ask there is misleading
+        # (often "—") and hides the fillable price from the operator.
+        side_label, price, edge_value = _embed_side(alert)
+        price_field = f"{side_label}_ask"
         fair = f"{alert.fair_prob_low * 100:.0f}–{alert.fair_prob_high * 100:.0f}%"
         embed = {
             "title": f"[{alert.grade}] {alert.market_ticker}{prev}",
             "description": f"**{alert.state}** — {alert.reason}",
             "color": _discord_color(alert.grade),
             "fields": [
-                {"name": "yes_ask", "value": ya, "inline": True},
+                {"name": price_field, "value": price, "inline": True},
                 {"name": "fair", "value": fair, "inline": True},
                 {"name": "edge", "value": edge_value, "inline": True},
                 {"name": "city", "value": alert.city_slug, "inline": True},
