@@ -461,11 +461,25 @@ class AutoTrader:
         alert: Alert,
         snap: SnapshotRow,
         size: Optional[int] = None,
+        *,
+        side_override: Optional[str] = None,
+        price_override: Optional[int] = None,
     ) -> TradeAttempt:
         """Single-alert entry. Returns the TradeAttempt regardless of
-        outcome; the audit log captures it for replay."""
+        outcome; the audit log captures it for replay.
+
+        `side_override` / `price_override` bypass the snapshot-derivation
+        for callers that have already resolved them (e.g. the `fire` CLI
+        command, where the operator explicitly picked the side at the
+        confirmation prompt). Without these the caller is at the mercy of
+        the snapshot, which may be stale or disagree with the operator's
+        intent.
+        """
         size = size if size is not None else self.default_size
-        side, price = self._derive_side_and_price(snap)
+        if side_override is not None and price_override is not None:
+            side, price = side_override, price_override
+        else:
+            side, price = self._derive_side_and_price(snap)
 
         attempt_base = dict(
             fired_at_utc=alert.fired_at_utc,
@@ -498,13 +512,14 @@ class AutoTrader:
             return attempt
 
         order_id: Optional[str] = None
+        filled_count = size   # paper mode assumes full fill
+        order_status: Optional[str] = None
         if not self.paper:
             try:
                 resp = self.client.place_order(
                     ticker=alert.market_ticker, action="buy", side=side,
                     count=size, price_cents=price, order_type=self.order_type,
                 )
-                order_id = (resp.get("order") or {}).get("order_id")
             except Exception as exc:
                 attempt = TradeAttempt(
                     **attempt_base, side=side, price_cents=price,
@@ -514,9 +529,31 @@ class AutoTrader:
                 )
                 self._audit(attempt)
                 return attempt
+            order = resp.get("order") or {}
+            order_id = order.get("order_id")
+            order_status = (order.get("status") or "").lower() or None
+            filled_count = self._fill_count_from_response(order, requested=size)
+            if filled_count == 0:
+                # Limit accepted but resting on the book (or canceled).
+                # Don't record a phantom position — the local store would
+                # diverge from the broker. Surface the order id in the
+                # audit so the operator can follow up via the Kalshi UI.
+                attempt = TradeAttempt(
+                    **attempt_base, side=side, price_cents=price,
+                    size_contracts=0, placed=False,
+                    reason=(
+                        f"order {order_status or 'accepted'} but unfilled "
+                        f"(0/{size} contracts); not recorded as position"
+                    ),
+                    order_id=order_id, position_id=None,
+                )
+                self._audit(attempt)
+                return attempt
 
-        # Record the position in the local store regardless of paper vs live —
-        # the dashboard's Risk panel needs to see what the bot deployed.
+        # Record the position with the size that ACTUALLY filled. For paper
+        # mode that's the requested size (no real broker to disagree). For
+        # live, partial fills here mean the local store stays in sync with
+        # the broker even when the book moved between snapshot and placement.
         note_parts = [
             f"auto-trade: grade={snap.grade} state={snap.state} "
             f"fair={snap.fair_prob_low * 100:.0f}-{snap.fair_prob_high * 100:.0f}%",
@@ -525,20 +562,54 @@ class AutoTrader:
             note_parts.append("PAPER (not actually placed)")
         if order_id:
             note_parts.append(f"order_id={order_id}")
+        if filled_count < size:
+            note_parts.append(
+                f"PARTIAL fill: {filled_count}/{size} (rest may be resting)"
+            )
         position_id = self.store.add_position(
             market_ticker=alert.market_ticker,
             event_ticker=alert.event_ticker,
-            side=side, size_contracts=size, avg_price_cents=price,
+            side=side, size_contracts=filled_count, avg_price_cents=price,
             notes="; ".join(note_parts),
         )
 
+        reason = "placed" + (" (paper)" if self.paper else "")
+        if filled_count < size:
+            reason += f" — partial fill {filled_count}/{size}"
         attempt = TradeAttempt(
-            **attempt_base, side=side, price_cents=price, size_contracts=size,
-            placed=True, reason="placed" + (" (paper)" if self.paper else ""),
+            **attempt_base, side=side, price_cents=price,
+            size_contracts=filled_count, placed=True, reason=reason,
             order_id=order_id, position_id=position_id,
         )
         self._audit(attempt)
         return attempt
+
+    @staticmethod
+    def _fill_count_from_response(order: dict, *, requested: int) -> int:
+        """Best-effort fill count from Kalshi's order response.
+
+        The field name has varied across Kalshi API versions; check the
+        common shapes before falling back to status inference. Conservative:
+        when nothing definitive is present, treat as 0 (resting) rather
+        than assuming a full fill — better to under-record locally than to
+        diverge from the broker.
+        """
+        for k in ("taker_fill_count", "fill_count", "filled_quantity", "filled_count"):
+            v = order.get(k)
+            if v is not None:
+                try:
+                    return max(0, min(requested, int(v)))
+                except (TypeError, ValueError):
+                    continue
+        status = (order.get("status") or "").lower()
+        if status == "executed":
+            # Some API versions only return status; "executed" means fully
+            # filled per Kalshi's documented order lifecycle.
+            return requested
+        if status in ("resting", "queued", "canceled", "cancelled"):
+            return 0
+        # Unknown shape — be defensive and assume nothing filled.
+        return 0
 
     @staticmethod
     def _derive_side_and_price(snap: SnapshotRow) -> tuple[Optional[str], Optional[int]]:

@@ -433,8 +433,13 @@ def test_auto_trader_live_mode_places_real_order(store, tmp_path, keypair):
     returned order_id alongside the local position."""
     _, pem = keypair
     with respx.mock(base_url=KALSHI_API_BASE) as mock:
+        # Fully-filled response: status=executed + explicit fill count.
         mock.post("/portfolio/orders").respond(
-            200, json={"order": {"order_id": "ord_abc123"}},
+            200, json={"order": {
+                "order_id": "ord_abc123",
+                "status": "executed",
+                "taker_fill_count": 1,
+            }},
         )
         client = KalshiTradingClient(key_id="kid", private_key_path=pem)
         trader = _trader(store, tmp_path, paper=False, client=client)
@@ -446,6 +451,133 @@ def test_auto_trader_live_mode_places_real_order(store, tmp_path, keypair):
     # Audit + local position both reference the broker-side id via notes.
     pos = store.query_positions(open_only=True)[0]
     assert "ord_abc123" in pos.notes
+    assert pos.size_contracts == 1
+
+
+def test_auto_trader_live_mode_skips_unfilled_resting_order(store, tmp_path, keypair):
+    """Codex P1: a limit order that's accepted but resting (no fill yet)
+    must NOT be recorded as a local position. The local store would
+    diverge from the broker; risk aggregation + auto-close would lie."""
+    _, pem = keypair
+    with respx.mock(base_url=KALSHI_API_BASE) as mock:
+        mock.post("/portfolio/orders").respond(
+            200, json={"order": {
+                "order_id": "ord_resting",
+                "status": "resting",
+                "taker_fill_count": 0,
+            }},
+        )
+        client = KalshiTradingClient(key_id="kid", private_key_path=pem)
+        # Lift the caps so the 10-contract intent isn't refused by the
+        # default $5 risk cap; we want the resting/fill check to be what
+        # blocks the position write, not the risk guard.
+        trader = _trader(store, tmp_path, paper=False, client=client,
+                         max_position_size_contracts=10,
+                         max_position_cost_cents=10000,
+                         max_concentration_per_event_cents=10000)
+        attempt = trader.maybe_trade(_alert(), _snap(), size=10)
+        client.close()
+    assert attempt.placed is False
+    assert "unfilled" in attempt.reason
+    assert "0/10" in attempt.reason
+    # Order id still surfaced so the operator can chase it on Kalshi.
+    assert attempt.order_id == "ord_resting"
+    # No phantom position written.
+    assert store.query_positions(open_only=True) == []
+
+
+def test_auto_trader_live_mode_records_partial_fill_with_actual_size(store, tmp_path, keypair):
+    """Codex P1: when Kalshi reports a partial fill, the local position
+    records only the actually-filled size — not the requested size — so
+    the local store mirrors the broker exactly."""
+    _, pem = keypair
+    with respx.mock(base_url=KALSHI_API_BASE) as mock:
+        mock.post("/portfolio/orders").respond(
+            200, json={"order": {
+                "order_id": "ord_partial",
+                "status": "resting",
+                "taker_fill_count": 3,    # 3 of 10 immediately taken
+            }},
+        )
+        client = KalshiTradingClient(key_id="kid", private_key_path=pem)
+        trader = _trader(store, tmp_path, paper=False, client=client,
+                         max_position_size_contracts=10,
+                         max_position_cost_cents=10000,
+                         max_concentration_per_event_cents=10000)
+        attempt = trader.maybe_trade(_alert(), _snap(), size=10)
+        client.close()
+    assert attempt.placed is True
+    assert attempt.size_contracts == 3       # not 10
+    assert "partial fill 3/10" in attempt.reason
+    pos = store.query_positions(open_only=True)[0]
+    assert pos.size_contracts == 3
+    assert "PARTIAL" in pos.notes
+
+
+def test_fill_count_handles_alternate_field_names(store, tmp_path, keypair):
+    """Kalshi has shipped both `taker_fill_count` and `fill_count` in
+    different API versions; the parser tries both before falling back to
+    the status field."""
+    from kalshi_scout.trading import AutoTrader as AT
+    # Explicit count wins regardless of status.
+    assert AT._fill_count_from_response({"fill_count": 5}, requested=10) == 5
+    assert AT._fill_count_from_response({"filled_quantity": 7}, requested=10) == 7
+    # No count, but status=executed → full fill.
+    assert AT._fill_count_from_response({"status": "executed"}, requested=10) == 10
+    # No count, status=resting → 0.
+    assert AT._fill_count_from_response({"status": "resting"}, requested=10) == 0
+    # Unknown shape → conservative 0.
+    assert AT._fill_count_from_response({}, requested=10) == 0
+    # Bogus count clamped to [0, requested].
+    assert AT._fill_count_from_response({"fill_count": 99}, requested=10) == 10
+    assert AT._fill_count_from_response({"fill_count": -3}, requested=10) == 0
+
+
+def test_auto_trader_honors_side_and_price_overrides(store, tmp_path):
+    """Codex P1: when the caller passes side_override + price_override
+    (e.g. from `fire` after the operator picked the side at the prompt),
+    those values must reach the broker — not the snapshot-derived ones.
+
+    Use a snap whose snapshot-derived side=no but where overriding to
+    yes still passes risk (positive edge_yes). With the override path
+    bypassing _derive_side_and_price, the order placed matches the
+    operator's intent.
+    """
+    # fair_lo=0.55, fair_hi=0.75 → fair_mid=0.65. yes_ask=15 → edge_yes
+    # = 0.65 - 0.15 = 0.50 (well above min_edge=5c). dead_no derivation
+    # would default to side=no — the override should win.
+    trader = _trader(store, tmp_path, paper=True)
+    high_edge_snap = _snap(
+        state="forecast_dependent", fair_lo=0.55, fair_hi=0.75,
+        yes_ask=15, no_ask=85, edge_yes=0.50, edge_no=-0.50,
+        running_min=62.0,
+    )
+    attempt = trader.maybe_trade(
+        _alert(), high_edge_snap, size=1,
+        side_override="yes", price_override=15,
+    )
+    assert attempt.placed is True, attempt.reason
+    assert attempt.side == "yes"
+    assert attempt.price_cents == 15
+    pos = store.query_positions(open_only=True)[0]
+    assert pos.side == "yes"
+    assert pos.avg_price_cents == 15
+
+
+def test_auto_trader_overrides_still_pass_through_risk_guard(store, tmp_path):
+    """Overrides bypass the SNAPSHOT-derivation but NOT the risk guard.
+    A nonsensical override (price=99c with no fair value to support it)
+    is still refused by the min-edge check."""
+    trader = _trader(store, tmp_path, paper=True)
+    # Snap has fair_prob=[0, 0.02] → yes side fair ≈ 1c, no side fair ≈ 99c.
+    # Override to side=yes, price=99 → edge_yes = 1 - 99 = -98c → REFUSED.
+    attempt = trader.maybe_trade(
+        _alert(), _snap(), size=1,
+        side_override="yes", price_override=99,
+    )
+    assert attempt.placed is False
+    assert "edge" in attempt.reason
+    assert store.query_positions(open_only=True) == []
 
 
 def test_auto_trader_handles_api_error(store, tmp_path, keypair):

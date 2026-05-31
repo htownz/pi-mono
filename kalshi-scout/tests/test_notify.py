@@ -490,3 +490,13 @@ def test_dispatcher_routes_to_multiple_sinks(store: SnapshotStore):
 def test_dispatcher_rejects_invalid_min_grade(store: SnapshotStore):
     with pytest.raises(ValueError):
         AlertDispatcher(sinks=[], store=store, min_grade="Z")
+
+
+def test_dispatcher_returns_alerts_with_empty_sinks(store: SnapshotStore):
+    """`serve --auto-trade` without `--notify` relies on this: the
+    dispatcher must still compute and return the fired alerts even when
+    there's no sink to emit them to, so the auto-trader can consume them."""
+    d = AlertDispatcher(sinks=[], store=store, min_grade="A")
+    fired = d.dispatch([_eval(grade="A+")])
+    assert len(fired) == 1
+    assert fired[0].grade == "A+"

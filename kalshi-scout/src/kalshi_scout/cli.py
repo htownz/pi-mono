@@ -1632,7 +1632,14 @@ def serve(store_path: str, interval: int, min_grade: str,
             store = SnapshotStore(store_path)
             try:
                 fired: list = []
-                if sinks:
+                # Run the dispatcher when EITHER notification sinks or
+                # auto-trade is on. Without this, `--auto-trade` with no
+                # `--notify` would silently skip every alert because the
+                # `fired` list never gets populated. The dispatcher's
+                # alert-transition logic runs independently of sinks; an
+                # empty sinks list just means no notification emission,
+                # but the Alert objects still come back for auto-trade.
+                if sinks or auto_trade:
                     dispatcher = AlertDispatcher(
                         sinks=sinks, store=store, min_grade=notify_min_grade
                     )
@@ -2077,7 +2084,14 @@ def fire(market_ticker: str, store_path: str, size: int,
                 client=trading_client, guard=guard, store=store,
                 default_size=size, paper=paper, audit_log_path=audit_path,
             )
-            attempt = trader.maybe_trade(alert, snap, size=size)
+            # Pass the operator's explicit side/price through so the order
+            # placed matches the one shown in the confirmation panel.
+            # Without these the AutoTrader would re-derive from the
+            # snapshot, ignoring --side / --price overrides.
+            attempt = trader.maybe_trade(
+                alert, snap, size=size,
+                side_override=side, price_override=price,
+            )
         finally:
             if trading_client is not None:
                 trading_client.close()
