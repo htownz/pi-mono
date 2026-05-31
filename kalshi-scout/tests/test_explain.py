@@ -16,7 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 
-from kalshi_scout.cli import _explain_to_dict, _grade_derivation
+from kalshi_scout.cli import _explain_to_dict, _grade_derivation, _make_unverified_eval
 from kalshi_scout.config import RankerConfig
 from kalshi_scout.models import (
     Bracket,
@@ -262,8 +262,6 @@ def test_explain_to_dict_surfaces_unverified_F_grade():
     explain command must surface the F grade from `_make_unverified_eval`
     so the diagnostic agrees with `scan`/`evaluate` (invariant I4).
     """
-    from kalshi_scout.cli import _make_unverified_eval
-
     market = _market()
     contract = _contract()
     settlement = Settlement(
