@@ -330,6 +330,60 @@ def test_derive_forecast_residuals_applies_when_enough_samples(store: SnapshotSt
     assert round(residuals[key].residual_f, 1) == expected_median
 
 
+def test_derive_forecast_residuals_counts_unfillable_market_days(store: SnapshotStore):
+    """Regression for the Codex/Copilot finding on PR #4: residual calibration
+    must not depend on whether the market had a tradable quote at scan time.
+
+    `backtest()` drops snapshots whose bracket has no fillable yes_ask/no_ask,
+    so routing through it would silently exclude valid settled days in thin
+    markets. The fix uses `get_settlement()` directly — this test creates
+    a settled snapshot with explicit None prices and asserts the residual
+    is still computed.
+    """
+    day = date(2026, 5, 27)
+    ticker = "KXHIGHHOUSTON-THIN-B79-80"
+    contract = ParsedContract(
+        market_ticker=ticker, event_ticker="KXHIGHHOUSTON-THIN",
+        city_slug="HOUSTON", metric=Metric.HIGH, market_date=day,
+        bracket=Bracket(BracketKind.BETWEEN, lo=79.0, hi=80.0),
+    )
+    # Build an evaluation with NO usable price on either side — backtest()
+    # would skip this snapshot entirely.
+    unpriced = KalshiMarket(
+        ticker=ticker, event_ticker="KXHIGHHOUSTON-THIN",
+        title="", yes_sub_title="", status="open", close_time=None,
+        yes_bid=None, yes_ask=None, no_bid=None, no_ask=None,
+        last_price=None, volume=0, open_interest=0,
+    )
+    eval_ = ContractEvaluation(
+        contract=contract, market=unpriced,
+        state=ContractState.FORECAST_DEPENDENT, reason="thin",
+        fair_prob_low=0.30, fair_prob_high=0.50,
+        yes_ask_cents=None, no_ask_cents=None,
+        edge_yes=None, edge_no=None, grade="D", notes=[],
+    )
+    store.record_scan(
+        evaluations=[eval_],
+        station_state_map={
+            ticker: {
+                "station_icao": "KHOU", "cli_product": "CLIHOU",
+                "source_provenance": "resolver", "regime": "clear_and_dry",
+                "running_max_f": 84.0, "running_min_f": None,
+                "projected_extremum_f": 85.0,
+                "cli_report_date": None, "cli_max_f": None, "cli_min_f": None,
+            },
+        },
+    )
+    _settle(store, ticker, "KXHIGHHOUSTON-THIN", day, cli_value_f=84.5)
+
+    residuals, _ = derive_forecast_residuals(store)
+    key = residual_key("KHOU", "high")
+    # Old (backtest-gated) implementation: residuals would be {} here.
+    # New implementation: the settled day counts.
+    assert key in residuals
+    assert residuals[key].n_samples == 1
+
+
 def test_derive_forecast_residuals_dedupes_same_day_siblings(store: SnapshotStore):
     """Multiple bracket contracts for the same (station, metric, market_date)
     share the same projection and the same realized value — counting each one

@@ -135,6 +135,23 @@ def test_forecast_residual_unapplied_stores_default_value():
     assert res.residual_f == DEFAULT_FORECAST_RESIDUAL_F
 
 
+def test_forecast_residual_from_dict_enforces_clamping_and_applied_invariant():
+    """Regression for the Copilot finding on PR #4: a hand-edited config
+    that loads a 99°F residual or stores a non-default value on an
+    unapplied entry must NOT bypass `ForecastResidual.of()` guards.
+    `from_dict` routes through `.of()` so the invariants hold."""
+    cfg = RankerConfig.from_dict({
+        "forecast_residuals": {
+            "KSFO|high": {"residual_f": 99.0, "n_samples": 50, "applied": True},
+            "KIAH|low":  {"residual_f": 1.2,  "n_samples": 5,  "applied": False},
+        },
+    })
+    # Out-of-range residual clamped to 10°F ceiling.
+    assert cfg.forecast_residuals["KSFO|high"].residual_f == 10.0
+    # Unapplied entry forced back to default — `applied=False` invariant.
+    assert cfg.forecast_residuals["KIAH|low"].residual_f == DEFAULT_FORECAST_RESIDUAL_F
+
+
 def test_forecast_residuals_round_trip_through_json(tmp_path: Path):
     cfg = RankerConfig(
         generated_at=datetime(2026, 5, 30, 12, 0, tzinfo=timezone.utc),

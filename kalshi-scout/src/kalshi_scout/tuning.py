@@ -289,31 +289,40 @@ def derive_forecast_residuals(
 
     Gates on `MIN_N_PER_RESIDUAL` settled days. Below threshold, the entry
     is stored with applied=False and the engine keeps the 2.0°F default.
+
+    "Settled" here means a settlement row exists with a realized CLI value
+    — we deliberately do NOT route through `backtest()`, which skips
+    snapshots whose market quote was unfillable. Liquidity has no bearing
+    on whether the underlying day settled, and using it as a gate would
+    bias the residual estimate (and drop valid days from the sample count).
     """
-    settled_rows = backtest(store, min_grade="D", since=since)
-    settled_index = {b.snapshot_id: b for b in settled_rows}
     all_snapshots = store.query_snapshots(min_grade="D", since=since)
 
     # Group |residual| by (station_icao, metric). One day's max contract
     # contributes one residual; same-day siblings would double-count, so
-    # dedupe by (station, metric, market_date).
+    # dedupe by (station, metric, market_date). Settlement lookups are
+    # cached by market_ticker to avoid N round-trips when many siblings
+    # share a market_date.
     seen_days: set[tuple[str, str, str]] = set()
     groups: dict[tuple[str, str], list[float]] = {}
+    settlement_cache: dict[str, Optional[float]] = {}  # ticker -> cli_value_f
     for row in all_snapshots:
         if row.projected_extremum_f is None or row.station_icao is None:
             continue
-        if row.id not in settled_index:
-            continue
-        # Need the realized CLI value, not just win/loss. Look up the settlement.
-        # Settlements are keyed by market_ticker; one settlement per market.
-        settlement = store.get_settlement(row.market_ticker)
-        if settlement is None or settlement.cli_value_f is None:
+        ticker = row.market_ticker
+        if ticker not in settlement_cache:
+            settlement = store.get_settlement(ticker)
+            settlement_cache[ticker] = (
+                settlement.cli_value_f if settlement is not None else None
+            )
+        realized = settlement_cache[ticker]
+        if realized is None:
             continue
         day_key = (row.station_icao, row.metric, row.market_date.isoformat())
         if day_key in seen_days:
             continue
         seen_days.add(day_key)
-        residual = abs(row.projected_extremum_f - settlement.cli_value_f)
+        residual = abs(row.projected_extremum_f - realized)
         groups.setdefault((row.station_icao, row.metric), []).append(residual)
 
     residuals: dict[str, ForecastResidual] = {}

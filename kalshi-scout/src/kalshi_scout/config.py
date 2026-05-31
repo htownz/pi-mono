@@ -210,9 +210,13 @@ class RankerConfig:
             )
         forecast_residuals = {}
         for k, v in (d.get("forecast_residuals") or {}).items():
-            forecast_residuals[k] = ForecastResidual(
+            # Route through `.of()` so the clamping + applied-flag invariant
+            # is enforced even for hand-edited config files; otherwise an
+            # operator could load a 99°F residual or store a non-default
+            # value on an unapplied entry and the engine would trust it.
+            forecast_residuals[k] = ForecastResidual.of(
                 residual_f=v.get("residual_f", DEFAULT_FORECAST_RESIDUAL_F),
-                n_samples=v.get("n_samples", 0),
+                n=v.get("n_samples", 0),
                 applied=v.get("applied", False),
             )
         generated = d.get("generated_at")
