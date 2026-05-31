@@ -6,11 +6,14 @@ from pathlib import Path
 from kalshi_scout.config import (
     DEFAULT_BRACKET_HIT,
     DEFAULT_FORECAST_DEPENDENT,
+    DEFAULT_FORECAST_RESIDUAL_F,
     DEFAULT_LOCKED_YES,
+    ForecastResidual,
     RankerConfig,
     RegimeShift,
     StateThresholds,
     regime_key,
+    residual_key,
 )
 
 
@@ -89,3 +92,82 @@ def test_json_round_trip(tmp_path: Path):
     assert loaded.regime_shift_for("rain_cooled", "high", "lte") == 0.04
     # Unapplied shift round-trips as zero (its delta was zeroed by RegimeShift.of).
     assert loaded.regime_shift_for("marine_layer", "high", "between") == 0.0
+
+
+# -- ForecastResidual --------------------------------------------------------
+
+def test_forecast_residual_for_returns_default_when_missing():
+    """No calibrated entry for this (station, metric) → fall back to 2.0°F."""
+    cfg = RankerConfig.default()
+    assert cfg.forecast_residual_for("KSFO", "high") == DEFAULT_FORECAST_RESIDUAL_F
+
+
+def test_forecast_residual_for_returns_default_when_unapplied():
+    """Entry exists but sample size is below threshold → ignore it."""
+    cfg = RankerConfig.default()
+    cfg.forecast_residuals[residual_key("KSFO", "high")] = ForecastResidual.of(
+        residual_f=1.2, n=5, applied=False,
+    )
+    assert cfg.forecast_residual_for("KSFO", "high") == DEFAULT_FORECAST_RESIDUAL_F
+
+
+def test_forecast_residual_for_returns_calibrated_when_applied():
+    cfg = RankerConfig.default()
+    cfg.forecast_residuals[residual_key("KSFO", "high")] = ForecastResidual.of(
+        residual_f=1.2, n=50, applied=True,
+    )
+    assert cfg.forecast_residual_for("KSFO", "high") == 1.2
+
+
+def test_forecast_residual_clamps_floor_and_ceiling():
+    """0.3°F is below the practical NWS floor; 99°F means the forecast is
+    useless. Both get clamped to keep downstream math sane."""
+    too_tight = ForecastResidual.of(residual_f=0.3, n=50, applied=True)
+    assert too_tight.residual_f == 0.5
+    too_loose = ForecastResidual.of(residual_f=99.0, n=50, applied=True)
+    assert too_loose.residual_f == 10.0
+
+
+def test_forecast_residual_unapplied_stores_default_value():
+    """When applied=False, the stored residual_f is the default — so any
+    later read that bypasses the .applied guard still sees a sane number."""
+    res = ForecastResidual.of(residual_f=1.5, n=3, applied=False)
+    assert res.residual_f == DEFAULT_FORECAST_RESIDUAL_F
+
+
+def test_forecast_residual_from_dict_enforces_clamping_and_applied_invariant():
+    """Regression for the Copilot finding on PR #4: a hand-edited config
+    that loads a 99°F residual or stores a non-default value on an
+    unapplied entry must NOT bypass `ForecastResidual.of()` guards.
+    `from_dict` routes through `.of()` so the invariants hold."""
+    cfg = RankerConfig.from_dict({
+        "forecast_residuals": {
+            "KSFO|high": {"residual_f": 99.0, "n_samples": 50, "applied": True},
+            "KIAH|low":  {"residual_f": 1.2,  "n_samples": 5,  "applied": False},
+        },
+    })
+    # Out-of-range residual clamped to 10°F ceiling.
+    assert cfg.forecast_residuals["KSFO|high"].residual_f == 10.0
+    # Unapplied entry forced back to default — `applied=False` invariant.
+    assert cfg.forecast_residuals["KIAH|low"].residual_f == DEFAULT_FORECAST_RESIDUAL_F
+
+
+def test_forecast_residuals_round_trip_through_json(tmp_path: Path):
+    cfg = RankerConfig(
+        generated_at=datetime(2026, 5, 30, 12, 0, tzinfo=timezone.utc),
+        based_on_snapshots=100,
+        forecast_residuals={
+            residual_key("KSFO", "high"): ForecastResidual.of(1.2, 50, True),
+            residual_key("KIAH", "low"): ForecastResidual.of(3.4, 8, False),
+        },
+    )
+    path = tmp_path / "cfg.json"
+    cfg.save_json(path)
+    loaded = RankerConfig.load_json(path)
+
+    assert loaded.forecast_residual_for("KSFO", "high") == 1.2
+    # Below-threshold entry round-trips but still returns default.
+    assert loaded.forecast_residual_for("KIAH", "low") == DEFAULT_FORECAST_RESIDUAL_F
+    # The raw entry is preserved so an operator can inspect the audit trail.
+    assert loaded.forecast_residuals[residual_key("KIAH", "low")].n_samples == 8
+    assert loaded.forecast_residuals[residual_key("KIAH", "low")].applied is False

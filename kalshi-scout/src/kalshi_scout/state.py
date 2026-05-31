@@ -239,6 +239,34 @@ def _remaining_extrema_from_forecast(
     return min(temps), max(temps)
 
 
+def project_extremum(
+    metric: Metric,
+    forecast: Optional[list[HourlyPoint]],
+    station_state: StationState,
+    now_utc: Optional[datetime] = None,
+) -> Optional[float]:
+    """Best point estimate of today's daily extremum (max for HIGH, min for LOW).
+
+    Combines what's already observed (`running_max/min_f`) with what the
+    forecast says is still ahead. Used by `fair_probability` to size the
+    uncertainty band, and stored on each snapshot so the calibration tuner
+    can compare projection-vs-realized after settlement.
+
+    Returns None only when neither observation nor forecast offers any
+    coverage of the market window.
+    """
+    now_utc = now_utc or datetime.now(timezone.utc)
+    observed = station_state.running_max_f if metric is Metric.HIGH else station_state.running_min_f
+    if forecast is None:
+        return observed
+    f_lo, f_hi = _remaining_extrema_from_forecast(metric, forecast, station_state, now_utc)
+    if f_lo is None or f_hi is None:
+        return observed
+    if metric is Metric.HIGH:
+        return max(observed, f_hi) if observed is not None else f_hi
+    return min(observed, f_lo) if observed is not None else f_lo
+
+
 def fair_probability(
     contract: ParsedContract,
     station_state: StationState,
@@ -280,6 +308,16 @@ def fair_probability(
         if shift == 0.0:
             return lo, hi
         return max(0.0, min(1.0, lo + shift)), max(0.0, min(1.0, hi + shift))
+
+    # Override the default 2.0°F residual with a per-(station, metric) calibrated
+    # value when one is available. The calibration is gated on sample size in
+    # tuning.derive_forecast_residuals; if uncalibrated, the lookup returns the
+    # 2.0°F default and the math is identical to the V0.9 behavior.
+    if config is not None and station_state.station is not None:
+        forecast_residual_f = config.forecast_residual_for(
+            station_icao=station_state.station.icao,
+            metric=contract.metric.value,
+        )
 
     now_utc = now_utc or datetime.now(timezone.utc)
     bracket = contract.bracket
