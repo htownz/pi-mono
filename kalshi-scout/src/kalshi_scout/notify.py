@@ -6,11 +6,18 @@ recent stored snapshot was at a worse grade than its current evaluation
 (invariant I8): the snapshot store is the source of truth for "have we
 already alerted on this".
 
-Three sink types in this slice:
+Five sink types:
 
-  StdoutSink   - print to console (always-on default during testing)
-  JsonlSink    - append one JSON object per alert to a file
-  WebhookSink  - POST JSON to a configurable URL (Slack/Discord/ntfy etc)
+  StdoutSink    - print to console (always-on default during testing)
+  JsonlSink     - append one JSON object per alert to a file
+  WebhookSink   - POST raw alert JSON to a configurable URL
+  NtfySink      - push notification via ntfy.sh / self-hosted ntfy
+  DiscordSink   - rich-embed message via Discord webhook
+
+`WebhookSink` is the generic escape hatch — anything that can consume the
+raw alert JSON. `NtfySink` / `DiscordSink` pre-format the alert for those
+specific destinations so the operator gets a phone-readable notification
+without a translator service in between.
 
 Adding new sinks: implement AlertSink.emit().
 """
@@ -166,6 +173,156 @@ class WebhookSink:
             resp.raise_for_status()
         except Exception as exc:
             self._failure_log(f"webhook {self.url} failed: {exc}")
+
+    def close(self) -> None:
+        self._client.close()
+
+
+def _format_alert_text(alert: Alert) -> str:
+    """Compact phone-friendly summary used by ntfy and Discord sinks.
+
+    The price line names the actionable side so a DEAD_NO alert shows
+    `no_ask: 7c` instead of `yes_ask: —` — matching the side that the
+    edge line reports.
+    """
+    prev = f" (was {alert.previous_grade})" if alert.previous_grade else ""
+    side, price, edge_str = _embed_side(alert)
+    edge_line = f"edge_{side}: {edge_str.split()[1]}" if edge_str != "—" else ""
+    price_line = f"{side}_ask: {price}"
+    fair_line = f"fair: {alert.fair_prob_low * 100:.0f}-{alert.fair_prob_high * 100:.0f}%"
+    return (
+        f"{alert.market_ticker} -> {alert.grade}{prev}\n"
+        f"state: {alert.state}\n"
+        f"{price_line}  {fair_line}\n"
+        f"{edge_line}"
+    ).rstrip()
+
+
+def _ntfy_priority(grade: str) -> str:
+    """Map grade to ntfy 1-5 priority. A+/A get max so the phone buzzes loud."""
+    return {"A+": "5", "A": "5", "B+": "4", "B": "3"}.get(grade, "2")
+
+
+class NtfySink:
+    """Push notification via ntfy (https://docs.ntfy.sh).
+
+    Spec form: `ntfy:<topic>` for the public ntfy.sh server, or
+    `ntfy:<full-https-url>` for a self-hosted instance. The body is the
+    formatted alert text; title / priority / tags ride in HTTP headers.
+    """
+    def __init__(
+        self,
+        topic_or_url: str,
+        timeout: float = 5.0,
+        client: Optional[httpx.Client] = None,
+        failure_log=print,
+    ):
+        if topic_or_url.startswith(("http://", "https://")):
+            self.url = topic_or_url
+        else:
+            self.url = f"https://ntfy.sh/{topic_or_url}"
+        self.timeout = timeout
+        self._client = client or httpx.Client(timeout=timeout)
+        self._failure_log = failure_log
+
+    def emit(self, alert: Alert) -> None:
+        body = _format_alert_text(alert)
+        headers = {
+            "Title": f"kalshi-scout [{alert.grade}] {alert.market_ticker}",
+            "Priority": _ntfy_priority(alert.grade),
+            "Tags": "chart_with_upwards_trend",
+        }
+        try:
+            resp = self._client.post(
+                self.url, content=body.encode("utf-8"), headers=headers,
+            )
+            resp.raise_for_status()
+        except Exception as exc:
+            self._failure_log(f"ntfy {self.url} failed: {exc}")
+
+    def close(self) -> None:
+        self._client.close()
+
+
+def _discord_color(grade: str) -> int:
+    """Embed sidebar color per grade — green for A-tier, yellow for B, gray else."""
+    return {
+        "A+": 0x1F8B4C,   # bright green
+        "A": 0x2ECC71,    # green
+        "B+": 0xF1C40F,   # yellow
+        "B": 0xE67E22,    # orange
+    }.get(grade, 0x95A5A6)  # gray for C/D
+
+
+def _embed_side(alert: Alert) -> tuple[str, str, str]:
+    """Pick the (side_label, price_string, edge_string) the alert's
+    actionable side. The ranker grades LOCKED_YES off edge_yes and DEAD_NO
+    off edge_no, so the side with the larger edge is the tradable one and
+    that side's ask is the fillable price the operator needs.
+    """
+    # Default: yes side. Switch to no when edge_no clearly wins.
+    side = "yes"
+    edge: Optional[float] = alert.edge_yes
+    if alert.edge_no is not None and (
+        alert.edge_yes is None or alert.edge_no > alert.edge_yes
+    ):
+        side = "no"
+        edge = alert.edge_no
+    if side == "yes":
+        price = f"{alert.yes_ask_cents}c" if alert.yes_ask_cents is not None else "—"
+    else:
+        price = f"{alert.no_ask_cents}c" if alert.no_ask_cents is not None else "—"
+    edge_str = f"{side} {edge:+.2f}" if edge is not None else "—"
+    return side, price, edge_str
+
+
+class DiscordSink:
+    """Rich-embed alert via Discord webhook.
+
+    Spec form: `discord:<full-webhook-url>`. The embed shows the grade
+    transition, state, fillable side and edge, and the fair-prob band.
+    """
+    def __init__(
+        self,
+        webhook_url: str,
+        timeout: float = 5.0,
+        client: Optional[httpx.Client] = None,
+        failure_log=print,
+    ):
+        self.webhook_url = webhook_url
+        self.timeout = timeout
+        self._client = client or httpx.Client(timeout=timeout)
+        self._failure_log = failure_log
+
+    def emit(self, alert: Alert) -> None:
+        prev = f" (was {alert.previous_grade})" if alert.previous_grade else ""
+        # Pick the actionable side from the edges so the embed reports the
+        # tradable price for THAT side. DEAD_NO alerts have edge_no > edge_yes
+        # and a populated no_ask — showing yes_ask there is misleading
+        # (often "—") and hides the fillable price from the operator.
+        side_label, price, edge_value = _embed_side(alert)
+        price_field = f"{side_label}_ask"
+        fair = f"{alert.fair_prob_low * 100:.0f}–{alert.fair_prob_high * 100:.0f}%"
+        embed = {
+            "title": f"[{alert.grade}] {alert.market_ticker}{prev}",
+            "description": f"**{alert.state}** — {alert.reason}",
+            "color": _discord_color(alert.grade),
+            "fields": [
+                {"name": price_field, "value": price, "inline": True},
+                {"name": "fair", "value": fair, "inline": True},
+                {"name": "edge", "value": edge_value, "inline": True},
+                {"name": "city", "value": alert.city_slug, "inline": True},
+                {"name": "metric", "value": alert.metric, "inline": True},
+                {"name": "date", "value": alert.market_date, "inline": True},
+            ],
+            "timestamp": alert.fired_at_utc.astimezone(timezone.utc).isoformat(),
+        }
+        payload = {"username": "kalshi-scout", "embeds": [embed]}
+        try:
+            resp = self._client.post(self.webhook_url, json=payload)
+            resp.raise_for_status()
+        except Exception as exc:
+            self._failure_log(f"discord webhook failed: {exc}")
 
     def close(self) -> None:
         self._client.close()
