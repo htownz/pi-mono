@@ -60,18 +60,20 @@ _RANGE_RE = re.compile(
     r"(-?\d+(?:\.\d+)?)",
     re.IGNORECASE,
 )
-# "above N" / "over N" / ">N"
+# Word-boundary `\b` applies only to letter-based alternatives. Symbolic
+# operators (`>=N`, `<N`, `=N`) don't have a word boundary before them at
+# string start, so the `\b` has to sit inside the letter group, not outside
+# the whole alternation, or the symbolic forms would be unreachable.
 _ABOVE_PREFIX_RE = re.compile(
-    r"\b(?:above|over|greater than|at least|>=?)\s*(-?\d+(?:\.\d+)?)",
+    r"(?:\b(?:above|over|greater than|at least)|>=?)\s*(-?\d+(?:\.\d+)?)",
     re.IGNORECASE,
 )
-# "N or above" / "N or higher" / "N+"
 _ABOVE_SUFFIX_RE = re.compile(
     r"(-?\d+(?:\.\d+)?)\s*°?\s*(?:or above|or higher|or more|or greater|\+)",
     re.IGNORECASE,
 )
 _BELOW_PREFIX_RE = re.compile(
-    r"\b(?:below|under|less than|at most|<=?)\s*(-?\d+(?:\.\d+)?)",
+    r"(?:\b(?:below|under|less than|at most)|<=?)\s*(-?\d+(?:\.\d+)?)",
     re.IGNORECASE,
 )
 _BELOW_SUFFIX_RE = re.compile(
@@ -79,15 +81,16 @@ _BELOW_SUFFIX_RE = re.compile(
     re.IGNORECASE,
 )
 _EXACT_RE = re.compile(
-    r"\b(?:exactly|equal to|=)\s*(-?\d+(?:\.\d+)?)",
+    r"(?:\b(?:exactly|equal to)|=)\s*(-?\d+(?:\.\d+)?)",
     re.IGNORECASE,
 )
 
-# Gap tolerance between adjacent intervals (in interval units). 1.5 is
-# generous enough for integer-bucket weather (`60-61` then `62-63` has a
-# 1-unit gap that's actually the strict-inequality boundary) and tight
-# enough that an event missing a whole bucket would be rejected.
-_GAP_TOLERANCE = 1.5
+# Adjacent finite intervals must touch (gap <= EPSILON). A 1.5-unit blanket
+# tolerance silently accepts real missing buckets in decimal-denominated
+# series (e.g. $3.00-$3.25 then $4.70-$5.00 has a 1.45 gap whose prices have
+# no winning bracket). Tail brackets are exempted by `_is_partition` since
+# they extend coverage to ±inf.
+_GAP_EPSILON = 0.01
 
 
 def _parse_interval(text: Optional[str]) -> Optional[tuple[float, float]]:
@@ -122,21 +125,44 @@ def _parse_interval(text: Optional[str]) -> Optional[tuple[float, float]]:
 
 
 def _is_partition(intervals: list[tuple[float, float]]) -> tuple[bool, str]:
-    """True iff intervals (any order) tile a contiguous numeric axis with no
-    overlaps and no significant gaps. Returns (verdict, reason) for diagnostics.
+    """True iff intervals tile the entire real line: at least one tail
+    bracket on each end AND finite intervals between them tile adjacently
+    with no overlaps or gaps. Returns (verdict, reason) for diagnostics.
+
+    Requiring tail brackets (low-tail = `-inf`-bounded, high-tail = `+inf`-
+    bounded) is the gate's exhaustive-coverage proof: a finite-only set like
+    `$3.00 to $3.25`, `$3.25 to $3.50`, `$3.50 to $3.75` has no winning
+    bracket for prices outside that span, so the no-arbitrage math is
+    invalid even though the listed buckets tile cleanly.
     """
     if len(intervals) < 2:
         return False, "fewer than 2 intervals"
-    finite = [iv for iv in intervals if iv[0] != float("-inf") and iv[1] != float("inf")]
-    if not finite:
-        return False, "no finite intervals to anchor the partition"
-    sorted_iv = sorted(intervals)
-    for prev, curr in zip(sorted_iv, sorted_iv[1:]):
-        if curr[0] < prev[1] - 0.01:
-            return False, f"overlap: {prev} and {curr}"
-        if (curr[0] - prev[1]) > _GAP_TOLERANCE:
-            return False, f"gap of {curr[0] - prev[1]:g} between {prev} and {curr}"
-    return True, f"partitions axis across {len(intervals)} intervals"
+    has_low_tail = any(iv[0] == float("-inf") for iv in intervals)
+    has_high_tail = any(iv[1] == float("inf") for iv in intervals)
+    if not (has_low_tail and has_high_tail):
+        missing = []
+        if not has_low_tail:
+            missing.append("below-tail (e.g. 'N or below')")
+        if not has_high_tail:
+            missing.append("above-tail (e.g. 'N or above')")
+        return False, (
+            f"finite-only partition — missing {', '.join(missing)}; "
+            "outcomes outside the listed span have no winning bracket"
+        )
+    finite = sorted(
+        iv for iv in intervals
+        if iv[0] != float("-inf") and iv[1] != float("inf")
+    )
+    if finite:
+        for prev, curr in zip(finite, finite[1:]):
+            if curr[0] < prev[1] - _GAP_EPSILON:
+                return False, f"overlap: {prev} and {curr}"
+            if (curr[0] - prev[1]) > _GAP_EPSILON:
+                return False, f"gap of {curr[0] - prev[1]:g} between {prev} and {curr}"
+    return True, (
+        f"tiles axis with {len(intervals)} intervals "
+        f"({len(finite)} finite + low/high tails)"
+    )
 
 
 @dataclass(frozen=True)
@@ -153,9 +179,16 @@ def detect_numeric_partition(event: KalshiEvent) -> MexDetection:
     numeric axis cleanly?
 
     Returns True when every market in the event has a parseable numeric
-    interval (from yes_sub_title, falling back to title) AND those intervals
-    form a contiguous non-overlapping partition. Either condition failing
+    interval (read **only** from `yes_sub_title` — the field that carries
+    the bracket label) AND those intervals form a contiguous partition with
+    low+high tail brackets bounding the axis. Either condition failing
     drops the event back into "treat as non-MEX" territory.
+
+    The detector deliberately does NOT fall back to `market.title` for
+    parsing: the title is the question (e.g. "Will Houston's high be
+    above 80°?") and its numeric content doesn't describe the bracket
+    structure. Reading it would weaken the gate enough for non-MEX events
+    with numeric questions to slip through.
     """
     n = len(event.markets)
     if n < 2:
@@ -163,7 +196,7 @@ def detect_numeric_partition(event: KalshiEvent) -> MexDetection:
     intervals: list[tuple[float, float]] = []
     n_parsed = 0
     for m in event.markets:
-        iv = _parse_interval(m.yes_sub_title) or _parse_interval(m.title)
+        iv = _parse_interval(m.yes_sub_title)
         if iv is None:
             return MexDetection(
                 False, f"market {m.ticker} has no parseable numeric range "

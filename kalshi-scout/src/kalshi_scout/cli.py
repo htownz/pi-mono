@@ -18,6 +18,7 @@ from rich.table import Table
 
 from kalshi_scout.arbitrage import (
     MUTUALLY_EXCLUSIVE_SERIES,
+    _parse_interval,
     detect_numeric_partition,
     is_mutually_exclusive_event,
     rank_arbitrage_opportunities,
@@ -1820,6 +1821,8 @@ def mex_check(event_ticker: str, as_json: bool) -> None:
     detection = detect_numeric_partition(event)
     accepted = is_mutually_exclusive_event(event)
 
+    parsed_intervals = [_parse_interval(m.yes_sub_title) for m in markets]
+
     if as_json:
         click.echo(json.dumps({
             "event_ticker": event_ticker,
@@ -1834,8 +1837,12 @@ def mex_check(event_ticker: str, as_json: bool) -> None:
             "accepted_by_default_gate": accepted,
             "accepted_by_strict_gate": in_whitelist,
             "markets": [
-                {"ticker": m.ticker, "yes_sub_title": m.yes_sub_title}
-                for m in markets
+                {
+                    "ticker": m.ticker,
+                    "yes_sub_title": m.yes_sub_title,
+                    "parsed_interval": _interval_for_json(iv),
+                }
+                for m, iv in zip(markets, parsed_intervals)
             ],
         }, indent=2))
         return
@@ -1858,11 +1865,45 @@ def mex_check(event_ticker: str, as_json: bool) -> None:
     sample_table = Table(title="Markets (first 10)", header_style="bold cyan")
     sample_table.add_column("Ticker")
     sample_table.add_column("yes_sub_title")
-    for m in markets[:10]:
-        sample_table.add_row(m.ticker, m.yes_sub_title or "[dim]—[/dim]")
+    sample_table.add_column("Parsed interval")
+    for m, iv in zip(markets[:10], parsed_intervals[:10]):
+        sample_table.add_row(
+            m.ticker,
+            m.yes_sub_title or "[dim]—[/dim]",
+            _interval_for_display(iv),
+        )
     console.print(sample_table)
     if len(markets) > 10:
         console.print(f"[dim]  (+{len(markets) - 10} more markets)[/dim]")
+
+
+def _interval_for_json(iv: Optional[tuple[float, float]]) -> Optional[dict]:
+    """JSON-safe encoding of a parsed interval. Infinite endpoints become
+    the strings "-inf" / "+inf" since json.dumps refuses non-finite floats."""
+    if iv is None:
+        return None
+    return {
+        "lo": _endpoint_for_json(iv[0]),
+        "hi": _endpoint_for_json(iv[1]),
+    }
+
+
+def _endpoint_for_json(v: float):
+    if v == float("-inf"):
+        return "-inf"
+    if v == float("inf"):
+        return "+inf"
+    return v
+
+
+def _interval_for_display(iv: Optional[tuple[float, float]]) -> str:
+    if iv is None:
+        return "[red]unparseable[/red]"
+    lo = "−∞" if iv[0] == float("-inf") else f"{iv[0]:g}"
+    hi = "+∞" if iv[1] == float("inf") else f"{iv[1]:g}"
+    if iv[0] == iv[1]:
+        return f"= {lo}"
+    return f"[{lo}, {hi}]"
 
 
 if __name__ == "__main__":
