@@ -64,6 +64,7 @@ from kalshi_scout.trading import (
     AutoTrader,
     KalshiTradingClient,
     KillSwitch,
+    PositionMonitor,
     RiskGuard,
     RiskLimits,
     auto_close_settled_positions,
@@ -1834,6 +1835,30 @@ def replay(store_path: str, snapshot_id: int) -> None:
                    "station's CLI). On any ensemble failure or thin "
                    "response, the engine silently falls back to the "
                    "NWS-only path.")
+@click.option("--monitor-positions", is_flag=True,
+              help="After each scan, walk open positions and apply two "
+                   "exit triggers: (1) take-profit when the bid for our "
+                   "side reaches --take-profit-bid (default 95c), (2) "
+                   "cut-loss when the snapshot's state flipped against "
+                   "our side (NO position now in LOCKED_YES, etc). Paper "
+                   "mode closes locally via close_position; live mode "
+                   "logs 'live_skipped' (sell-order placement deferred). "
+                   "Off by default — explicit opt-in for behavior change.")
+@click.option("--take-profit-bid", type=int, default=95,
+              help="Bid threshold (cents) at which the monitor closes a "
+                   "winning position to lock in gains. Default 95c. Only "
+                   "matters with --monitor-positions.")
+@click.option("--no-cut-loss-on-state-flip", is_flag=True,
+              help="Disable the state-flip cut-loss branch of the position "
+                   "monitor. Take-profit is still active. Useful for "
+                   "operators who want to hold to expiration on adverse "
+                   "moves (hope it recovers) but still capture take-profit.")
+@click.option("--exit-audit-log", type=click.Path(),
+              default=None,
+              help="JSONL file for exit attempts. Default "
+                   "<store-dir>/auto-exit.jsonl. Sibling of --audit-log "
+                   "(which covers entries); kept separate so the existing "
+                   "`audit` command and dashboard panel stay aligned.")
 def serve(store_path: str, interval: int, min_grade: str,
           notify_specs: tuple[str, ...], notify_min_grade: str,
           config_path: Optional[str], once: bool,
@@ -1844,7 +1869,10 @@ def serve(store_path: str, interval: int, min_grade: str,
           max_concentration_per_event: int, min_edge_cents_opt: int,
           rounding_buffer: float, kill_file: Optional[str],
           audit_log: Optional[str], refresh_quote: bool,
-          use_ensemble: bool) -> None:
+          use_ensemble: bool,
+          monitor_positions: bool, take_profit_bid: int,
+          no_cut_loss_on_state_flip: bool,
+          exit_audit_log: Optional[str]) -> None:
     """Run the universe scanner on a loop.
 
     Equivalent to running `scan --store ... --notify ...` in a `while sleep`
@@ -1898,6 +1926,9 @@ def serve(store_path: str, interval: int, min_grade: str,
     store_dir = Path(store_path).resolve().parent
     kill_path = Path(kill_file) if kill_file else store_dir / "scout.kill"
     audit_path = Path(audit_log) if audit_log else store_dir / "auto-trade.jsonl"
+    exit_audit_path = (
+        Path(exit_audit_log) if exit_audit_log else store_dir / "auto-exit.jsonl"
+    )
     if auto_trade and not paper:
         if not api_key_id or not api_key_path:
             raise click.BadParameter(
@@ -1920,6 +1951,12 @@ def serve(store_path: str, interval: int, min_grade: str,
         )
     if ranker_config and ranker_config.use_ensemble:
         log.info("ensemble fair_prob enabled (open-meteo); NWS-only fallback on failure")
+    if monitor_positions:
+        log.info(
+            f"position monitor enabled: take_profit_bid={take_profit_bid}c "
+            f"cut_loss_on_state_flip={not no_cut_loss_on_state_flip} "
+            f"exit_audit={exit_audit_path}"
+        )
 
     iteration = 0
     while not stop["flag"]:
@@ -2013,13 +2050,33 @@ def serve(store_path: str, interval: int, min_grade: str,
                     if rt_kalshi_client is not None:
                         rt_kalshi_client.close()
 
+                # Position monitor: walk open positions and apply
+                # take-profit / cut-loss triggers using the snapshots that
+                # were just persisted. Snapshot-driven, so no extra Kalshi
+                # calls. Opt-in via --monitor-positions; default off.
+                n_exits = 0
+                n_exit_examined = 0
+                if monitor_positions:
+                    monitor = PositionMonitor(
+                        store=store,
+                        take_profit_bid_cents=take_profit_bid,
+                        cut_loss_on_state_flip=not no_cut_loss_on_state_flip,
+                        paper=paper,
+                        audit_log_path=exit_audit_path,
+                    )
+                    n_exits, n_exit_examined = monitor.run(now_utc=scan_started)
+
                 trade_summary = (
                     f", auto-trade {n_placed} placed / {n_refused} refused"
                     if auto_trade else ""
                 )
+                exit_summary = (
+                    f", monitor {n_exits} closed / {n_exit_examined} examined"
+                    if monitor_positions else ""
+                )
                 log.info(
                     f"scan {iteration}: persisted {len(persistable)} snapshots, "
-                    f"fired {len(fired)} alerts{trade_summary}"
+                    f"fired {len(fired)} alerts{trade_summary}{exit_summary}"
                 )
             finally:
                 store.close()

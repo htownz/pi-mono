@@ -50,7 +50,7 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from kalshi_scout.kalshi import KalshiClient
 from kalshi_scout.notify import Alert
-from kalshi_scout.store import SnapshotRow, SnapshotStore
+from kalshi_scout.store import PositionRow, SnapshotRow, SnapshotStore
 
 
 KALSHI_API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
@@ -682,6 +682,186 @@ class AutoTrader:
     def _audit(self, attempt: TradeAttempt) -> None:
         if self.audit_log_path is None:
             return
+        with self.audit_log_path.open("a") as f:
+            f.write(json.dumps(attempt.to_json_dict()) + "\n")
+
+
+# -- In-flight position monitor ---------------------------------------------
+
+@dataclass(frozen=True)
+class ExitAttempt:
+    """One end-to-end attempt to close an open position: take-profit or
+    cut-loss. Logged to the exit audit jsonl regardless of outcome.
+
+    Sibling of `TradeAttempt` for the entry side. Lives in its own jsonl
+    so the entry audit's daily totals stay aligned with the existing
+    `audit` command and dashboard panel; exits are a separate ledger.
+    """
+    fired_at_utc: datetime
+    position_id: int
+    market_ticker: str
+    event_ticker: str
+    side: str                        # 'yes' or 'no' — the side we hold
+    size_contracts: int
+    open_price_cents: int
+    exit_price_cents: int            # snapshot's bid on our side at decision
+    realized_pnl_cents: int          # (exit - open) × size
+    reason: str                      # take_profit | cut_loss_state_flip | live_skipped
+    closed: bool                     # did the close actually go through?
+    paper: bool
+    snap_id: Optional[int]
+
+    def to_json_dict(self) -> dict:
+        return {
+            "fired_at_utc": self.fired_at_utc.astimezone(timezone.utc).isoformat(),
+            "position_id": self.position_id,
+            "market_ticker": self.market_ticker,
+            "event_ticker": self.event_ticker,
+            "side": self.side,
+            "size_contracts": self.size_contracts,
+            "open_price_cents": self.open_price_cents,
+            "exit_price_cents": self.exit_price_cents,
+            "realized_pnl_cents": self.realized_pnl_cents,
+            "reason": self.reason,
+            "closed": self.closed,
+            "paper": self.paper,
+            "snap_id": self.snap_id,
+        }
+
+
+class PositionMonitor:
+    """Walks open positions and applies two exit triggers each scan:
+
+      1. Take-profit: when the current bid for our side reaches a high
+         threshold (default 95c), close to lock in the gain and free
+         capital for the next opportunity. Hold-to-expiration captures
+         ~5c more per contract; closing early ~7 hours earlier on a
+         typical day frees that capital sooner — higher hourly ROI on
+         the freed bankroll usually wins.
+
+      2. Cut-loss on state flip: when the snapshot's state machine now
+         says the bracket settled against the side we hold (NO position
+         + state==LOCKED_YES; YES + state==DEAD_NO), close at the
+         current bid. The forecast was wrong; capturing whatever the
+         opposite side will still pay beats holding to a $0 settlement.
+
+    Both triggers are snapshot-driven — the scan that just ran wrote
+    fresh quotes and state. No extra Kalshi calls needed.
+
+    Paper mode: close locally via `store.close_position`. Live mode:
+    DEFERRED (sell-order placement is PR-13 plan-of-record). In live
+    mode the monitor logs `reason='live_skipped'` so the operator can
+    see what the monitor would have done.
+    """
+
+    def __init__(
+        self,
+        store: SnapshotStore,
+        take_profit_bid_cents: int = 95,
+        cut_loss_on_state_flip: bool = True,
+        paper: bool = True,
+        audit_log_path: Optional[Path] = None,
+    ) -> None:
+        if not (0 < take_profit_bid_cents < 100):
+            raise ValueError(
+                f"take_profit_bid_cents must be in (0, 100), got "
+                f"{take_profit_bid_cents}"
+            )
+        self.store = store
+        self.take_profit_bid_cents = take_profit_bid_cents
+        self.cut_loss_on_state_flip = cut_loss_on_state_flip
+        self.paper = paper
+        self.audit_log_path = audit_log_path
+
+    def run(self, now_utc: Optional[datetime] = None) -> tuple[int, int]:
+        """Returns (n_closed, n_examined). Examined = open positions checked."""
+        now_utc = now_utc or datetime.now(timezone.utc)
+        n_closed = 0
+        positions = self.store.query_positions(open_only=True)
+        for position in positions:
+            decision = self._should_close(position)
+            if decision is None:
+                continue
+            exit_price_cents, reason, snap_id = decision
+            attempt = self._close(position, exit_price_cents, reason, snap_id, now_utc)
+            if attempt.closed:
+                n_closed += 1
+            if self.audit_log_path is not None:
+                self._write_audit(attempt)
+        return n_closed, len(positions)
+
+    def _should_close(
+        self, position: PositionRow,
+    ) -> Optional[tuple[int, str, Optional[int]]]:
+        """Returns (exit_price_cents, reason, snap_id) or None to hold."""
+        latest = self.store.query_snapshots(
+            market_ticker=position.market_ticker, limit=1,
+        )
+        if not latest:
+            return None
+        snap = latest[0]
+        # Pick the bid for our side. NULLs mean no resting order on that
+        # side — we can't realize anything, so hold.
+        if position.side == "no":
+            bid = snap.no_bid
+        else:
+            bid = snap.yes_bid
+        if bid is None:
+            return None
+
+        # 1. Take-profit
+        if bid >= self.take_profit_bid_cents:
+            return bid, "take_profit", snap.id
+
+        # 2. State-flip cut-loss
+        if self.cut_loss_on_state_flip:
+            adverse = (
+                (position.side == "no" and snap.state == "locked_yes")
+                or (position.side == "yes" and snap.state == "dead_no")
+            )
+            if adverse:
+                return bid, "cut_loss_state_flip", snap.id
+        return None
+
+    def _close(
+        self,
+        position: PositionRow,
+        exit_price_cents: int,
+        reason: str,
+        snap_id: Optional[int],
+        now_utc: datetime,
+    ) -> ExitAttempt:
+        realized = (exit_price_cents - position.avg_price_cents) * position.size_contracts
+        if not self.paper:
+            # Live exit is deferred — record what we WOULD have done.
+            return ExitAttempt(
+                fired_at_utc=now_utc, position_id=position.id,
+                market_ticker=position.market_ticker,
+                event_ticker=position.event_ticker, side=position.side,
+                size_contracts=position.size_contracts,
+                open_price_cents=position.avg_price_cents,
+                exit_price_cents=exit_price_cents,
+                realized_pnl_cents=realized,
+                reason="live_skipped",
+                closed=False, paper=False, snap_id=snap_id,
+            )
+        ok = self.store.close_position(
+            position.id, closed_at=now_utc, at_price_cents=exit_price_cents,
+        )
+        return ExitAttempt(
+            fired_at_utc=now_utc, position_id=position.id,
+            market_ticker=position.market_ticker,
+            event_ticker=position.event_ticker, side=position.side,
+            size_contracts=position.size_contracts,
+            open_price_cents=position.avg_price_cents,
+            exit_price_cents=exit_price_cents,
+            realized_pnl_cents=realized,
+            reason=reason,
+            closed=ok, paper=True, snap_id=snap_id,
+        )
+
+    def _write_audit(self, attempt: ExitAttempt) -> None:
+        self.audit_log_path.parent.mkdir(parents=True, exist_ok=True)
         with self.audit_log_path.open("a") as f:
             f.write(json.dumps(attempt.to_json_dict()) + "\n")
 
