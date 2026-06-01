@@ -120,6 +120,13 @@ def build_station_state(
         if per_station_min:
             neighbor_min = min(per_station_min)
 
+    # Min dewpoint in the observed window — physical floor on the daily LOW.
+    # NWS observations carry dewpoint when the station reports it; some
+    # readings have None (icing on the sensor, manual obs gaps). Take the
+    # min only across populated readings; default None when nothing is.
+    dewpoint_vals = [r.dewpoint_f for r in obs if r.dewpoint_f is not None]
+    dewpoint_floor_f = min(dewpoint_vals) if dewpoint_vals else None
+
     return StationState(
         station=station,
         market_date=market_date,
@@ -136,6 +143,7 @@ def build_station_state(
         neighbor_running_min_f=neighbor_min,
         neighbor_sample_count=neighbor_sample_count,
         neighbor_icaos=tuple(neighbor_icaos_queried),
+        dewpoint_floor_f=dewpoint_floor_f,
     )
 
 
@@ -447,8 +455,25 @@ def fair_probability(
 
     # LOW
     observed = station_state.effective_running_min_f
-    proj_lo = min(observed if observed is not None else 999, f_lo) - forecast_residual_f
-    proj_hi = min(observed if observed is not None else 999, f_lo) + forecast_residual_f
+    projected_min = min(observed if observed is not None else 999, f_lo)
+
+    # Dewpoint floor: the daily low almost never drops more than ~1°F below
+    # the minimum dewpoint observed in the window so far. When the forecast
+    # extrapolation says it will, clip the projection to physics and widen
+    # the residual band by 1°F to reflect the forecast-vs-physics disagreement
+    # (an honest signal of low forecast skill on that side). Skip when
+    # dewpoint_floor_f is unavailable (no dewpoint readings yet) or when
+    # the projection already respects physics.
+    DEWPOINT_TOLERANCE_F = 1.0
+    DISAGREEMENT_RESIDUAL_BUMP_F = 1.0
+    if station_state.dewpoint_floor_f is not None:
+        physics_floor = station_state.dewpoint_floor_f - DEWPOINT_TOLERANCE_F
+        if projected_min < physics_floor:
+            projected_min = physics_floor
+            forecast_residual_f = forecast_residual_f + DISAGREEMENT_RESIDUAL_BUMP_F
+
+    proj_lo = projected_min - forecast_residual_f
+    proj_hi = projected_min + forecast_residual_f
     lo, hi = _bracket_overlap_prob(bracket, proj_lo, proj_hi)
     return _shifted(lo, hi)
 

@@ -239,6 +239,13 @@ class StationState:
     neighbor_sample_count: int = 0
     neighbor_icaos: tuple[str, ...] = ()   # neighbors actually queried
 
+    #: Minimum dewpoint observed inside the market-day window so far, in °F.
+    #: Physical floor on the daily LOW: the air rarely cools more than ~1°F
+    #: below this without dry advection. Used by fair_probability LOW path
+    #: to clip absurd cold-cooling forecasts; never used to lock a contract.
+    #: None when no observations carry dewpoint data.
+    dewpoint_floor_f: Optional[float] = None
+
     @property
     def cli_matches_market_date(self) -> bool:
         return self.cli_report_date == self.market_date
