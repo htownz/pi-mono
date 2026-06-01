@@ -146,21 +146,24 @@ def test_project_extremum_returns_none_when_nothing_available():
 # -- fair_probability uses calibrated residual -------------------------------
 
 def test_fair_probability_uses_calibrated_residual_when_config_provided():
-    """A tighter residual (0.5°F vs 2.0°F default) shifts the margin enough
-    to change which discrete probability bucket the BRACKET_HIT case lands in.
+    """A calibrated residual shifts the margin enough to change which discrete
+    probability bucket the BRACKET_HIT case lands in.
 
-    Setup: HIGH market at 79-80°, forecast max 80.5°F, observed max 79.5°F
-    (inside bracket → BRACKET_HIT_VULNERABLE). Escape threshold is 81°F.
+    Setup: HIGH market at 79-80°, forecast max 80.5°F at lead-time ~10h
+    (mid-tier default = 2.5°F), observed max 79.5°F (inside bracket →
+    BRACKET_HIT_VULNERABLE). Escape threshold is 81°F.
 
-      With 2.0°F default: margin = 80.5 + 2.0 - 81 = +1.5 → p=0.35 bucket
-      With 0.5°F tight:   margin = 80.5 + 0.5 - 81 = +0.0 → p=0.55 bucket
+      Lead-time tier (10h → 2.5°F):  margin = 80.5 + 2.5 - 81 = +2.0 → p=0.35
+      Calibrated 0.5°F:              margin = 80.5 + 0.5 - 81 = +0.0 → p=0.55
     """
     contract = _contract(Metric.HIGH, Bracket(BracketKind.BETWEEN, lo=79.0, hi=80.0))
     ss = _station_state(running_max=79.5)
-    now = ss.window_start + timedelta(hours=14)
-    forecast = _forecast(now.astimezone(timezone.utc), 80.5, 79.0, 76.0)
+    now = ss.window_start + timedelta(hours=4)   # 4am local
+    # Forecast peak at now+10h (2pm local), lead-time → tier 6-12h → 2.5°F.
+    pad = [80.0] * 9     # filler points before the peak
+    forecast = _forecast(now.astimezone(timezone.utc), *pad, 80.5, 79.0, 76.0)
 
-    # Default — no config → 2.0°F residual → p=0.35 → (0.27, 0.43)
+    # Default — no config → lead-time tier (10h, 2.5°F) → p=0.35 → (0.27, 0.43)
     lo_default, hi_default = fair_probability(
         contract, ss, ContractState.BRACKET_HIT_VULNERABLE,
         forecast, now_utc=now.astimezone(timezone.utc),
@@ -179,6 +182,88 @@ def test_fair_probability_uses_calibrated_residual_when_config_provided():
     assert round((lo_cal + hi_cal) / 2, 2) == 0.55
     # Confirm the tightening actually moved the answer.
     assert lo_cal > lo_default
+
+
+def test_fair_probability_tier_default_tightens_for_near_settlement_lead():
+    """Lead-time-aware default tightens the residual band for near-settlement
+    trades vs the same setup at a long lead time. Same forecast peak, same
+    observed max, same bracket — just shifted in time.
+
+    With observed max 79.5 inside bracket [79, 80] and forecast peak 80.5:
+      Lead ~ 1h  → tier 0-2h → 0.8°F → margin = +0.3 → p=0.55 bucket
+      Lead ~ 14h → tier 12-24h → 3.5°F → margin = +3.0 → p=0.35 bucket
+    """
+    contract = _contract(Metric.HIGH, Bracket(BracketKind.BETWEEN, lo=79.0, hi=80.0))
+    ss = _station_state(running_max=79.5)
+
+    # Near-settlement: now is 1h before forecast peak.
+    now_near = ss.window_start + timedelta(hours=13)
+    forecast_near = _forecast(now_near.astimezone(timezone.utc), 80.5, 79.0, 76.0)
+    lo_near, hi_near = fair_probability(
+        contract, ss, ContractState.BRACKET_HIT_VULNERABLE,
+        forecast_near, now_utc=now_near.astimezone(timezone.utc),
+    )
+    assert round((lo_near + hi_near) / 2, 2) == 0.55
+
+    # Long lead: now is 14h before forecast peak. Build 13 filler points then peak.
+    now_far = ss.window_start + timedelta(hours=0)
+    pad = [78.0] * 13
+    forecast_far = _forecast(now_far.astimezone(timezone.utc), *pad, 80.5, 79.0, 76.0)
+    lo_far, hi_far = fair_probability(
+        contract, ss, ContractState.BRACKET_HIT_VULNERABLE,
+        forecast_far, now_utc=now_far.astimezone(timezone.utc),
+    )
+    assert round((lo_far + hi_far) / 2, 2) == 0.35
+    # Wider residual at long lead → lower confidence we stay in bracket.
+    assert lo_far < lo_near
+
+
+def test_fair_probability_uses_neighbor_fallback_when_primary_observation_missing():
+    """When the primary ASOS is silent BUT the day's peak has already passed
+    (forecast from here on is cooling), the neighbor's observed max becomes
+    the only evidence of where the day actually got to.
+
+    Without the neighbor fallback, the projection collapses to the cool
+    remainder forecast — drastically understating the daily high. With it,
+    we recover the true peak from the network.
+
+    Setup: HIGH market at 88-90°, primary has no obs, evening forecast tops
+    out at 82°F (day already past peak), neighbor saw 89.5°F mid-afternoon.
+
+      Without neighbor: projection ≈ 82°F → BELOW bracket → low fair_prob.
+      With neighbor:    projection ≈ 89.5°F → IN bracket → much higher prob.
+    """
+    contract = _contract(Metric.HIGH, Bracket(BracketKind.BETWEEN, lo=88.0, hi=90.0))
+    ss = _station_state(running_max=None)
+    # Manually inject what build_station_state would have populated if the
+    # primary ASOS went silent but the neighbor (KIAH) saw the day peak.
+    ss.neighbor_running_max_f = 89.5
+    ss.neighbor_running_min_f = 70.0
+    ss.neighbor_sample_count = 24
+    ss.neighbor_icaos = ("KIAH",)
+
+    now = ss.window_start + timedelta(hours=20)   # 8pm local — past peak
+    forecast = _forecast(now.astimezone(timezone.utc), 82.0, 78.0, 75.0)
+
+    lo_with_neighbor, hi_with_neighbor = fair_probability(
+        contract, ss, ContractState.FORECAST_DEPENDENT,
+        forecast, now_utc=now.astimezone(timezone.utc),
+    )
+
+    ss_no_neighbor = _station_state(running_max=None)
+    lo_no, hi_no = fair_probability(
+        contract, ss_no_neighbor, ContractState.FORECAST_DEPENDENT,
+        forecast, now_utc=now.astimezone(timezone.utc),
+    )
+    # Neighbor lifts the projection from the cool remainder (~82°F, well
+    # below bracket) to the actually-realized peak (~89.5°F, inside bracket).
+    # That has to shift the fair_prob mid-point upward by a clear margin.
+    mid_with = (lo_with_neighbor + hi_with_neighbor) / 2
+    mid_no = (lo_no + hi_no) / 2
+    assert mid_with > mid_no + 0.10, (
+        f"neighbor fallback only shifted fair_prob by {mid_with - mid_no:.3f} "
+        f"(expected >0.10): with={mid_with:.3f}, without={mid_no:.3f}"
+    )
 
 
 def test_fair_probability_unapplied_residual_no_ops():

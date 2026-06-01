@@ -26,6 +26,9 @@ _STATIONS: dict[str, Station] = {
             cli_product="CLIHOU",
             latitude=29.6453,
             longitude=-95.2768,
+            # KIAH (Bush, inland): no-sea-breeze baseline. KGLS (Galveston):
+            # marine baseline. KEFD (Ellington): mid-distance corroborator.
+            neighbors=("KIAH", "KGLS", "KEFD"),
         ),
         Station(
             icao="KIAH",
@@ -44,6 +47,10 @@ _STATIONS: dict[str, Station] = {
             cli_product="CLINYC",
             latitude=40.7794,
             longitude=-73.9692,
+            # Central Park runs 2-4°F hotter than the airports on calm summer
+            # nights (urban heat island), cooler on windy days. The 4-airport
+            # ensemble is a useful prior + redundancy on KNYC ASOS gaps.
+            neighbors=("KJFK", "KLGA", "KEWR", "KTEB"),
         ),
         Station(
             icao="KLGA",
@@ -71,6 +78,11 @@ _STATIONS: dict[str, Station] = {
             cli_product="CLIMDW",
             latitude=41.7868,
             longitude=-87.7522,
+            # KORD is the regional anchor. KGYY (Gary IN) catches lake-breeze
+            # from the south. KPWK (Palwaukee) sits NW of the city, away from
+            # the lake. KDPA (DuPage) is the western front-passage early
+            # warning — fronts typically arrive there 1-2h before KMDW.
+            neighbors=("KORD", "KGYY", "KPWK", "KDPA"),
         ),
         Station(
             icao="KORD",
@@ -80,6 +92,8 @@ _STATIONS: dict[str, Station] = {
             cli_product="CLIORD",
             latitude=41.9786,
             longitude=-87.9047,
+            # Same regional ensemble as KMDW with KMDW itself as a neighbor.
+            neighbors=("KMDW", "KGYY", "KPWK", "KDPA"),
         ),
         Station(
             icao="KDCA",
@@ -107,6 +121,12 @@ _STATIONS: dict[str, Station] = {
             cli_product="CLILAX",
             latitude=33.9425,
             longitude=-118.4081,
+            # KLAX is right on the coast — marine layer dominates the high.
+            # KBUR (Burbank, inland over the hills): "no marine layer" baseline.
+            # KSMO (Santa Monica): just NW, marine-similar corroborator.
+            # KLGB (Long Beach): south of LAX, also marine-influenced.
+            # KLAX - KBUR delta = marine-layer strength.
+            neighbors=("KBUR", "KSMO", "KLGB"),
         ),
         Station(
             icao="KSFO",

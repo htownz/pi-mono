@@ -152,6 +152,63 @@ def test_forecast_residual_from_dict_enforces_clamping_and_applied_invariant():
     assert cfg.forecast_residuals["KIAH|low"].residual_f == DEFAULT_FORECAST_RESIDUAL_F
 
 
+def test_forecast_residual_for_uses_lead_time_tiers_when_no_calibration():
+    """No calibrated entry + lead_hours supplied → tier default applies.
+
+    Tier table: (≤2h, 0.8), (≤6h, 1.5), (≤12h, 2.5), (≤24h, 3.5), (∞, 4.5).
+    """
+    cfg = RankerConfig.default()
+    assert cfg.forecast_residual_for("KSFO", "high", lead_hours=0.5) == 0.8
+    assert cfg.forecast_residual_for("KSFO", "high", lead_hours=2.0) == 0.8
+    assert cfg.forecast_residual_for("KSFO", "high", lead_hours=4.0) == 1.5
+    assert cfg.forecast_residual_for("KSFO", "high", lead_hours=10.0) == 2.5
+    assert cfg.forecast_residual_for("KSFO", "high", lead_hours=20.0) == 3.5
+    assert cfg.forecast_residual_for("KSFO", "high", lead_hours=48.0) == 4.5
+
+
+def test_forecast_residual_for_calibrated_wins_over_tier_default():
+    """A calibrated (applied) entry beats the tier default even with lead_hours."""
+    cfg = RankerConfig.default()
+    cfg.forecast_residuals[residual_key("KSFO", "high")] = ForecastResidual.of(
+        residual_f=1.2, n=50, applied=True,
+    )
+    # Without lead_hours: calibrated value.
+    assert cfg.forecast_residual_for("KSFO", "high") == 1.2
+    # With lead_hours that would normally pick 4.5°F tier — calibrated still wins.
+    assert cfg.forecast_residual_for("KSFO", "high", lead_hours=48.0) == 1.2
+
+
+def test_use_ensemble_round_trips_through_json(tmp_path: Path):
+    """The opt-in use_ensemble flag must survive save/load so a config file
+    can pin it on across container restarts. Default is False."""
+    cfg = RankerConfig.default()
+    assert cfg.use_ensemble is False    # default off — no behavior change
+    cfg.use_ensemble = True
+    path = tmp_path / "cfg.json"
+    cfg.save_json(path)
+    loaded = RankerConfig.load_json(path)
+    assert loaded.use_ensemble is True
+
+
+def test_use_ensemble_defaults_off_when_absent_from_json(tmp_path: Path):
+    """An older config.json without use_ensemble must load with the flag off
+    (backward compat — existing configs don't suddenly enable ensemble)."""
+    path = tmp_path / "no_ensemble.json"
+    path.write_text('{"based_on_snapshots": 100}')
+    loaded = RankerConfig.load_json(path)
+    assert loaded.use_ensemble is False
+
+
+def test_forecast_residual_for_lead_hours_none_preserves_legacy_default():
+    """The lead-time tier system is purely additive — when `lead_hours` is
+    None, the engine sees exactly the historical 2.0°F default (or the
+    calibrated value when present). No grade-line drift on existing callers
+    that haven't opted in."""
+    cfg = RankerConfig.default()
+    assert cfg.forecast_residual_for("KSFO", "high") == DEFAULT_FORECAST_RESIDUAL_F
+    assert cfg.forecast_residual_for("KSFO", "high", lead_hours=None) == DEFAULT_FORECAST_RESIDUAL_F
+
+
 def test_forecast_residuals_round_trip_through_json(tmp_path: Path):
     cfg = RankerConfig(
         generated_at=datetime(2026, 5, 30, 12, 0, tzinfo=timezone.utc),
