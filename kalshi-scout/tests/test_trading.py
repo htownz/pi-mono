@@ -194,7 +194,7 @@ def test_place_order_validates_inputs(keypair):
     _, pem = keypair
     client = KalshiTradingClient(key_id="kid", private_key_path=pem)
     with pytest.raises(ValueError, match="action must be"):
-        client.place_order(ticker="K", action="sell", side="yes", count=1, price_cents=15)
+        client.place_order(ticker="K", action="hodl", side="yes", count=1, price_cents=15)
     with pytest.raises(ValueError, match="side must be"):
         client.place_order(ticker="K", action="buy", side="maybe", count=1, price_cents=15)
     with pytest.raises(ValueError, match="count must be"):

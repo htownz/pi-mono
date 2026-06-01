@@ -88,6 +88,33 @@ def _sign(key: rsa.RSAPrivateKey, payload: str) -> str:
     return base64.b64encode(sig).decode("ascii")
 
 
+def _fill_count_from_response(order: dict, *, requested: int) -> int:
+    """Best-effort fill count from Kalshi's order response.
+
+    The field name has varied across Kalshi API versions; check the
+    common shapes before falling back to status inference. Conservative:
+    when nothing definitive is present, treat as 0 (resting) rather
+    than assuming a full fill — better to under-record locally than to
+    diverge from the broker. Shared by AutoTrader (buy fills) and
+    PositionMonitor (sell fills)."""
+    for k in ("taker_fill_count", "fill_count", "filled_quantity", "filled_count"):
+        v = order.get(k)
+        if v is not None:
+            try:
+                return max(0, min(requested, int(v)))
+            except (TypeError, ValueError):
+                continue
+    status = (order.get("status") or "").lower()
+    if status == "executed":
+        # Some API versions only return status; "executed" means fully
+        # filled per Kalshi's documented order lifecycle.
+        return requested
+    if status in ("resting", "queued", "canceled", "cancelled"):
+        return 0
+    # Unknown shape — be defensive and assume nothing filled.
+    return 0
+
+
 class KalshiTradingClient:
     """Authenticated HTTP client for Kalshi's trading endpoints.
 
@@ -134,7 +161,7 @@ class KalshiTradingClient:
     def place_order(
         self,
         ticker: str,
-        action: str,          # "buy" — we don't expose sell here yet
+        action: str,          # "buy" or "sell"
         side: str,            # "yes" or "no"
         count: int,           # contracts
         price_cents: int,     # for limit orders; 1..99
@@ -143,10 +170,17 @@ class KalshiTradingClient:
         """POST a single order. Returns Kalshi's raw response body.
 
         Limit orders set `yes_price` or `no_price` to `price_cents` per
-        Kalshi's API convention (the field name carries the side).
+        Kalshi's API convention (the field name carries the side, NOT the
+        direction — for both buy and sell of the NO side you set `no_price`).
+
+        `action="sell"` closes an existing position by selling contracts of
+        the side we hold back into the book. A sell limit priced at the
+        current bid is marketable and should fill immediately as a taker;
+        if the book moved and it rests, the caller is responsible for
+        canceling it (see PositionMonitor) so it can't double-fill later.
         """
-        if action not in ("buy",):
-            raise ValueError(f"action must be 'buy', got {action!r}")
+        if action not in ("buy", "sell"):
+            raise ValueError(f"action must be 'buy' or 'sell', got {action!r}")
         if side not in ("yes", "no"):
             raise ValueError(f"side must be 'yes' or 'no', got {side!r}")
         if order_type not in ("limit", "market"):
@@ -162,6 +196,14 @@ class KalshiTradingClient:
                 raise ValueError(f"price_cents must be 1..99 for limit, got {price_cents}")
             body["yes_price" if side == "yes" else "no_price"] = price_cents
         return self._request("POST", "/trade-api/v2/portfolio/orders", json_body=body)
+
+    def cancel_order(self, order_id: str) -> dict:
+        """Cancel a resting order by id. Used by the position monitor to
+        retract a sell limit that didn't fill immediately, so it can't
+        fill on a later book move and create an unintended short."""
+        return self._request(
+            "DELETE", f"/trade-api/v2/portfolio/orders/{order_id}"
+        )
 
     def get_balance_cents(self) -> int:
         """Returns the cleared cash balance in cents."""
@@ -636,30 +678,9 @@ class AutoTrader:
 
     @staticmethod
     def _fill_count_from_response(order: dict, *, requested: int) -> int:
-        """Best-effort fill count from Kalshi's order response.
-
-        The field name has varied across Kalshi API versions; check the
-        common shapes before falling back to status inference. Conservative:
-        when nothing definitive is present, treat as 0 (resting) rather
-        than assuming a full fill — better to under-record locally than to
-        diverge from the broker.
-        """
-        for k in ("taker_fill_count", "fill_count", "filled_quantity", "filled_count"):
-            v = order.get(k)
-            if v is not None:
-                try:
-                    return max(0, min(requested, int(v)))
-                except (TypeError, ValueError):
-                    continue
-        status = (order.get("status") or "").lower()
-        if status == "executed":
-            # Some API versions only return status; "executed" means fully
-            # filled per Kalshi's documented order lifecycle.
-            return requested
-        if status in ("resting", "queued", "canceled", "cancelled"):
-            return 0
-        # Unknown shape — be defensive and assume nothing filled.
-        return 0
+        """Delegates to the module-level helper. Kept as a staticmethod for
+        backward compatibility with callers/tests that reference it here."""
+        return _fill_count_from_response(order, requested=requested)
 
     @staticmethod
     def _derive_side_and_price(snap: SnapshotRow) -> tuple[Optional[str], Optional[int]]:
@@ -746,12 +767,21 @@ class PositionMonitor:
          opposite side will still pay beats holding to a $0 settlement.
 
     Both triggers are snapshot-driven — the scan that just ran wrote
-    fresh quotes and state. No extra Kalshi calls needed.
+    fresh quotes and state. No extra Kalshi calls needed to DECIDE.
 
-    Paper mode: close locally via `store.close_position`. Live mode:
-    DEFERRED (sell-order placement is PR-13 plan-of-record). In live
-    mode the monitor logs `reason='live_skipped'` so the operator can
-    see what the monitor would have done.
+    Execution:
+      - Paper mode: close locally via `store.close_position`.
+      - Live mode WITHOUT a `trading_client`: log `reason='live_skipped'`
+        (the monitor decides but can't act — useful for observing what it
+        would do before arming real exits).
+      - Live mode WITH a `trading_client`: place a sell limit at the
+        current bid (marketable → fills immediately as a taker). On a
+        full fill, close the position locally at the fill price. If the
+        book moved and the order rests, CANCEL it immediately so it can't
+        fill on a later scan and create an unintended short — then leave
+        the position open for the next scan to retry fresh. This
+        cancel-on-no-fill is the core safety against double-selling a
+        position that has no order-tracking state in the local store.
     """
 
     def __init__(
@@ -761,6 +791,7 @@ class PositionMonitor:
         cut_loss_on_state_flip: bool = True,
         paper: bool = True,
         audit_log_path: Optional[Path] = None,
+        trading_client: Optional["KalshiTradingClient"] = None,
     ) -> None:
         if not (0 < take_profit_bid_cents < 100):
             raise ValueError(
@@ -772,6 +803,7 @@ class PositionMonitor:
         self.cut_loss_on_state_flip = cut_loss_on_state_flip
         self.paper = paper
         self.audit_log_path = audit_log_path
+        self.trading_client = trading_client
 
     def run(self, now_utc: Optional[datetime] = None) -> tuple[int, int]:
         """Returns (n_closed, n_examined). Examined = open positions checked."""
@@ -832,8 +864,8 @@ class PositionMonitor:
         now_utc: datetime,
     ) -> ExitAttempt:
         realized = (exit_price_cents - position.avg_price_cents) * position.size_contracts
-        if not self.paper:
-            # Live exit is deferred — record what we WOULD have done.
+
+        def _attempt(reason_: str, closed: bool, paper: bool) -> ExitAttempt:
             return ExitAttempt(
                 fired_at_utc=now_utc, position_id=position.id,
                 market_ticker=position.market_ticker,
@@ -842,22 +874,74 @@ class PositionMonitor:
                 open_price_cents=position.avg_price_cents,
                 exit_price_cents=exit_price_cents,
                 realized_pnl_cents=realized,
-                reason="live_skipped",
-                closed=False, paper=False, snap_id=snap_id,
+                reason=reason_, closed=closed, paper=paper, snap_id=snap_id,
             )
-        ok = self.store.close_position(
-            position.id, closed_at=now_utc, at_price_cents=exit_price_cents,
-        )
-        return ExitAttempt(
-            fired_at_utc=now_utc, position_id=position.id,
-            market_ticker=position.market_ticker,
-            event_ticker=position.event_ticker, side=position.side,
-            size_contracts=position.size_contracts,
-            open_price_cents=position.avg_price_cents,
-            exit_price_cents=exit_price_cents,
-            realized_pnl_cents=realized,
-            reason=reason,
-            closed=ok, paper=True, snap_id=snap_id,
+
+        if self.paper:
+            ok = self.store.close_position(
+                position.id, closed_at=now_utc, at_price_cents=exit_price_cents,
+            )
+            return _attempt(reason, closed=ok, paper=True)
+
+        # -- Live --------------------------------------------------------
+        if self.trading_client is None:
+            # No client wired (live exits not armed) — decide but don't act.
+            return _attempt("live_skipped", closed=False, paper=False)
+        return self._close_live(position, exit_price_cents, reason, _attempt)
+
+    def _close_live(
+        self,
+        position: PositionRow,
+        exit_price_cents: int,
+        reason: str,
+        _attempt,
+    ) -> ExitAttempt:
+        """Place a real sell limit at the bid; reconcile by actual fill.
+
+        Fills fully → close locally. Doesn't fill → cancel so the resting
+        order can't double-fill on a later scan, then leave open to retry.
+        Any API exception leaves the position untouched (safe: we'd rather
+        hold to settlement than corrupt local state on a flaky call).
+        """
+        assert self.trading_client is not None
+        size = position.size_contracts
+        try:
+            resp = self.trading_client.place_order(
+                ticker=position.market_ticker,
+                action="sell",
+                side=position.side,
+                count=size,
+                price_cents=exit_price_cents,
+                order_type="limit",
+            )
+        except Exception as exc:
+            return _attempt(f"sell_error: {exc}", closed=False, paper=False)
+
+        order = resp.get("order") or {}
+        order_id = order.get("order_id")
+        filled = _fill_count_from_response(order, requested=size)
+
+        if filled >= size:
+            ok = self.store.close_position(
+                position.id, at_price_cents=exit_price_cents,
+            )
+            tag = "" if order_id is None else f" order_id={order_id}"
+            return _attempt(f"{reason} (live sold {filled}/{size}){tag}",
+                            closed=ok, paper=False)
+
+        # Not fully filled — retract so it can't fill later (double-sell guard).
+        cancel_note = ""
+        if order_id is not None:
+            try:
+                self.trading_client.cancel_order(order_id)
+                cancel_note = "; canceled unfilled remainder"
+            except Exception as exc:
+                # Loud: a lingering resting sell is the one thing that could
+                # double-fill. Surface it so the operator can cancel by hand.
+                cancel_note = f"; WARN cancel FAILED ({exc}) — check Kalshi UI"
+        return _attempt(
+            f"{reason}_unfilled (sold {filled}/{size}){cancel_note}",
+            closed=False, paper=False,
         )
 
     def _write_audit(self, attempt: ExitAttempt) -> None:
