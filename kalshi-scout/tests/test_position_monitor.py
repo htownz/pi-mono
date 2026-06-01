@@ -328,3 +328,182 @@ def test_take_profit_bid_must_be_in_valid_range(store):
         PositionMonitor(store, take_profit_bid_cents=100)
     with pytest.raises(ValueError):
         PositionMonitor(store, take_profit_bid_cents=-1)
+
+
+# -- live exits (real sell orders) -------------------------------------------
+
+class _FakeTradingClient:
+    """Records place_order / cancel_order calls and returns scripted fills.
+
+    `fill_for(ticker)` returns the contracts to report filled on the next
+    place_order for that ticker (defaults to full fill). `raise_on` makes
+    the named method raise, to exercise error paths.
+    """
+    def __init__(self, default_fill="full", raise_on=None):
+        self.default_fill = default_fill
+        self.raise_on = raise_on or set()
+        self.orders: list[dict] = []
+        self.cancels: list[str] = []
+        self._next_order_id = 1
+
+    def place_order(self, ticker, action, side, count, price_cents, order_type="limit"):
+        if "place_order" in self.raise_on:
+            raise RuntimeError("boom: place_order")
+        self.orders.append({
+            "ticker": ticker, "action": action, "side": side,
+            "count": count, "price_cents": price_cents, "order_type": order_type,
+        })
+        oid = f"ord-{self._next_order_id}"
+        self._next_order_id += 1
+        if self.default_fill == "full":
+            filled = count
+        elif self.default_fill == "none":
+            filled = 0
+        else:
+            filled = int(self.default_fill)
+        return {"order": {"order_id": oid, "fill_count": filled}}
+
+    def cancel_order(self, order_id):
+        if "cancel_order" in self.raise_on:
+            raise RuntimeError("boom: cancel_order")
+        self.cancels.append(order_id)
+        return {"order_id": order_id, "status": "canceled"}
+
+
+def test_live_exit_full_fill_closes_position(store, tmp_path):
+    """Live + trading client + immediate full fill → position closed locally
+    at the bid, sell order placed with action=sell on our side."""
+    audit = tmp_path / "exit.jsonl"
+    pid = store.add_position("MKT1", "EVT", "no", 1, 50)
+    _record_snapshot(store, "MKT1", no_bid=97)
+    fake = _FakeTradingClient(default_fill="full")
+
+    monitor = PositionMonitor(
+        store, take_profit_bid_cents=95, paper=False,
+        audit_log_path=audit, trading_client=fake,
+    )
+    n_closed, n_examined = monitor.run()
+
+    assert (n_closed, n_examined) == (1, 1)
+    # Real sell placed: action=sell, side=no, at the bid.
+    assert len(fake.orders) == 1
+    o = fake.orders[0]
+    assert o["action"] == "sell" and o["side"] == "no" and o["price_cents"] == 97
+    # Position closed locally at the fill price.
+    closed = store.query_positions(open_only=False)[0]
+    assert closed.closed_at_price_cents == 97
+    assert closed.realized_pnl_cents == (97 - 50)
+    # Audit row reflects a real close (not live_skipped).
+    rows = [json.loads(l) for l in audit.read_text().splitlines()]
+    assert rows[0]["closed"] is True
+    assert rows[0]["paper"] is False
+    assert "take_profit" in rows[0]["reason"]
+    assert "live sold 1/1" in rows[0]["reason"]
+
+
+def test_live_exit_no_fill_cancels_and_leaves_open(store, tmp_path):
+    """Sell rests (0 filled) → monitor cancels it (double-sell guard) and
+    leaves the position open for the next scan to retry."""
+    audit = tmp_path / "exit.jsonl"
+    pid = store.add_position("MKT1", "EVT", "no", 1, 50)
+    _record_snapshot(store, "MKT1", no_bid=97)
+    fake = _FakeTradingClient(default_fill="none")
+
+    monitor = PositionMonitor(
+        store, take_profit_bid_cents=95, paper=False,
+        audit_log_path=audit, trading_client=fake,
+    )
+    n_closed, n_examined = monitor.run()
+
+    assert (n_closed, n_examined) == (0, 1)
+    # Position still open.
+    assert len(store.query_positions(open_only=True)) == 1
+    # The resting order was canceled — the core double-sell safety.
+    assert fake.cancels == ["ord-1"]
+    rows = [json.loads(l) for l in audit.read_text().splitlines()]
+    assert rows[0]["closed"] is False
+    assert "unfilled" in rows[0]["reason"]
+    assert "canceled unfilled remainder" in rows[0]["reason"]
+
+
+def test_live_exit_place_order_error_leaves_position_untouched(store, tmp_path):
+    """An API exception on the sell → position stays open, reason flags the
+    error, no cancel attempted (no order to cancel)."""
+    audit = tmp_path / "exit.jsonl"
+    pid = store.add_position("MKT1", "EVT", "no", 1, 50)
+    _record_snapshot(store, "MKT1", no_bid=97)
+    fake = _FakeTradingClient(raise_on={"place_order"})
+
+    monitor = PositionMonitor(
+        store, take_profit_bid_cents=95, paper=False,
+        audit_log_path=audit, trading_client=fake,
+    )
+    n_closed, _ = monitor.run()
+
+    assert n_closed == 0
+    assert len(store.query_positions(open_only=True)) == 1
+    assert fake.cancels == []
+    rows = [json.loads(l) for l in audit.read_text().splitlines()]
+    assert "sell_error" in rows[0]["reason"]
+    assert rows[0]["closed"] is False
+
+
+def test_live_exit_cancel_failure_is_surfaced_loudly(store, tmp_path):
+    """If the sell rests AND the cancel fails, the audit reason warns the
+    operator to check the Kalshi UI (a lingering sell could double-fill)."""
+    audit = tmp_path / "exit.jsonl"
+    pid = store.add_position("MKT1", "EVT", "no", 1, 50)
+    _record_snapshot(store, "MKT1", no_bid=97)
+    fake = _FakeTradingClient(default_fill="none", raise_on={"cancel_order"})
+
+    monitor = PositionMonitor(
+        store, take_profit_bid_cents=95, paper=False,
+        audit_log_path=audit, trading_client=fake,
+    )
+    monitor.run()
+
+    rows = [json.loads(l) for l in audit.read_text().splitlines()]
+    assert "WARN cancel FAILED" in rows[0]["reason"]
+    assert rows[0]["closed"] is False
+    # Position remains open (we couldn't confirm it's flat).
+    assert len(store.query_positions(open_only=True)) == 1
+
+
+def test_live_exit_cut_loss_places_real_sell(store, tmp_path):
+    """Cut-loss path also routes through a real sell when armed."""
+    audit = tmp_path / "exit.jsonl"
+    pid = store.add_position("MKT1", "EVT", "no", 1, 80)
+    _record_snapshot(store, "MKT1", no_bid=6, state="locked_yes")
+    fake = _FakeTradingClient(default_fill="full")
+
+    monitor = PositionMonitor(
+        store, take_profit_bid_cents=95, cut_loss_on_state_flip=True,
+        paper=False, audit_log_path=audit, trading_client=fake,
+    )
+    n_closed, _ = monitor.run()
+
+    assert n_closed == 1
+    assert fake.orders[0]["action"] == "sell"
+    assert fake.orders[0]["price_cents"] == 6   # sold at the (bad) bid
+    rows = [json.loads(l) for l in audit.read_text().splitlines()]
+    assert "cut_loss_state_flip" in rows[0]["reason"]
+    assert rows[0]["closed"] is True
+
+
+def test_live_without_trading_client_still_logs_skipped(store, tmp_path):
+    """Live mode but no trading client (live exits not armed) preserves the
+    original log-only behavior — no orders, position untouched."""
+    audit = tmp_path / "exit.jsonl"
+    pid = store.add_position("MKT1", "EVT", "no", 1, 50)
+    _record_snapshot(store, "MKT1", no_bid=97)
+
+    monitor = PositionMonitor(
+        store, take_profit_bid_cents=95, paper=False,
+        audit_log_path=audit, trading_client=None,
+    )
+    n_closed, _ = monitor.run()
+
+    assert n_closed == 0
+    assert len(store.query_positions(open_only=True)) == 1
+    rows = [json.loads(l) for l in audit.read_text().splitlines()]
+    assert rows[0]["reason"] == "live_skipped"

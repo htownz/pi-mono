@@ -1859,6 +1859,13 @@ def replay(store_path: str, snapshot_id: int) -> None:
                    "<store-dir>/auto-exit.jsonl. Sibling of --audit-log "
                    "(which covers entries); kept separate so the existing "
                    "`audit` command and dashboard panel stay aligned.")
+@click.option("--live-exits", is_flag=True,
+              help="Arm the position monitor to place REAL sell orders in "
+                   "live mode (otherwise it only logs 'live_skipped'). "
+                   "Sells at the current bid (marketable limit); cancels "
+                   "any unfilled remainder to prevent double-selling. "
+                   "Requires --auto-trade --monitor-positions and live "
+                   "(non-paper) mode + valid API key. Off by default.")
 def serve(store_path: str, interval: int, min_grade: str,
           notify_specs: tuple[str, ...], notify_min_grade: str,
           config_path: Optional[str], once: bool,
@@ -1872,7 +1879,8 @@ def serve(store_path: str, interval: int, min_grade: str,
           use_ensemble: bool,
           monitor_positions: bool, take_profit_bid: int,
           no_cut_loss_on_state_flip: bool,
-          exit_audit_log: Optional[str]) -> None:
+          exit_audit_log: Optional[str],
+          live_exits: bool) -> None:
     """Run the universe scanner on a loop.
 
     Equivalent to running `scan --store ... --notify ...` in a `while sleep`
@@ -1952,11 +1960,24 @@ def serve(store_path: str, interval: int, min_grade: str,
     if ranker_config and ranker_config.use_ensemble:
         log.info("ensemble fair_prob enabled (open-meteo); NWS-only fallback on failure")
     if monitor_positions:
+        live_exits_armed = bool(live_exits and not paper and trading_client is not None)
         log.info(
             f"position monitor enabled: take_profit_bid={take_profit_bid}c "
             f"cut_loss_on_state_flip={not no_cut_loss_on_state_flip} "
-            f"exit_audit={exit_audit_path}"
+            f"exit_audit={exit_audit_path} "
+            f"live_exits={'ARMED (real sells)' if live_exits_armed else 'off (log-only)'}"
         )
+        if live_exits and not live_exits_armed:
+            # Operator asked for live exits but a prerequisite is missing.
+            # Don't fail — degrade to log-only — but say why, loudly.
+            why = (
+                "paper mode" if paper
+                else "no trading client (need --auto-trade + API key)"
+            )
+            log.warning(
+                f"--live-exits requested but NOT armed ({why}); monitor will "
+                f"log 'live_skipped' instead of placing real sell orders"
+            )
 
     iteration = 0
     while not stop["flag"]:
@@ -2057,12 +2078,22 @@ def serve(store_path: str, interval: int, min_grade: str,
                 n_exits = 0
                 n_exit_examined = 0
                 if monitor_positions:
+                    # Arm real sells only when --live-exits is set AND we're
+                    # live AND a trading client exists. Otherwise the monitor
+                    # decides but logs 'live_skipped' (or closes locally in
+                    # paper). This keeps live order placement strictly opt-in.
+                    monitor_client = (
+                        trading_client
+                        if (live_exits and not paper and trading_client is not None)
+                        else None
+                    )
                     monitor = PositionMonitor(
                         store=store,
                         take_profit_bid_cents=take_profit_bid,
                         cut_loss_on_state_flip=not no_cut_loss_on_state_flip,
                         paper=paper,
                         audit_log_path=exit_audit_path,
+                        trading_client=monitor_client,
                     )
                     n_exits, n_exit_examined = monitor.run(now_utc=scan_started)
 
