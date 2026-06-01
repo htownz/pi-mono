@@ -171,6 +171,13 @@ class RankerConfig:
     forecast_dependent: StateThresholds = field(default_factory=lambda: DEFAULT_FORECAST_DEPENDENT)
     regime_shifts: dict[str, RegimeShift] = field(default_factory=dict)
     forecast_residuals: dict[str, ForecastResidual] = field(default_factory=dict)
+    #: Opt-in: use Open-Meteo's ensemble forecast to compute fair_prob by
+    #: counting members above/below the bracket threshold, instead of the
+    #: NWS-only Gaussian-band overlap. The settlement source is unchanged
+    #: (still the primary station's CLI). When True and ensemble data is
+    #: available, the ensemble fair_prob is used; on failure or insufficient
+    #: members, the engine silently falls back to the NWS-only path.
+    use_ensemble: bool = False
 
     @classmethod
     def default(cls) -> "RankerConfig":
@@ -248,6 +255,7 @@ class RankerConfig:
             "forecast_residuals": {
                 k: asdict(v) for k, v in self.forecast_residuals.items()
             },
+            "use_ensemble": self.use_ensemble,
         }
 
     @classmethod
@@ -290,6 +298,7 @@ class RankerConfig:
             forecast_dependent=_state("forecast_dependent", DEFAULT_FORECAST_DEPENDENT),
             regime_shifts=regime_shifts,
             forecast_residuals=forecast_residuals,
+            use_ensemble=bool(d.get("use_ensemble", False)),
         )
 
     def save_json(self, path: Path | str) -> None:

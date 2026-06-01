@@ -178,6 +178,27 @@ def test_forecast_residual_for_calibrated_wins_over_tier_default():
     assert cfg.forecast_residual_for("KSFO", "high", lead_hours=48.0) == 1.2
 
 
+def test_use_ensemble_round_trips_through_json(tmp_path: Path):
+    """The opt-in use_ensemble flag must survive save/load so a config file
+    can pin it on across container restarts. Default is False."""
+    cfg = RankerConfig.default()
+    assert cfg.use_ensemble is False    # default off — no behavior change
+    cfg.use_ensemble = True
+    path = tmp_path / "cfg.json"
+    cfg.save_json(path)
+    loaded = RankerConfig.load_json(path)
+    assert loaded.use_ensemble is True
+
+
+def test_use_ensemble_defaults_off_when_absent_from_json(tmp_path: Path):
+    """An older config.json without use_ensemble must load with the flag off
+    (backward compat — existing configs don't suddenly enable ensemble)."""
+    path = tmp_path / "no_ensemble.json"
+    path.write_text('{"based_on_snapshots": 100}')
+    loaded = RankerConfig.load_json(path)
+    assert loaded.use_ensemble is False
+
+
 def test_forecast_residual_for_lead_hours_none_preserves_legacy_default():
     """The lead-time tier system is purely additive — when `lead_hours` is
     None, the engine sees exactly the historical 2.0°F default (or the

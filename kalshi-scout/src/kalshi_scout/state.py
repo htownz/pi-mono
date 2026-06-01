@@ -9,6 +9,7 @@ unless the forecast residual is very small.
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Optional
 
@@ -485,3 +486,93 @@ def _bracket_overlap_prob(bracket: Bracket, proj_lo: float, proj_hi: float) -> t
         center = min(1.0, overlap / span)
     pad = 0.10
     return max(0.0, center - pad), min(1.0, center + pad)
+
+
+# -- Ensemble-based fair probability (opt-in, Tier 1B) -----------------------
+
+def fair_probability_from_ensemble(
+    contract: ParsedContract,
+    station_state: StationState,
+    state: ContractState,
+    ensemble,                       # list[EnsembleHourlyPoint] — avoid hard import
+    now_utc: Optional[datetime] = None,
+    regime: Optional[str] = None,
+    config: Optional["RankerConfig"] = None,
+    min_members: int = 10,
+) -> Optional[tuple[float, float]]:
+    """Compute fair_prob by counting ensemble members that settle YES.
+
+    Returns the (lo, hi) range using a 95% Wilson-style binomial interval
+    around the empirical fraction, so a small ensemble produces a wider
+    band. Returns `None` when there's no useful signal — caller must fall
+    back to the NWS-only `fair_probability` path. The None cases:
+
+      - LOCKED_YES / DEAD_NO: deterministic; ensemble adds no value, return
+        None so the caller uses the eps-locked range.
+      - No ensemble points inside the market window.
+      - Fewer than `min_members` per point (ensemble too thin to trust).
+
+    Computation:
+      For each member, find that member's remaining-window max (HIGH) or
+      min (LOW). Combine with observed running extremum to get the per-
+      member projected daily extremum. Check whether the bracket would
+      contain that value at settlement. The fraction yes ≈ fair_prob.
+    """
+    # Deterministic states — let the caller handle these with the eps-locked
+    # range. Ensemble adds no value once settlement is conclusive.
+    if state is ContractState.LOCKED_YES or state is ContractState.DEAD_NO:
+        return None
+    if not ensemble:
+        return None
+
+    now_utc = now_utc or datetime.now(timezone.utc)
+    end_utc = station_state.window_end.astimezone(timezone.utc)
+    in_window = [p for p in ensemble if now_utc <= p.start <= end_utc]
+    if not in_window:
+        return None
+
+    # Number of members in the first in-window point. Open-Meteo returns the
+    # same count per hour; the parser already drops hours with no valid
+    # members. Use min across points so we never index out of bounds on a
+    # ragged series.
+    n_members = min(len(p.members_f) for p in in_window)
+    if n_members < min_members:
+        return None
+
+    yes_count = 0
+    for m in range(n_members):
+        # Per-member remaining extremum inside the window.
+        member_max = max(p.members_f[m] for p in in_window)
+        member_min = min(p.members_f[m] for p in in_window)
+        if contract.metric is Metric.HIGH:
+            observed = station_state.effective_running_max_f
+            projection = max(observed if observed is not None else -999.0, member_max)
+        else:
+            observed = station_state.effective_running_min_f
+            projection = min(observed if observed is not None else 999.0, member_min)
+        if contract.bracket.contains(projection):
+            yes_count += 1
+
+    p = yes_count / n_members
+    # Wilson 95% CI half-width (rather than naive ±2 SE): well-behaved at
+    # p=0 and p=1, doesn't pad the band below 0 / above 1.
+    z = 1.96
+    denom = 1.0 + z * z / n_members
+    center = (p + z * z / (2 * n_members)) / denom
+    half = (z / denom) * math.sqrt(
+        max(0.0, p * (1 - p) / n_members + z * z / (4 * n_members * n_members))
+    )
+    lo = max(0.0, center - half)
+    hi = min(1.0, center + half)
+
+    # Same regime shift as fair_probability (config.regime_shift_for).
+    if config is not None and regime is not None:
+        shift = config.regime_shift_for(
+            regime=regime,
+            metric=contract.metric.value,
+            bracket_kind=contract.bracket.kind.value,
+        )
+        if shift != 0.0:
+            lo = max(0.0, min(1.0, lo + shift))
+            hi = max(0.0, min(1.0, hi + shift))
+    return lo, hi

@@ -53,6 +53,7 @@ from kalshi_scout.notify import (
     WebhookSink,
 )
 from kalshi_scout.nws import NwsClient
+from kalshi_scout.openmeteo import OpenMeteoClient
 from kalshi_scout.orderbook import parse_orderbook
 from kalshi_scout.risk import aggregate_risk
 from kalshi_scout.parser import parse_market
@@ -68,7 +69,13 @@ from kalshi_scout.trading import (
     auto_close_settled_positions,
 )
 from kalshi_scout.tuning import derive_config
-from kalshi_scout.state import build_station_state, classify, fair_probability, project_extremum
+from kalshi_scout.state import (
+    build_station_state,
+    classify,
+    fair_probability,
+    fair_probability_from_ensemble,
+    project_extremum,
+)
 from kalshi_scout.stations import all_cities, get_station
 from kalshi_scout.store import (
     SnapshotStore,
@@ -177,6 +184,7 @@ def _evaluate_event(
     now_utc: Optional[datetime] = None,
     station_state_sink: Optional[dict[str, dict]] = None,
     config: Optional[RankerConfig] = None,
+    om_client: Optional["OpenMeteoClient"] = None,
 ) -> list[ContractEvaluation]:
     """Evaluate every market in a single event. Returns evaluations sorted by grade.
 
@@ -251,16 +259,51 @@ def _evaluate_event(
         projected_f = project_extremum(
             contract.metric, local_forecast or None, local_state, now_utc=now_utc,
         )
-        fair_lo, fair_hi = fair_probability(
-            contract,
-            local_state,
-            state,
-            local_forecast or None,
-            now_utc=now_utc,
-            regime=regime_reading.regime.value,
-            config=config,
-        )
+
+        # Ensemble path (Tier 1B, opt-in via config.use_ensemble). When
+        # om_client is wired AND the config flag is on, try ensemble first.
+        # On None return — deterministic state, empty/thin ensemble, out-of-
+        # window — silently fall back to the NWS-only path. Failures NEVER
+        # bubble up; the engine must always grade.
+        fair_lo = fair_hi = None
+        ensemble_used = False
+        if (
+            om_client is not None
+            and config is not None
+            and config.use_ensemble
+            and settlement.station is not None
+        ):
+            try:
+                ens = om_client.ensemble_hourly_temperature(
+                    latitude=settlement.station.latitude,
+                    longitude=settlement.station.longitude,
+                    tz=settlement.station.tz,
+                )
+            except Exception:
+                ens = []
+            if ens:
+                ens_result = fair_probability_from_ensemble(
+                    contract, local_state, state, ens,
+                    now_utc=now_utc, regime=regime_reading.regime.value,
+                    config=config,
+                )
+                if ens_result is not None:
+                    fair_lo, fair_hi = ens_result
+                    ensemble_used = True
+
+        if fair_lo is None:
+            fair_lo, fair_hi = fair_probability(
+                contract,
+                local_state,
+                state,
+                local_forecast or None,
+                now_utc=now_utc,
+                regime=regime_reading.regime.value,
+                config=config,
+            )
         eval_ = grade(contract, market, state, reason, fair_lo, fair_hi, config=config)
+        if ensemble_used:
+            eval_.notes.append("fair_prob: open-meteo ensemble")
         if not local_state.cli_matches_market_date:
             eval_.notes.append("no matching CLI yet (preliminary obs only)")
         if settlement.provenance is SettlementProvenance.REGISTRY:
@@ -1783,6 +1826,14 @@ def replay(store_path: str, snapshot_id: int) -> None:
                    "Kalshi quote and use that ask instead of the stored "
                    "snapshot's. Catches stale-snapshot drift on books "
                    "that moved since the last scan.")
+@click.option("--use-ensemble", is_flag=True,
+              help="Use Open-Meteo's free ensemble forecast to compute "
+                   "fair_prob by counting members above/below the bracket, "
+                   "instead of the NWS-only Gaussian-band model. The "
+                   "settlement source is unchanged (still the primary "
+                   "station's CLI). On any ensemble failure or thin "
+                   "response, the engine silently falls back to the "
+                   "NWS-only path.")
 def serve(store_path: str, interval: int, min_grade: str,
           notify_specs: tuple[str, ...], notify_min_grade: str,
           config_path: Optional[str], once: bool,
@@ -1792,7 +1843,8 @@ def serve(store_path: str, interval: int, min_grade: str,
           max_position_cost: int, max_daily_loss: int,
           max_concentration_per_event: int, min_edge_cents_opt: int,
           rounding_buffer: float, kill_file: Optional[str],
-          audit_log: Optional[str], refresh_quote: bool) -> None:
+          audit_log: Optional[str], refresh_quote: bool,
+          use_ensemble: bool) -> None:
     """Run the universe scanner on a loop.
 
     Equivalent to running `scan --store ... --notify ...` in a `while sleep`
@@ -1816,6 +1868,13 @@ def serve(store_path: str, interval: int, min_grade: str,
         raise click.BadParameter(f"min-grade must be one of {grade_order}")
     cutoff = grade_order.index(min_grade)
     ranker_config = RankerConfig.load_json(config_path) if config_path else None
+    # --use-ensemble is a CLI-level override on top of any config.use_ensemble
+    # already set in the loaded JSON. Synthesize a default-config if no
+    # config was loaded so the flag still takes effect.
+    if use_ensemble:
+        if ranker_config is None:
+            ranker_config = RankerConfig.default()
+        ranker_config.use_ensemble = True
 
     stop = {"flag": False}
     def _handle_signal(signum, _frame):
@@ -1859,6 +1918,8 @@ def serve(store_path: str, interval: int, min_grade: str,
             f"rounding_buffer={rounding_buffer}°F "
             f"kill_file={kill_path}"
         )
+    if ranker_config and ranker_config.use_ensemble:
+        log.info("ensemble fair_prob enabled (open-meteo); NWS-only fallback on failure")
 
     iteration = 0
     while not stop["flag"]:
@@ -1868,12 +1929,20 @@ def serve(store_path: str, interval: int, min_grade: str,
         try:
             sink_map: dict[str, dict] = {}
             persistable: list[ContractEvaluation] = []
-            with KalshiClient() as kclient, NwsClient() as nclient:
+            # Fresh ensemble client per-iteration so its per-(lat, lon)
+            # cache reflects only the current scan — we want a new ensemble
+            # fetch on each iteration, just not duplicate calls across markets
+            # that share a station within the same iteration.
+            from contextlib import nullcontext
+            _use_ens = bool(ranker_config and ranker_config.use_ensemble)
+            _om_ctx = OpenMeteoClient() if _use_ens else nullcontext()
+            with KalshiClient() as kclient, NwsClient() as nclient, _om_ctx as om:
                 for event in iter_temperature_events(kclient):
                     evals = _evaluate_event(
                         nclient, event,
                         station_state_sink=sink_map,
                         config=ranker_config,
+                        om_client=om if _use_ens else None,
                     )
                     if not evals:
                         continue
