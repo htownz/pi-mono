@@ -280,6 +280,142 @@ def test_risk_guard_rejects_event_concentration(store, tmp_path):
     assert "concentration" in decision.reason
 
 
+# -- Total-deployment cap (portfolio backstop) -------------------------------
+
+def test_total_deployment_cap_allows_under_limit(store, tmp_path):
+    """With a $5 portfolio cap and $2 already open across other events, a
+    new $0.89 order is under the $5 total and allowed."""
+    g = _guard(store, tmp_path,
+               max_total_deployment_cents=500,
+               max_concentration_per_event_cents=10000,
+               max_position_size_contracts=100, max_position_cost_cents=10000)
+    store.add_position(
+        market_ticker="KXHIGHMIA-26JUN02-B90.5", event_ticker="KXHIGHMIA-26JUN02",
+        side="no", size_contracts=2, avg_price_cents=99,  # $1.98 elsewhere
+    )
+    decision = g.can_place(_snap(), side="no", price_cents=89, size_contracts=1)
+    # 198c open + 89c new = 287c < 500c cap → allowed.
+    assert decision.allowed is True, decision.reason
+
+
+def test_total_deployment_cap_blocks_over_limit_across_events(store, tmp_path):
+    """The per-event cap is generous, but cumulative open cost across MANY
+    different events exceeds the portfolio cap → refuse. This is the exact
+    failure mode that let the bot deploy ~$93 across 258 positions."""
+    g = _guard(store, tmp_path,
+               max_total_deployment_cents=400,           # $4 total
+               max_concentration_per_event_cents=10000,  # per-event not binding
+               max_position_size_contracts=100, max_position_cost_cents=10000)
+    # Four different events, 99c each = 396c already deployed.
+    for i in range(4):
+        store.add_position(
+            market_ticker=f"KXHIGHMIA-26JUN0{i}-B90.5",
+            event_ticker=f"KXHIGHMIA-26JUN0{i}",
+            side="no", size_contracts=1, avg_price_cents=99,
+        )
+    decision = g.can_place(_snap(), side="no", price_cents=89, size_contracts=1)
+    # 396c open + 89c new = 485c > 400c cap → refuse.
+    assert decision.allowed is False
+    assert "total deployment" in decision.reason
+
+
+def test_total_deployment_cap_zero_means_unlimited(store, tmp_path):
+    """Default 0 disables the cap — backward compatible with all prior runs."""
+    g = _guard(store, tmp_path,
+               max_total_deployment_cents=0,
+               max_concentration_per_event_cents=10000,
+               max_position_size_contracts=100, max_position_cost_cents=10000)
+    for i in range(10):
+        store.add_position(
+            market_ticker=f"KXHIGHMIA-26JUN0{i}-B90.5",
+            event_ticker=f"KXHIGHMIA-26JUN0{i}",
+            side="no", size_contracts=1, avg_price_cents=99,
+        )
+    decision = g.can_place(_snap(), side="no", price_cents=89, size_contracts=1)
+    assert decision.allowed is True, decision.reason
+
+
+# -- MEX guard (guaranteed-loss avoidance) -----------------------------------
+
+def test_mex_guard_blocks_yes_on_sibling_bracket(store, tmp_path):
+    """Holding YES on one bracket of an event, a YES buy on a DIFFERENT
+    bracket of the same event is refused — only one bracket settles YES."""
+    g = _guard(store, tmp_path,
+               max_concentration_per_event_cents=10000,
+               max_position_size_contracts=100, max_position_cost_cents=10000)
+    store.add_position(
+        market_ticker="KXHIGHNY-26JUN02-B70.5", event_ticker="KXHIGHNY-26JUN02",
+        side="yes", size_contracts=1, avg_price_cents=20,
+    )
+    snap = _snap(
+        ticker="KXHIGHNY-26JUN02-B72.5", event="KXHIGHNY-26JUN02",
+        state="forecast_dependent", bracket_kind="between",
+        bracket_lo=72.0, bracket_hi=72.5,
+        running_min=None, running_max=None,
+        fair_lo=0.50, fair_hi=0.70, edge_yes=0.30,
+    )
+    decision = g.can_place(snap, side="yes", price_cents=30, size_contracts=1)
+    assert decision.allowed is False
+    assert "MEX guard" in decision.reason
+
+
+def test_mex_guard_allows_no_on_sibling_bracket(store, tmp_path):
+    """NO-side stacking across brackets is fine — many brackets settle NO.
+    The guard must NOT block a NO buy even when a sibling NO is held."""
+    g = _guard(store, tmp_path,
+               max_concentration_per_event_cents=10000,
+               max_position_size_contracts=100, max_position_cost_cents=10000)
+    store.add_position(
+        market_ticker="KXLOWTDC-26MAY30-T63", event_ticker="KXLOWTDC-26MAY30",
+        side="no", size_contracts=1, avg_price_cents=80,
+    )
+    # _snap() is the same event, a different bracket, NO side.
+    decision = g.can_place(_snap(), side="no", price_cents=89, size_contracts=1)
+    assert decision.allowed is True, decision.reason
+
+
+def test_mex_guard_allows_yes_on_unrelated_event(store, tmp_path):
+    """A YES position on event A doesn't block a YES on event B."""
+    g = _guard(store, tmp_path,
+               max_concentration_per_event_cents=10000,
+               max_position_size_contracts=100, max_position_cost_cents=10000)
+    store.add_position(
+        market_ticker="KXHIGHNY-26JUN02-B70.5", event_ticker="KXHIGHNY-26JUN02",
+        side="yes", size_contracts=1, avg_price_cents=20,
+    )
+    snap = _snap(
+        ticker="KXHIGHMIA-26JUN02-B90.5", event="KXHIGHMIA-26JUN02",
+        state="forecast_dependent", bracket_kind="between",
+        bracket_lo=90.0, bracket_hi=90.5,
+        running_min=None, running_max=None,
+        fair_lo=0.50, fair_hi=0.70, edge_yes=0.30,
+    )
+    decision = g.can_place(snap, side="yes", price_cents=30, size_contracts=1)
+    assert decision.allowed is True, decision.reason
+
+
+def test_mex_guard_can_be_disabled(store, tmp_path):
+    """--no-mex-guard (mex_guard_yes_siblings=False) lets the YES sibling
+    through, for operators who deliberately want bracket spreads."""
+    g = _guard(store, tmp_path,
+               mex_guard_yes_siblings=False,
+               max_concentration_per_event_cents=10000,
+               max_position_size_contracts=100, max_position_cost_cents=10000)
+    store.add_position(
+        market_ticker="KXHIGHNY-26JUN02-B70.5", event_ticker="KXHIGHNY-26JUN02",
+        side="yes", size_contracts=1, avg_price_cents=20,
+    )
+    snap = _snap(
+        ticker="KXHIGHNY-26JUN02-B72.5", event="KXHIGHNY-26JUN02",
+        state="forecast_dependent", bracket_kind="between",
+        bracket_lo=72.0, bracket_hi=72.5,
+        running_min=None, running_max=None,
+        fair_lo=0.50, fair_hi=0.70, edge_yes=0.30,
+    )
+    decision = g.can_place(snap, side="yes", price_cents=30, size_contracts=1)
+    assert decision.allowed is True, decision.reason
+
+
 def test_risk_guard_kills_after_daily_loss_threshold(store, tmp_path):
     g = _guard(store, tmp_path, max_daily_loss_cents=100)
     # Close a position with a -150c realized P&L, today.
