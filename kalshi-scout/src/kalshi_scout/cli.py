@@ -1808,6 +1808,18 @@ def replay(store_path: str, snapshot_id: int) -> None:
 @click.option("--max-concentration-per-event", type=int, default=2500,
               help="Hard cap on cumulative open cost per event_ticker. "
                    "Default 2500c ($25).")
+@click.option("--max-total-deployment", type=int, default=0,
+              help="Portfolio-level cap on TOTAL open cost basis across all "
+                   "positions, in cents. The per-event cap can't bound this "
+                   "when the eligible universe is broad (many cities x metrics "
+                   "x brackets x days), so set this to a fraction of bankroll "
+                   "(e.g. 4000 = $40) as a backstop. Default 0 = unlimited.")
+@click.option("--no-mex-guard", is_flag=True,
+              help="Disable the mutually-exclusive-bracket guard. By default "
+                   "the bot refuses a YES buy when it already holds YES on a "
+                   "sibling bracket of the same event (only one bracket can "
+                   "settle YES, so the second is a guaranteed loss). NO-side "
+                   "stacking is always allowed.")
 @click.option("--min-edge", "min_edge_cents_opt", type=int, default=5,
               help="Refuse orders whose snapshot edge is below this. Default 5c.")
 @click.option("--rounding-buffer", type=float, default=0.5,
@@ -1873,7 +1885,9 @@ def serve(store_path: str, interval: int, min_grade: str,
           api_key_path: Optional[str], paper: bool,
           default_size: int, max_position_size: int,
           max_position_cost: int, max_daily_loss: int,
-          max_concentration_per_event: int, min_edge_cents_opt: int,
+          max_concentration_per_event: int,
+          max_total_deployment: int, no_mex_guard: bool,
+          min_edge_cents_opt: int,
           rounding_buffer: float, kill_file: Optional[str],
           audit_log: Optional[str], refresh_quote: bool,
           use_ensemble: bool,
@@ -1930,6 +1944,8 @@ def serve(store_path: str, interval: int, min_grade: str,
         max_concentration_per_event_cents=max_concentration_per_event,
         min_edge_cents=min_edge_cents_opt,
         rounding_risk_buffer_f=rounding_buffer,
+        max_total_deployment_cents=max_total_deployment,
+        mex_guard_yes_siblings=not no_mex_guard,
     )
     store_dir = Path(store_path).resolve().parent
     kill_path = Path(kill_file) if kill_file else store_dir / "scout.kill"
@@ -1955,6 +1971,10 @@ def serve(store_path: str, interval: int, min_grade: str,
             f"max_daily_loss=${max_daily_loss / 100:.2f} "
             f"min_edge={min_edge_cents_opt}c "
             f"rounding_buffer={rounding_buffer}°F "
+            f"max_total_deployment="
+            + (f"${max_total_deployment / 100:.2f}" if max_total_deployment > 0 else "unlimited")
+            + " "
+            f"mex_guard={'off' if no_mex_guard else 'on'} "
             f"kill_file={kill_path}"
         )
     if ranker_config and ranker_config.use_ensemble:

@@ -252,6 +252,20 @@ class RiskLimits:
     #: to whole degrees, so an observation right at the boundary can flip
     #: the outcome under standard rounding.
     rounding_risk_buffer_f: float = 0.5
+    #: Hard cap on TOTAL cost basis across ALL open positions, in cents.
+    #: The per-event cap limits any single event, but with a broad eligible
+    #: universe (many cities × metrics × brackets × multiple days) the bot
+    #: can deploy most of a bankroll while every individual order stays
+    #: under the per-order and per-event caps. This is the portfolio-level
+    #: backstop. 0 = unlimited (backward-compatible default); set it to a
+    #: fraction of bankroll (e.g. 40%) in production.
+    max_total_deployment_cents: int = 0
+    #: Refuse a YES buy when we already hold YES on a DIFFERENT bracket of
+    #: the same event. Kalshi temperature brackets are mutually exclusive
+    #: (the day's extremum lands in exactly one), so holding YES on two
+    #: brackets of one event guarantees at least one loses. NO-side stacking
+    #: is fine (many brackets can all settle NO) and is unaffected.
+    mex_guard_yes_siblings: bool = True
 
 
 @dataclass(frozen=True)
@@ -301,6 +315,28 @@ class RiskGuard:
             if p.event_ticker == event_ticker:
                 total += p.cost_basis_cents
         return total
+
+    def _total_open_cost_cents(self) -> int:
+        """Sum of cost_basis_cents across ALL currently-open positions —
+        used for the portfolio-level deployment cap."""
+        return sum(
+            p.cost_basis_cents for p in self.store.query_positions(open_only=True)
+        )
+
+    def _holds_side_on_sibling_bracket(
+        self, event_ticker: str, market_ticker: str, side: str,
+    ) -> bool:
+        """True if an open position holds `side` on a DIFFERENT bracket
+        (market_ticker) of the same event. Used by the MEX guard to block
+        guaranteed-loss YES stacking across mutually-exclusive brackets."""
+        for p in self.store.query_positions(open_only=True):
+            if (
+                p.event_ticker == event_ticker
+                and p.market_ticker != market_ticker
+                and p.side == side
+            ):
+                return True
+        return False
 
     def _rounding_risk(self, snap: SnapshotRow) -> Optional[str]:
         """For dead_no / locked_yes, check the observed extremum's distance
@@ -394,6 +430,38 @@ class RiskGuard:
                 f"(existing {existing}c + this {cost}c) > "
                 f"max_concentration_per_event_cents "
                 f"{self.limits.max_concentration_per_event_cents}",
+            )
+
+        # Portfolio-level deployment cap (0 = unlimited). This is the
+        # backstop that the per-event cap can't provide: it bounds total
+        # capital at risk across the whole open book, not just one event.
+        if self.limits.max_total_deployment_cents > 0:
+            total_open = self._total_open_cost_cents()
+            if total_open + cost > self.limits.max_total_deployment_cents:
+                return RiskDecision(
+                    False,
+                    f"total deployment {total_open + cost}c "
+                    f"(open {total_open}c + this {cost}c) > "
+                    f"max_total_deployment_cents "
+                    f"{self.limits.max_total_deployment_cents}",
+                )
+
+        # MEX guard: refuse YES on a bracket when we already hold YES on a
+        # sibling bracket of the same event. Only one bracket can settle YES,
+        # so the second YES is a guaranteed loss. NO-side stacking is allowed
+        # (many brackets settle NO) — the guard is YES-only by design.
+        if (
+            self.limits.mex_guard_yes_siblings
+            and side == "yes"
+            and self._holds_side_on_sibling_bracket(
+                snap.event_ticker, snap.market_ticker, "yes"
+            )
+        ):
+            return RiskDecision(
+                False,
+                f"MEX guard: already hold YES on a sibling bracket of "
+                f"{snap.event_ticker}; only one bracket can settle YES "
+                f"(guaranteed-loss avoidance)",
             )
 
         today_loss = self._today_realized_loss_cents()
