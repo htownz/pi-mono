@@ -155,8 +155,48 @@ class KalshiTradingClient:
             method, url, headers=headers,
             json=json_body if json_body is not None else None,
         )
-        resp.raise_for_status()
+        if resp.is_error:
+            # Kalshi puts the actual rejection reason in the response BODY
+            # (e.g. {"error":{"code":"market_not_active",...}}). The default
+            # raise_for_status() discards it, leaving a useless bare
+            # "400 Bad Request" in the audit log. Surface the body so a
+            # failed order says WHY. Keep the exception type as
+            # httpx.HTTPStatusError so existing `except` handlers are
+            # unaffected.
+            detail = self._error_detail(resp)
+            raise httpx.HTTPStatusError(
+                f"{resp.status_code} {resp.reason_phrase} for {path}: {detail}",
+                request=resp.request,
+                response=resp,
+            )
         return resp.json() if resp.content else {}
+
+    @staticmethod
+    def _error_detail(resp: httpx.Response) -> str:
+        """Extract the most useful human string from an error response body.
+
+        Handles the common Kalshi shapes — {"error": {"code","message"}},
+        top-level {"code"/"message"}, plain text — and falls back to a
+        truncated raw body. Never raises; returns a placeholder if the body
+        is empty or unparseable."""
+        try:
+            data = resp.json()
+        except Exception:
+            text = (resp.text or "").strip()
+            return text[:300] if text else "(empty body)"
+        if isinstance(data, dict):
+            for container in (data.get("error"), data):
+                if not isinstance(container, dict):
+                    continue
+                code = container.get("code") or container.get("error_code")
+                msg = container.get("message") or container.get("detail")
+                parts = [str(p) for p in (code, msg) if p]
+                if parts:
+                    return " — ".join(parts)
+        try:
+            return json.dumps(data)[:300]
+        except Exception:
+            return "(unparseable body)"
 
     def place_order(
         self,

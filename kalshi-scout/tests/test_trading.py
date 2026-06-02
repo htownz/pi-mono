@@ -190,6 +190,51 @@ def test_place_order_body_uses_correct_price_field_for_side(keypair):
         client.close()
 
 
+def test_api_error_surfaces_kalshi_error_body(keypair):
+    """A 400 with a Kalshi error body must raise an HTTPStatusError whose
+    message includes the body detail — not a bare '400 Bad Request'. This is
+    what turns 'API error: 400' in the audit log into something diagnosable."""
+    import httpx
+    import pytest
+    _, pem = keypair
+    with respx.mock(base_url=KALSHI_API_BASE) as mock:
+        mock.post("/portfolio/orders").respond(
+            400, json={"error": {"code": "market_not_active",
+                                  "message": "market is not accepting orders"}},
+        )
+        client = KalshiTradingClient(key_id="kid", private_key_path=pem)
+        with pytest.raises(httpx.HTTPStatusError) as excinfo:
+            client.place_order(ticker="K", action="buy", side="no",
+                               count=1, price_cents=50)
+        client.close()
+    msg = str(excinfo.value)
+    assert "400" in msg
+    assert "market_not_active" in msg
+    assert "market is not accepting orders" in msg
+
+
+def test_api_error_detail_handles_plain_text_and_empty_bodies(keypair):
+    """The detail extractor degrades gracefully: plain-text body is passed
+    through; an empty body yields a placeholder rather than crashing."""
+    import httpx
+    _, pem = keypair
+    client = KalshiTradingClient(key_id="kid", private_key_path=pem)
+
+    text_resp = httpx.Response(403, text="invalid signature",
+                               request=httpx.Request("POST", "http://x"))
+    assert "invalid signature" in client._error_detail(text_resp)
+
+    empty_resp = httpx.Response(500, content=b"",
+                                request=httpx.Request("POST", "http://x"))
+    assert client._error_detail(empty_resp) == "(empty body)"
+
+    # Top-level message (no nested "error") is also extracted.
+    flat_resp = httpx.Response(400, json={"message": "price out of range"},
+                               request=httpx.Request("POST", "http://x"))
+    assert "price out of range" in client._error_detail(flat_resp)
+    client.close()
+
+
 def test_place_order_validates_inputs(keypair):
     _, pem = keypair
     client = KalshiTradingClient(key_id="kid", private_key_path=pem)
