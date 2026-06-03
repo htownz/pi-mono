@@ -1,4 +1,4 @@
-# pmscan — Polymarket sum-to-one scanner (Phase 0 + 1 + 1b)
+# pmscan — Polymarket sum-to-one scanner (Phase 0 + 1 + 1b + 1c)
 
 Read-only Polymarket **scanner**: detection and logging only. It never authenticates, signs,
 holds a wallet, or places an order. It is the Polymarket half of a planned unified
@@ -36,8 +36,9 @@ cross-bracket arbitrage math is the direct analogue of the NegRisk detector here
 python scan.py --once                                  # binary, top 800 markets by 24h volume
 python scan.py --once --max-markets 1500 --min-edge 1.0 --out opportunities.jsonl
 python scan.py --negrisk --once                        # NegRisk, COMPLETE events via /events (default)
-python scan.py --negrisk --interval 30 --out neg.jsonl # watch loop (persistence measurement)
-python test_scanner.py                                 # synthetic self-tests (14, all passing)
+python scan.py --negrisk --interval 30 --out neg.jsonl --snapshot snap.jsonl  # watch + baseline log
+python -m pmscan.temporal snap.jsonl --summary         # detect transient dips over the snapshot log
+python test_scanner.py                                 # synthetic self-tests (20, all passing)
 ```
 
 No install needed — standard library only, Python 3.10+.
@@ -105,8 +106,26 @@ construction. So:
   qualify, which is the honest ceiling for a static check.)
 - **The real discriminator is time.** A structural/phantom edge sits at a *stable* depressed
   `ask_sum` indefinitely; a real arb is a *brief dip* below the event's own rolling baseline.
-  That is what the persistence loop (and the planned temporal detector) is for — it is the
-  actual edge detector, not just a measuring tape.
+  That is what the temporal detector below is for — it is the actual edge detector, not just a
+  measuring tape.
+
+## Phase 1c — temporal dislocation detector (`pmscan/temporal.py`)
+
+Since a snapshot can't separate edge from missing-mass, we watch each event over **time**:
+
+1. `scan.py --snapshot snap.jsonl` logs **every** event's basket level each cycle —
+   *crossing or not*, `ask_sum` ≥ $1 included. (The crossing log `--out` can't feed this: it
+   only records sub-$1 events, so it never captures the *normal* level a dip is measured against.)
+2. `python -m pmscan.temporal snap.jsonl` builds a robust per-event baseline (median / MAD,
+   so a real dip doesn't inflate its own benchmark) and flags **dips**: contiguous runs where
+   `ask_sum` falls a robust z-score (`-k`, default 4) below baseline.
+3. Each dip reports **depth** (how much cheaper than normal the basket got) and **duration**
+   (cycles below baseline × poll interval = the lifetime a non-latency trader had to act).
+
+A flat structural event shows `dip ≈ 0` and is ignored; a transient drop-and-recover is
+surfaced, deepest first. **Duration is the go/no-go**: a dip that survives only one cycle is a
+latency race we lose; one that persists for minutes is potentially capturable. Run the snapshot
+log for hours, then let the detector tell you whether any real dislocation persists at all.
 
 ## Live finding (Phase 1, first run, ~1,500 highest-volume markets)
 
@@ -145,12 +164,13 @@ The honest read from Phase 1 is that latency-flat binary markets are competed ou
 is in three places, in order of effort:
 
 1. **NegRisk basket dislocations (this phase).** Multi-outcome events re-price unevenly during
-   news; the buy-all-YES basket transiently dips below $1 before bots rebalance. As shown above,
-   a snapshot can't tell that transient dip from structural missing-mass — so the next build is a
-   **temporal detector**: track each event's `ask_sum` over the `--interval` loop and flag a dip
-   below its own rolling baseline (a relative dislocation), not an absolute `< $1` test. The
-   loop defaults to `--min-sets 5 --min-edge 1.0` so 0-size / sub-cent noise stays out of the
-   log. That persistence/relative signal, not a single frame, is the real go/no-go for capital.
+   news; the buy-all-YES basket transiently dips below $1 before bots rebalance. A snapshot
+   can't tell that transient dip from structural missing-mass, so this is now handled by the
+   **temporal detector** (Phase 1c above): `--snapshot` logs every event's `ask_sum` each cycle
+   and `pmscan.temporal` flags dips below each event's rolling baseline — a *relative*
+   dislocation, not an absolute `< $1` test. The crossing loop also defaults to
+   `--min-sets 5 --min-edge 1.0` so 0-size / sub-cent noise stays out of the `--out` log. The
+   dip's *duration*, not a single frame, is the real go/no-go for capital.
 2. **The convert/sell side** (flagged, not built). The on-chain NegRisk adapter
    `convertPositions` lets a holder of "NO on every outcome" redeem $1, opening the
    complementary `Σ bid(YES_i) > $1` short-the-basket edge. Detection-safe to *model*;
@@ -166,13 +186,14 @@ is in three places, in order of effort:
 ```
 polymarket-scout/
   scan.py              # CLI entry (detection + logging only): binary + --negrisk paths
-  test_scanner.py      # synthetic self-tests (4 binary + 10 NegRisk)
+  test_scanner.py      # synthetic self-tests (4 binary + 12 NegRisk + 4 temporal)
   requirements.txt     # (stdlib only)
   pmscan/
     __init__.py        # package exports
-    models.py          # Market / OrderBook / Opportunity / NegRiskEvent / NegRiskOpportunity
+    models.py          # Market / OrderBook / Opportunity / NegRiskEvent / -Opportunity / -Snapshot
     client.py          # Gamma + CLOB read-only clients, parse_market, parse_event (/events)
-    scanner.py         # scan_market (Phase 1) + group_negrisk / scan_negrisk (Phase 1b)
+    scanner.py         # scan_market (1) + group_negrisk / scan_negrisk / negrisk_snapshot (1b)
+    temporal.py        # rolling-baseline dip detector over the snapshot log          (Phase 1c)
 ```
 
 ## Boundaries (by design)

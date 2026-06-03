@@ -133,6 +133,28 @@ class NegRiskEvent:
 
 
 @dataclass
+class NegRiskSnapshot:
+    """One timestamped basket reading for a NegRisk event — crossing or not.
+
+    Unlike NegRiskOpportunity (emitted only when ask_sum < $1), a snapshot is recorded every
+    cycle regardless of crossing, so the temporal detector has the event's *baseline* ask_sum
+    to measure dips against. A structural/phantom event sits flat here; a real dislocation is
+    a transient drop below its own baseline.
+    """
+    ts: str
+    request_id: str
+    title: str
+    legs: int
+    ask_sum: float
+    bid_sum: float
+    implied_mass: float
+    has_other: bool
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self), separators=(",", ":"))
+
+
+@dataclass
 class NegRiskOpportunity:
     """A detected cross-outcome NegRisk mispricing (buy-all-YES). DETECTION ONLY.
 

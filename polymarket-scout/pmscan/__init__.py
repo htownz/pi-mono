@@ -4,13 +4,15 @@ from .models import (
     Market,
     NegRiskEvent,
     NegRiskOpportunity,
+    NegRiskSnapshot,
     OrderBook,
     Opportunity,
 )
 from .client import ClobClient, GammaClient, parse_event, parse_market
-from .scanner import group_negrisk, scan_market, scan_negrisk
+from .scanner import group_negrisk, negrisk_snapshot, scan_market, scan_negrisk
+from .temporal import Dip, detect_dips, load_snapshots
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "BookLevel",
@@ -19,6 +21,7 @@ __all__ = [
     "Opportunity",
     "NegRiskEvent",
     "NegRiskOpportunity",
+    "NegRiskSnapshot",
     "GammaClient",
     "ClobClient",
     "parse_market",
@@ -26,4 +29,8 @@ __all__ = [
     "scan_market",
     "group_negrisk",
     "scan_negrisk",
+    "negrisk_snapshot",
+    "detect_dips",
+    "load_snapshots",
+    "Dip",
 ]

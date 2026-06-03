@@ -14,7 +14,7 @@ import time
 
 from pmscan.client import ClobClient, GammaClient, parse_event, parse_market
 from pmscan.models import Market, NegRiskEvent
-from pmscan.scanner import group_negrisk, scan_market, scan_negrisk
+from pmscan.scanner import group_negrisk, negrisk_snapshot, scan_market, scan_negrisk
 
 
 def _discover(max_markets: int, min_volume: float) -> list[Market]:
@@ -93,6 +93,12 @@ def run_negrisk(args) -> int:
     yes_tokens = [t for ev in events for m in ev.outcomes if (t := m.yes_token())]
     books = ClobClient().get_books(yes_tokens)
 
+    # Snapshot every event's basket level (crossing or not) — the temporal baseline feed.
+    if args.snapshot:
+        snaps = [s.to_json() for ev in events if (s := negrisk_snapshot(ev, books)) is not None]
+        if snaps:
+            _log("\n".join(snaps), args.snapshot)
+
     hits = 0
     skipped_incomplete = 0
     for ev in events:
@@ -141,6 +147,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--fee", type=float, default=0.0, help="per-share per-leg fee (USD).")
     p.add_argument("--gas", type=float, default=0.01, help="round-trip gas (USD).")
     p.add_argument("--out", type=str, default=None, help="append matched opportunities as JSONL.")
+    p.add_argument("--snapshot", type=str, default=None,
+                   help="NegRisk: append every event's basket level (crossing or not) as JSONL "
+                        "— the baseline feed for pmscan.temporal dip detection.")
     args = p.parse_args(argv)
 
     # Loop (persistence) mode defaults to noise filters so 0-set / sub-cent crossings don't
