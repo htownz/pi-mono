@@ -6,6 +6,9 @@ Or via pytest:                pytest test_scanner.py
 """
 from __future__ import annotations
 
+import json
+
+from pmscan.client import parse_event
 from pmscan.models import BookLevel, Market, NegRiskEvent, OrderBook
 from pmscan.scanner import group_negrisk, scan_market, scan_negrisk
 
@@ -180,6 +183,66 @@ def test_negrisk_incomplete_legs_refused():
         # "C" intentionally absent
     ])
     assert scan_negrisk(ev, books) is None
+
+
+def test_negrisk_truncated_fragment_flagged_uncertain():
+    # Reproduces the live artifact: a big event (e.g. "Brazil Presidential Election")
+    # truncated to its 2 longshot legs. YES asks ≈ 0 → a 99.6c "edge" that is NOT real.
+    # The mass floor MUST quarantine it — a near-zero mass can never read as verified.
+    outs = [_outcome(t, t + "?") for t in ("A", "B")]
+    ev = NegRiskEvent(request_id="EVT", outcomes=outs, title="Brazil Presidential Election")
+    books = _four_outcome_books([
+        ("A", 0.002, 715903, 0.001),
+        ("B", 0.002, 800000, 0.001),
+    ])
+    opp = scan_negrisk(ev, books, gas_usd=0.0)
+    assert opp is not None, "a crossing IS present — we report it, but flagged"
+    assert opp.legs == 2
+    assert opp.edge_cents > 99.0
+    assert opp.exhaustive_verified is False, "near-zero-mass fragment must never verify"
+    assert "not exhaustive" in opp.uncertainty_reason
+
+
+# --------------------------------------------------------------------------- #
+# Phase 1b — complete-event grouping from /events records
+# --------------------------------------------------------------------------- #
+def _raw_child(cond: str, *, yes_tok: str, neg_other=False, vol=1000.0) -> dict:
+    """A Gamma child-market dict as it appears nested under an /events record."""
+    return {
+        "conditionId": cond, "question": f"{cond}?", "slug": cond,
+        "enableOrderBook": True, "active": True, "closed": False, "acceptingOrders": True,
+        "clobTokenIds": json.dumps([yes_tok, yes_tok + "_no"]),
+        "outcomes": json.dumps(["Yes", "No"]),
+        "negRisk": True, "negRiskOther": neg_other, "volume24hr": vol,
+        "orderPriceMinTickSize": 0.01,
+    }
+
+
+def test_parse_event_builds_complete_group():
+    raw = {
+        "id": "ev1", "title": "Who wins the election?", "slug": "who-wins", "negRisk": True,
+        "negRiskMarketID": "NRM-1",
+        "markets": [
+            _raw_child("a", yes_tok="A"),
+            _raw_child("b", yes_tok="B"),
+            _raw_child("c", yes_tok="C", neg_other=True),
+            {"active": False, "closed": True},  # a resolved/garbage child → dropped
+        ],
+    }
+    ev = parse_event(raw)
+    assert ev is not None
+    assert ev.n == 3, "three usable outcomes; the closed child is dropped"
+    assert ev.request_id == "NRM-1"
+    assert ev.title == "Who wins the election?"
+    assert ev.has_other is True
+    assert [m.yes_token() for m in ev.outcomes] == ["A", "B", "C"]
+
+
+def test_parse_event_skips_non_negrisk():
+    assert parse_event({"id": "x", "negRisk": False, "markets": []}) is None
+    # NegRisk but only one usable outcome → not a partition → skip.
+    one = {"id": "y", "negRisk": True, "markets": [_raw_child("solo", yes_tok="S")]}
+    assert parse_event(one) is None
 
 
 # --------------------------------------------------------------------------- #

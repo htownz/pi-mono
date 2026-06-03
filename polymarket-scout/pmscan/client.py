@@ -13,7 +13,7 @@ import urllib.request
 import urllib.error
 from typing import Iterator
 
-from .models import BookLevel, Market, OrderBook
+from .models import BookLevel, Market, NegRiskEvent, OrderBook
 
 GAMMA = "https://gamma-api.polymarket.com"
 CLOB = "https://clob.polymarket.com"
@@ -59,6 +59,30 @@ class GammaClient:
                 break
             for m in page:
                 yield m
+            fetched += len(page)
+            offset += len(page)
+            if len(page) < limit:
+                break
+
+    def iter_active_events(self, max_events: int = 1000, page_size: int = 100) -> Iterator[dict]:
+        """Yield raw active, open events with their child markets nested under `markets`.
+
+        This is the authoritative source for NegRisk grouping: an event carries its FULL
+        outcome set, so we never reconstruct a partition from a volume-truncated market
+        sample (which silently drops outcomes and manufactures phantom sub-$1 baskets).
+        Like /markets, /events hard-caps at 100/page; we paginate with `offset`.
+        """
+        offset = 0
+        fetched = 0
+        while fetched < max_events:
+            limit = min(page_size, max_events - fetched)
+            url = (f"{GAMMA}/events?active=true&closed=false&archived=false"
+                   f"&limit={limit}&offset={offset}&order=volume24hr&ascending=false")
+            page = _get_json(url)
+            if not page:
+                break
+            for e in page:
+                yield e
             fetched += len(page)
             offset += len(page)
             if len(page) < limit:
@@ -133,4 +157,37 @@ def parse_market(raw: dict) -> Market | None:
         neg_risk_request_id=(raw.get("negRiskRequestID") or raw.get("negRiskRequestId") or None),
         neg_risk_other=bool(raw.get("negRiskOther", False)),
         group_title=_event_title(raw),
+    )
+
+
+def parse_event(raw: dict) -> NegRiskEvent | None:
+    """Build a complete NegRiskEvent from a Gamma `/events` record and its nested markets.
+
+    Returns None unless the event is NegRisk and resolves to ≥2 usable (active, order-book,
+    binary) outcome markets — i.e. a real mutually-exclusive partition we can price as a
+    basket. Child markets that are closed/disabled drop out via parse_market; we keep the
+    event only if what survives is still a multi-outcome set.
+    """
+    if not raw.get("negRisk"):
+        return None
+    outcomes: list[Market] = []
+    has_other = False
+    for child in (raw.get("markets") or []):
+        if not isinstance(child, dict):
+            continue
+        m = parse_market(child)
+        if m is None:
+            continue
+        outcomes.append(m)
+        has_other = has_other or m.neg_risk_other
+    if len(outcomes) < 2:
+        return None
+    request_id = (raw.get("negRiskMarketID") or raw.get("negRiskRequestID")
+                  or outcomes[0].neg_risk_request_id
+                  or str(raw.get("id") or raw.get("slug") or ""))
+    return NegRiskEvent(
+        request_id=request_id,
+        outcomes=outcomes,
+        title=(raw.get("title") or raw.get("slug")),
+        has_other=has_other,
     )

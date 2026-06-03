@@ -7,10 +7,10 @@ from .models import (
     OrderBook,
     Opportunity,
 )
-from .client import ClobClient, GammaClient, parse_market
+from .client import ClobClient, GammaClient, parse_event, parse_market
 from .scanner import group_negrisk, scan_market, scan_negrisk
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "BookLevel",
@@ -22,6 +22,7 @@ __all__ = [
     "GammaClient",
     "ClobClient",
     "parse_market",
+    "parse_event",
     "scan_market",
     "group_negrisk",
     "scan_negrisk",
