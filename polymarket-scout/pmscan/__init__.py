@@ -11,8 +11,17 @@ from .models import (
 from .client import ClobClient, GammaClient, parse_event, parse_market
 from .scanner import group_negrisk, negrisk_snapshot, scan_market, scan_negrisk
 from .temporal import Dip, detect_dips, load_snapshots
+from .parity import (
+    ParityLink,
+    ParityOpportunity,
+    VenueQuote,
+    kalshi_venue_quote,
+    pm_venue_quote,
+    scan_parity,
+    scan_parity_links,
+)
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 __all__ = [
     "BookLevel",
@@ -33,4 +42,11 @@ __all__ = [
     "detect_dips",
     "load_snapshots",
     "Dip",
+    "VenueQuote",
+    "ParityLink",
+    "ParityOpportunity",
+    "pm_venue_quote",
+    "kalshi_venue_quote",
+    "scan_parity",
+    "scan_parity_links",
 ]

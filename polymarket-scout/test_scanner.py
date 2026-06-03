@@ -12,6 +12,9 @@ from pmscan.client import parse_event
 from pmscan.models import BookLevel, Market, NegRiskEvent, OrderBook
 from pmscan.scanner import group_negrisk, negrisk_snapshot, scan_market, scan_negrisk
 from pmscan.temporal import detect_dips, group_by_event, robust_stats
+from pmscan.parity import (
+    ParityLink, VenueQuote, kalshi_venue_quote, pm_venue_quote, scan_parity, scan_parity_links,
+)
 
 
 def _book(token_id: str, asks=(), bids=()) -> OrderBook:
@@ -356,6 +359,84 @@ def test_temporal_skips_events_with_too_little_history():
     assert detect_dips(_snaps("SHORT", asks)) == []
     # but with min_points lowered it fires
     assert len(detect_dips(_snaps("SHORT", asks), min_points=5)) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Phase 2 (draft) — cross-venue parity
+# --------------------------------------------------------------------------- #
+def _vq(venue, key, **kw):
+    return VenueQuote(venue=venue, market_key=key, label=key, **kw)
+
+
+def test_parity_cross_venue_lock_detected():
+    # PM YES ask 0.55 + Kalshi NO ask 0.40 = 0.95 → 5c locked edge, settlement verified.
+    a = _vq("polymarket", "PM", yes_ask=0.55, no_ask=0.46, yes_ask_size=100, no_ask_size=80)
+    b = _vq("kalshi", "KX", yes_ask=0.58, no_ask=0.40, yes_ask_size=50, no_ask_size=200)
+    opp = scan_parity(ParityLink("Same outcome", a, b, settlement_verified=True))
+    assert opp is not None
+    assert opp.side == "A_yes+B_no"            # 0.55 + 0.40 beats 0.58 + 0.46
+    assert abs(opp.cost_sum - 0.95) < 1e-9
+    assert abs(opp.edge_cents - 5.0) < 1e-6
+    assert opp.capturable_sets == 100          # min(PM yes size 100, Kalshi no size 200)
+    assert opp.settlement_verified is True
+
+
+def test_parity_picks_cheaper_construction():
+    # Make B_yes + A_no the cheaper basket.
+    a = _vq("polymarket", "PM", yes_ask=0.70, no_ask=0.30)
+    b = _vq("kalshi", "KX", yes_ask=0.55, no_ask=0.55)
+    opp = scan_parity(ParityLink("x", a, b, settlement_verified=True))
+    assert opp is not None and opp.side == "B_yes+A_no"  # 0.55 + 0.30 = 0.85
+    assert abs(opp.edge_cents - 15.0) < 1e-6
+
+
+def test_parity_no_edge_when_baskets_at_or_above_par():
+    a = _vq("polymarket", "PM", yes_ask=0.60, no_ask=0.45)
+    b = _vq("kalshi", "KX", yes_ask=0.58, no_ask=0.47)   # cheapest basket = 0.58+0.45 = 1.03
+    assert scan_parity(ParityLink("x", a, b, settlement_verified=True)) is None
+
+
+def test_parity_unverified_settlement_still_emits_but_flagged():
+    a = _vq("polymarket", "PM", yes_ask=0.50, no_ask=0.55)
+    b = _vq("kalshi", "KX", yes_ask=0.55, no_ask=0.45)   # 0.50 + 0.45 = 0.95
+    opp = scan_parity(ParityLink("maybe-same", a, b, settlement_verified=False, note="dates differ?"))
+    assert opp is not None and opp.edge_cents > 0
+    assert opp.settlement_verified is False
+    assert opp.note == "dates differ?"
+
+
+def test_parity_net_after_fees():
+    a = _vq("polymarket", "PM", yes_ask=0.50, no_ask=0.55, yes_ask_size=100)
+    b = _vq("kalshi", "KX", yes_ask=0.55, no_ask=0.45, no_ask_size=100)  # 0.50+0.45=0.95, 5c
+    opp = scan_parity(ParityLink("x", a, b, settlement_verified=True), fee_per_leg=0.01, gas_usd=0.0)
+    # gross = 0.05 * 100 = 5.00; fees = 2 * 0.01 * 100 = 2.00; net = 3.00
+    assert abs(opp.net_profit_usd - 3.00) < 1e-6
+
+
+def test_parity_kalshi_cents_adapter():
+    q = kalshi_venue_quote("KXTICKER", label="Cand X", yes_bid_c=40, yes_ask_c=42,
+                           no_bid_c=58, no_ask_c=60)
+    assert q.venue == "kalshi" and abs(q.yes_ask - 0.42) < 1e-9 and abs(q.no_ask - 0.60) < 1e-9
+
+
+def test_parity_pm_adapter_from_books():
+    m = _binary(yes_token="Y", no_token="N")
+    books = {
+        "Y": _book("Y", asks=[(0.55, 100)], bids=[(0.53, 90)]),
+        "N": _book("N", asks=[(0.46, 80)], bids=[(0.44, 70)]),
+    }
+    q = pm_venue_quote(m, books)
+    assert q is not None and q.venue == "polymarket"
+    assert abs(q.yes_ask - 0.55) < 1e-9 and abs(q.no_ask - 0.46) < 1e-9
+    assert q.yes_ask_size == 100 and q.no_ask_size == 80
+    # end-to-end through scan_parity_links against a Kalshi quote.
+    kb = kalshi_venue_quote("KX", label="same", yes_bid_c=50, yes_ask_c=52, no_bid_c=46, no_ask_c=48)
+    opps = scan_parity_links([ParityLink("same", q, kb, settlement_verified=True)])
+    # A_yes+B_no = 0.55 + 0.48 = 1.03 (≥$1); B_yes+A_no = 0.52 + 0.46 = 0.98 (<$1) → the latter wins.
+    assert len(opps) == 1
+    assert opps[0].side == "B_yes+A_no"
+    assert abs(opps[0].cost_sum - 0.98) < 1e-9
+    assert abs(opps[0].edge_cents - 2.0) < 1e-6
 
 
 # --------------------------------------------------------------------------- #
