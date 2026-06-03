@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, asdict
+from datetime import datetime
 from collections import defaultdict
 
 
@@ -31,10 +32,20 @@ class Dip:
     baseline_ask: float     # event's robust-median ask_sum (its "normal" level)
     min_ask: float          # lowest ask_sum reached during the dip
     depth: float            # baseline_ask - min_ask (transient cheapness vs. normal)
+    below_par: float        # max(0, 1 - min_ask): the actual buy-all-YES edge at the trough
     n_points: int           # consecutive snapshots below threshold (× interval = lifetime)
+    duration_s: float       # end_ts - start_ts in seconds (0 for a single-snapshot dip)
     start_ts: str
     end_ts: str
     robust_sigma: float     # 1.4826 * MAD of the event's ask_sum series
+
+    @property
+    def capturable(self) -> bool:
+        """A real dislocation: the basket is NORMALLY ≥ $1 (no standing edge — efficient &
+        exhaustive) but transiently fell BELOW $1. Excludes illiquid high-baseline baskets
+        (a dip from 2.1→1.7 is still >$1) and structurally-cheap non-exhaustive fragments
+        (baseline << 1, cheap forever — not a dislocation)."""
+        return self.baseline_ask >= 1.0 and self.min_ask < 1.0
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), separators=(",", ":"))
@@ -76,12 +87,20 @@ def robust_stats(xs: list[float]) -> tuple[float, float]:
     return med, 1.4826 * mad
 
 
+def _duration_s(start_ts: str, end_ts: str) -> float:
+    try:
+        return (datetime.fromisoformat(end_ts) - datetime.fromisoformat(start_ts)).total_seconds()
+    except ValueError:
+        return 0.0
+
+
 def detect_dips(
     snaps: list[dict],
     *,
     k: float = 4.0,
     min_points: int = 12,
     min_depth: float = 0.005,
+    capturable_only: bool = True,
 ) -> list[Dip]:
     """Flag transient drops of ask_sum below each event's robust baseline.
 
@@ -90,7 +109,13 @@ def detect_dips(
     Consecutive below-points are merged into one dip episode. Events with fewer than
     `min_points` snapshots are skipped (not enough history for a trustworthy baseline).
 
-    Returns dips sorted by depth, deepest first.
+    When `capturable_only` (default), returns ONLY economically real dislocations — baskets
+    normally priced ≥ $1 that transiently fell below $1 (Dip.capturable). This strips out the
+    two noise classes the raw relative view is dominated by: illiquid high-baseline baskets
+    (a 2.1→1.7 dip is still >$1) and structurally-cheap non-exhaustive fragments (baseline
+    << 1 forever). Set capturable_only=False for the raw relative-dip diagnostic view.
+
+    Returns dips ranked by below-par edge (1 - min_ask), then duration, then depth.
     """
     dips: list[Dip] = []
     for rid, rs in group_by_event(snaps).items():
@@ -110,21 +135,24 @@ def detect_dips(
             while j < len(rs) and asks[j] < threshold:
                 j += 1
             episode = rs[i:j]
-            ep_asks = asks[i:j]
-            mn = min(ep_asks)
-            dips.append(Dip(
+            mn = min(asks[i:j])
+            dip = Dip(
                 request_id=rid,
                 title=title,
                 baseline_ask=round(baseline, 6),
                 min_ask=round(mn, 6),
                 depth=round(baseline - mn, 6),
+                below_par=round(max(0.0, 1.0 - mn), 6),
                 n_points=len(episode),
+                duration_s=_duration_s(episode[0]["ts"], episode[-1]["ts"]),
                 start_ts=episode[0]["ts"],
                 end_ts=episode[-1]["ts"],
                 robust_sigma=round(sigma, 6),
-            ))
+            )
+            if not capturable_only or dip.capturable:
+                dips.append(dip)
             i = j
-    dips.sort(key=lambda d: d.depth, reverse=True)
+    dips.sort(key=lambda d: (d.below_par, d.duration_s, d.depth), reverse=True)
     return dips
 
 
@@ -135,6 +163,11 @@ def summarize(snaps: list[dict]) -> str:
     if snaps:
         ts = [s["ts"] for s in snaps]
         lines.append(f"span: {min(ts)}  ->  {max(ts)}")
+    # Split events by their normal level: only baskets normally ≥ $1 can host a real
+    # (transient) buy-all-YES dislocation; those normally < $1 are structurally cheap.
+    at_par = sum(1 for rs in by.values() if robust_stats([r["ask_sum"] for r in rs])[0] >= 1.0)
+    lines.append(f"normally ≥ $1 (dislocation-eligible): {at_par}   |   "
+                 f"normally < $1 (structurally cheap): {len(by) - at_par}")
     lines.append("")
     lines.append(f"{'event':40} {'pts':>4} {'base_ask':>8} {'min_ask':>8} {'dip':>6} {'maxN':>4}")
     rows = []
@@ -156,6 +189,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("-k", type=float, default=4.0, help="robust z-score threshold for a dip.")
     p.add_argument("--min-points", type=int, default=12, help="min snapshots/event for a baseline.")
     p.add_argument("--min-depth", type=float, default=0.005, help="min ask_sum drop to count (USD).")
+    p.add_argument("--all-dips", action="store_true",
+                   help="raw diagnostic: every relative dip, including high-baseline (>$1) and "
+                        "structurally-cheap (<$1) baskets. Default shows only capturable ones.")
     p.add_argument("--summary", action="store_true", help="print the per-event baseline table.")
     args = p.parse_args(argv)
 
@@ -163,16 +199,19 @@ def main(argv: list[str] | None = None) -> int:
     if args.summary:
         print(summarize(snaps))
         print()
-    dips = detect_dips(snaps, k=args.k, min_points=args.min_points, min_depth=args.min_depth)
+    dips = detect_dips(snaps, k=args.k, min_points=args.min_points, min_depth=args.min_depth,
+                       capturable_only=not args.all_dips)
+    label = "relative dip" if args.all_dips else "CAPTURABLE dislocation (basket ≥$1 → <$1)"
     if not dips:
-        print("no transient dips detected — every crossing event sits flat at its baseline "
-              "(structural missing-mass, not a capturable dislocation).")
+        print(f"no {label}s detected — no event normally priced ≥ $1 transiently fell below it "
+              f"in this log. (That is the honest go/no-go: no capturable edge at this cadence.)")
         return 0
-    print(f"{len(dips)} dip episode(s), deepest first "
-          f"(depth = how far ask_sum fell below the event's normal level):\n")
+    print(f"{len(dips)} {label}(s), best first "
+          f"(edge = $1 - min_ask captured at the trough; pts × poll-interval = lifetime):\n")
     for d in dips:
-        print(f"  depth={d.depth * 100:5.2f}c  base={d.baseline_ask:.3f} -> min={d.min_ask:.3f}  "
-              f"{d.n_points:>3} pts  {d.start_ts}..{d.end_ts}  {d.title[:44]}")
+        print(f"  edge={d.below_par * 100:5.2f}c  base={d.baseline_ask:.3f} -> min={d.min_ask:.3f}  "
+              f"{d.n_points:>3} pts / {d.duration_s:6.0f}s  {d.start_ts[11:19]}..{d.end_ts[11:19]}  "
+              f"{d.title[:40]}")
     return 0
 
 

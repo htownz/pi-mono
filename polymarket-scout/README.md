@@ -38,7 +38,7 @@ python scan.py --once --max-markets 1500 --min-edge 1.0 --out opportunities.json
 python scan.py --negrisk --once                        # NegRisk, COMPLETE events via /events (default)
 python scan.py --negrisk --interval 30 --out neg.jsonl --snapshot snap.jsonl  # watch + baseline log
 python -m pmscan.temporal snap.jsonl --summary         # detect transient dips over the snapshot log
-python test_scanner.py                                 # synthetic self-tests (20, all passing)
+python test_scanner.py                                 # synthetic self-tests (22, all passing)
 ```
 
 No install needed — standard library only, Python 3.10+.
@@ -119,13 +119,27 @@ Since a snapshot can't separate edge from missing-mass, we watch each event over
 2. `python -m pmscan.temporal snap.jsonl` builds a robust per-event baseline (median / MAD,
    so a real dip doesn't inflate its own benchmark) and flags **dips**: contiguous runs where
    `ask_sum` falls a robust z-score (`-k`, default 4) below baseline.
-3. Each dip reports **depth** (how much cheaper than normal the basket got) and **duration**
-   (cycles below baseline × poll interval = the lifetime a non-latency trader had to act).
+3. By default it reports only **capturable dislocations** — baskets normally priced **≥ $1**
+   (no standing edge, i.e. efficient & exhaustive) that **transiently fell below $1**. This is
+   the only economically real signal, and it excludes the two noise classes the raw relative
+   view drowns in:
+   - **illiquid high-baseline baskets** — a many-way futures market normally at `ask_sum` $2–5
+     (wide spreads on every leg); a dip from 2.1→1.7 is still >$1, *not* an edge;
+   - **structurally-cheap fragments** — non-exhaustive sets that sit below $1 *forever*
+     (`Roland Garros` at 0.64); cheap is their normal, not a dislocation.
+   Each dip reports **below-par edge** (`$1 − min_ask`, the actual buy-all-YES profit at the
+   trough) and **duration** (`pts × poll interval`, the lifetime to act). `--all-dips` shows
+   the raw relative view for diagnostics; `--summary` adds the per-event baseline table and the
+   ≥$1 / <$1 split.
 
-A flat structural event shows `dip ≈ 0` and is ignored; a transient drop-and-recover is
-surfaced, deepest first. **Duration is the go/no-go**: a dip that survives only one cycle is a
-latency race we lose; one that persists for minutes is potentially capturable. Run the snapshot
-log for hours, then let the detector tell you whether any real dislocation persists at all.
+**Duration is the go/no-go**: a dip that survives only one cycle is a latency race we lose; one
+that persists for minutes is potentially capturable. Run the snapshot log for hours, then let
+the detector tell you whether any real dislocation persists at all.
+
+> **First live read (~26 min, 469 events):** zero persistent capturable dislocations. The deep
+> "dips" were all illiquid high-baseline baskets (still ≫ $1) or structural fragments; the only
+> sub-$1 crossings were ≤ 2¢ and lasted 1–3 cycles (30–90s) — a latency race. Honest go/no-go
+> so far: no capturable NegRisk edge at 30s cadence. Longer logs may surface news-driven ones.
 
 ## Live finding (Phase 1, first run, ~1,500 highest-volume markets)
 
@@ -186,7 +200,7 @@ is in three places, in order of effort:
 ```
 polymarket-scout/
   scan.py              # CLI entry (detection + logging only): binary + --negrisk paths
-  test_scanner.py      # synthetic self-tests (4 binary + 12 NegRisk + 4 temporal)
+  test_scanner.py      # synthetic self-tests (4 binary + 12 NegRisk + 6 temporal)
   requirements.txt     # (stdlib only)
   pmscan/
     __init__.py        # package exports
