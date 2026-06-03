@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from .models import Market, NegRiskEvent, NegRiskOpportunity, OrderBook, Opportunity
+from .models import Market, NegRiskEvent, NegRiskOpportunity, NegRiskSnapshot, OrderBook, Opportunity
 
 
 def _now() -> str:
@@ -112,6 +112,39 @@ def group_negrisk(markets: list[Market]) -> list[NegRiskEvent]:
         if ev.title is None and m.group_title:
             ev.title = m.group_title
     return list(buckets.values())
+
+
+def negrisk_snapshot(event: NegRiskEvent, books: dict[str, OrderBook]) -> NegRiskSnapshot | None:
+    """One basket reading for a NegRisk event, crossing or not — the temporal baseline feed.
+
+    Returns None only when leg data is incomplete (any outcome's YES ask missing), matching
+    scan_negrisk's refuse-rather-than-under-sum policy. ask_sum here may be ≥ $1 (no edge);
+    that's the point — the detector needs the normal level to spot a dip below it.
+    """
+    if event.n < 2:
+        return None
+    yes_books: list[OrderBook] = []
+    for m in event.outcomes:
+        tid = m.yes_token()
+        bk = books.get(tid) if tid else None
+        if bk is None or bk.best_ask() is None:
+            return None
+        yes_books.append(bk)
+    ask_sum = sum(bk.best_ask().price for bk in yes_books)
+    bids = [bk.best_bid() for bk in yes_books]
+    bid_sum = sum(b.price for b in bids if b is not None)
+    mids = [bk.mid() for bk in yes_books]
+    implied_mass = sum(md for md in mids if md is not None)
+    return NegRiskSnapshot(
+        ts=_now(),
+        request_id=event.request_id,
+        title=event.title or event.request_id,
+        legs=len(yes_books),
+        ask_sum=round(ask_sum, 6),
+        bid_sum=round(bid_sum, 6),
+        implied_mass=round(implied_mass, 6),
+        has_other=event.has_other,
+    )
 
 
 def scan_negrisk(

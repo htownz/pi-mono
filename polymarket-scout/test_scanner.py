@@ -10,7 +10,8 @@ import json
 
 from pmscan.client import parse_event
 from pmscan.models import BookLevel, Market, NegRiskEvent, OrderBook
-from pmscan.scanner import group_negrisk, scan_market, scan_negrisk
+from pmscan.scanner import group_negrisk, negrisk_snapshot, scan_market, scan_negrisk
+from pmscan.temporal import detect_dips, group_by_event, robust_stats
 
 
 def _book(token_id: str, asks=(), bids=()) -> OrderBook:
@@ -267,6 +268,73 @@ def test_parse_event_skips_non_negrisk():
     # NegRisk but only one usable outcome → not a partition → skip.
     one = {"id": "y", "negRisk": True, "markets": [_raw_child("solo", yes_tok="S")]}
     assert parse_event(one) is None
+
+
+# --------------------------------------------------------------------------- #
+# Phase 1b — snapshots (temporal baseline feed)
+# --------------------------------------------------------------------------- #
+def test_negrisk_snapshot_records_noncrossing_basket():
+    # ask_sum ≥ 1 (no edge) must STILL produce a snapshot — baselines need the normal level.
+    outs = [_outcome(t, t + "?") for t in ("A", "B", "C")]
+    ev = NegRiskEvent(request_id="EVT", outcomes=outs, title="Who wins?")
+    books = _four_outcome_books([
+        ("A", 0.40, 100, 0.39),
+        ("B", 0.35, 100, 0.34),
+        ("C", 0.30, 100, 0.29),  # ask_sum = 1.05, no crossing
+    ])
+    snap = negrisk_snapshot(ev, books)
+    assert snap is not None and snap.legs == 3
+    assert abs(snap.ask_sum - 1.05) < 1e-9
+    assert abs(snap.bid_sum - 1.02) < 1e-9
+    assert scan_negrisk(ev, books) is None  # ...while the opportunity scan correctly emits nothing
+
+
+def test_negrisk_snapshot_refuses_incomplete():
+    outs = [_outcome(t, t + "?") for t in ("A", "B")]
+    ev = NegRiskEvent(request_id="EVT", outcomes=outs)
+    books = {"A": _book("A", asks=[(0.5, 100)])}  # "B" missing
+    assert negrisk_snapshot(ev, books) is None
+
+
+# --------------------------------------------------------------------------- #
+# Phase 1c — temporal dislocation detector
+# --------------------------------------------------------------------------- #
+def _snaps(request_id, asks, title="Evt"):
+    return [{"ts": f"2026-06-03T00:{i:02d}:00+00:00", "request_id": request_id, "title": title,
+             "legs": 5, "ask_sum": a, "bid_sum": a - 0.02, "implied_mass": a - 0.01,
+             "has_other": False} for i, a in enumerate(asks)]
+
+
+def test_robust_stats_outlier_resistant():
+    # A few deep dips must NOT drag the baseline down (that's the whole point of median/MAD).
+    med, sigma = robust_stats([0.99] * 18 + [0.90, 0.90])
+    assert abs(med - 0.99) < 1e-9
+
+
+def test_temporal_flat_structural_has_no_dip():
+    # Phantom/structural event: ask_sum sits flat at a depressed level → NOT a dislocation.
+    snaps = _snaps("FLAT", [0.962, 0.961, 0.962, 0.963, 0.961] * 4, title="Presidential 2028")
+    assert detect_dips(snaps) == []
+
+
+def test_temporal_transient_dislocation_detected():
+    # Stable at 0.99, then a 3-cycle drop to 0.95 (recovers) = a real, capturable dip.
+    asks = [0.99] * 10 + [0.95, 0.949, 0.95] + [0.99] * 6
+    dips = detect_dips(_snaps("DISLOC", asks, title="Real Event"))
+    assert len(dips) == 1, dips
+    d = dips[0]
+    assert d.n_points == 3
+    assert abs(d.baseline_ask - 0.99) < 1e-9
+    assert abs(d.min_ask - 0.949) < 1e-9
+    assert d.depth > 0.03
+
+
+def test_temporal_skips_events_with_too_little_history():
+    # 6 points < default min_points (12) → no trustworthy baseline → skip.
+    asks = [0.99, 0.99, 0.95, 0.99, 0.99, 0.99]
+    assert detect_dips(_snaps("SHORT", asks)) == []
+    # but with min_points lowered it fires
+    assert len(detect_dips(_snaps("SHORT", asks), min_points=5)) == 1
 
 
 # --------------------------------------------------------------------------- #
