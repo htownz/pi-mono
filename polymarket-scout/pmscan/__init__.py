@@ -10,7 +10,7 @@ from .models import (
 from .client import ClobClient, GammaClient, parse_event, parse_market
 from .scanner import group_negrisk, scan_market, scan_negrisk
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "BookLevel",
