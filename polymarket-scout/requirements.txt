@@ -1,0 +1,11 @@
+# pmscan Phase 0/1/1b has NO third-party dependencies — standard library only.
+# Requires Python 3.10+ (uses | union types and modern dataclasses).
+#
+# Nothing to install. Run directly:
+#   python scan.py --once            # binary within-market scan
+#   python scan.py --negrisk --once  # NegRisk multi-outcome scan
+#   python test_scanner.py           # synthetic self-tests
+#
+# (A later, separate execution phase — out of scope here — would add:
+#  py-clob-client, web3, requests, and a funded wallet. Not before edges are
+#  proven to persist at our latency via --interval logging.)

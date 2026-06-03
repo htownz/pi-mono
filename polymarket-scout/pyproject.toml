@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "polymarket-scout"
+version = "0.2.0"
+description = "Read-only Polymarket sum-to-one scanner: binary within-market + NegRisk multi-outcome edge detection (detection/logging only, no wallet/orders)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "ben.melson" }]
+# Runtime is standard-library only by design (Phase 0/1/1b). No dependencies.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+pmscan = "scan:main"
+
+[tool.setuptools]
+py-modules = ["scan"]
+
+[tool.setuptools.packages.find]
+include = ["pmscan*"]
+
+[tool.pytest.ini_options]
+testpaths = ["test_scanner.py"]
+addopts = "-q"
