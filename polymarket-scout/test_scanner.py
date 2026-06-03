@@ -318,20 +318,41 @@ def test_temporal_flat_structural_has_no_dip():
 
 
 def test_temporal_transient_dislocation_detected():
-    # Stable at 0.99, then a 3-cycle drop to 0.95 (recovers) = a real, capturable dip.
-    asks = [0.99] * 10 + [0.95, 0.949, 0.95] + [0.99] * 6
+    # Normally ≥ $1 (1.01), then a 3-cycle drop BELOW $1 to 0.969 (recovers) = a real,
+    # capturable dislocation (basket briefly buyable under $1).
+    asks = [1.01] * 10 + [0.97, 0.969, 0.97] + [1.01] * 6
     dips = detect_dips(_snaps("DISLOC", asks, title="Real Event"))
     assert len(dips) == 1, dips
     d = dips[0]
     assert d.n_points == 3
-    assert abs(d.baseline_ask - 0.99) < 1e-9
-    assert abs(d.min_ask - 0.949) < 1e-9
-    assert d.depth > 0.03
+    assert abs(d.baseline_ask - 1.01) < 1e-9
+    assert abs(d.min_ask - 0.969) < 1e-9
+    assert abs(d.below_par - 0.031) < 1e-9   # $1 - 0.969 = the edge at the trough
+    assert d.capturable is True
+    assert d.duration_s > 0
+
+
+def test_temporal_high_baseline_dip_is_not_capturable():
+    # Illiquid basket normally at $2.10 dips to $1.67 — still >$1, NOT an edge. Filtered by
+    # default; visible only with capturable_only=False.
+    asks = [2.10] * 12 + [1.67, 1.68] + [2.10] * 6
+    assert detect_dips(_snaps("HIGH", asks, title="Illiquid Futures")) == []
+    raw = detect_dips(_snaps("HIGH", asks), capturable_only=False)
+    assert len(raw) == 1 and raw[0].capturable is False and raw[0].below_par == 0.0
+
+
+def test_temporal_structurally_cheap_basket_is_not_capturable():
+    # Non-exhaustive fragment sits cheap forever (~0.64) and wobbles — baseline < $1, so it's
+    # not a dislocation even though min_ask < 1. Filtered by default.
+    asks = [0.64] * 12 + [0.55, 0.55] + [0.64] * 6
+    assert detect_dips(_snaps("CHEAP", asks, title="Roland Garros frag")) == []
+    raw = detect_dips(_snaps("CHEAP", asks), capturable_only=False)
+    assert len(raw) == 1 and raw[0].capturable is False
 
 
 def test_temporal_skips_events_with_too_little_history():
     # 6 points < default min_points (12) → no trustworthy baseline → skip.
-    asks = [0.99, 0.99, 0.95, 0.99, 0.99, 0.99]
+    asks = [1.01, 1.01, 0.97, 1.01, 1.01, 1.01]
     assert detect_dips(_snaps("SHORT", asks)) == []
     # but with min_points lowered it fires
     assert len(detect_dips(_snaps("SHORT", asks), min_points=5)) == 1

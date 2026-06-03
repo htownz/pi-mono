@@ -12,7 +12,7 @@ from .client import ClobClient, GammaClient, parse_event, parse_market
 from .scanner import group_negrisk, negrisk_snapshot, scan_market, scan_negrisk
 from .temporal import Dip, detect_dips, load_snapshots
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 __all__ = [
     "BookLevel",
