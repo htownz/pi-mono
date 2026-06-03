@@ -111,43 +111,49 @@ def test_negrisk_grouping():
 
 
 def test_negrisk_edge_verified():
-    # Realistic small gap: YES asks sum 0.985 → 1.5c edge; mids ≈ 0.975 → exhaustive plausible.
+    # Tight near-complete set: YES asks sum 0.99 → 1c edge; mids ≈ 0.986 ≥ 0.98 floor.
     outs = [_outcome(t, t + "?") for t in ("A", "B", "C", "D")]
     ev = NegRiskEvent(request_id="EVT", outcomes=outs, title="Who wins?")
     books = _four_outcome_books([
-        ("A", 0.250, 100, 0.245),
-        ("B", 0.250, 150, 0.245),
-        ("C", 0.245, 200, 0.240),
-        ("D", 0.240, 120, 0.235),
+        ("A", 0.250, 100, 0.248),
+        ("B", 0.250, 150, 0.248),
+        ("C", 0.245, 200, 0.243),
+        ("D", 0.245, 120, 0.243),
     ])
     opp = scan_negrisk(ev, books, gas_usd=0.0)
-    assert opp is not None, "should detect the 1.5c basket edge"
+    assert opp is not None, "should detect the 1c basket edge"
     assert opp.legs == 4
-    assert abs(opp.ask_sum - 0.985) < 1e-9
-    assert abs(opp.edge_cents - 1.5) < 1e-6
+    assert abs(opp.ask_sum - 0.99) < 1e-9
+    assert abs(opp.edge_cents - 1.0) < 1e-6
     assert opp.capturable_sets == 100  # min leg size
     assert opp.exhaustive_verified is True, opp.uncertainty_reason
-    assert abs(opp.gross_profit_usd - 0.015 * 100) < 1e-6
+    assert abs(opp.gross_profit_usd - 0.01 * 100) < 1e-6
+    # transparency fields for the time-series detector
+    assert abs(opp.bid_sum - 0.982) < 1e-9
+    assert abs(opp.spread - 0.008) < 1e-9
+    assert abs(opp.implied_mass - 0.986) < 1e-9
+    assert abs(opp.implied_other - 0.014) < 1e-9
 
 
 def test_negrisk_other_bucket_flagged_uncertain():
-    # Same prices, but one outcome carries the Other/None flag → scan, flag uncertain (not drop).
+    # Otherwise-verifiable prices, but one outcome carries Other/None → flag uncertain (not drop).
     outs = [_outcome(t, t + "?", neg_risk_other=(t == "D")) for t in ("A", "B", "C", "D")]
     ev = group_negrisk(outs)[0]
     books = _four_outcome_books([
-        ("A", 0.250, 100, 0.245),
-        ("B", 0.250, 150, 0.245),
-        ("C", 0.245, 200, 0.240),
-        ("D", 0.240, 120, 0.235),
+        ("A", 0.250, 100, 0.248),
+        ("B", 0.250, 150, 0.248),
+        ("C", 0.245, 200, 0.243),
+        ("D", 0.245, 120, 0.243),
     ])
     opp = scan_negrisk(ev, books, gas_usd=0.0)
     assert opp is not None
     assert opp.exhaustive_verified is False
-    assert "Other" in opp.uncertainty_reason
+    assert opp.uncertainty_reason == "explicit Other/None bucket present"  # Other alone, mass ok
 
 
 def test_negrisk_low_mass_flagged_uncertain():
-    # Big 10c gap → mids sum ≈ 0.88, below the 0.90 floor → set likely not exhaustive.
+    # Big 10c gap → mids sum ≈ 0.88, below the 0.98 floor → set likely not exhaustive.
+    # This is the structural case: the gap below $1 IS the missing mass (~12c on unlisted).
     outs = [_outcome(t, t + "?") for t in ("A", "B", "C", "D")]
     ev = NegRiskEvent(request_id="EVT", outcomes=outs)
     books = _four_outcome_books([
@@ -160,6 +166,24 @@ def test_negrisk_low_mass_flagged_uncertain():
     assert opp is not None and abs(opp.edge_cents - 10.0) < 1e-6
     assert opp.exhaustive_verified is False
     assert "not exhaustive" in opp.uncertainty_reason
+    # implied_other ≈ 1 - mass; mass = mids (0.195+0.245+0.145+0.295) = 0.88 → other ≈ 0.12
+    assert abs(opp.implied_mass - 0.88) < 1e-9
+    assert abs(opp.implied_other - 0.12) < 1e-9
+
+
+def test_negrisk_spread_nan_when_a_leg_has_no_bid():
+    # A one-sided leg (ask, no bid) → spread is undefined (NaN), but mass/edge still compute.
+    import math
+    outs = [_outcome(t, t + "?") for t in ("A", "B")]
+    ev = NegRiskEvent(request_id="EVT", outcomes=outs)
+    books = {
+        "A": _book("A", asks=[(0.49, 100)], bids=[(0.48, 100)]),
+        "B": _book("B", asks=[(0.49, 100)]),  # no bid on this leg
+    }
+    opp = scan_negrisk(ev, books, gas_usd=0.0)
+    assert opp is not None
+    assert math.isnan(opp.spread)
+    assert abs(opp.bid_sum - 0.48) < 1e-9  # only the leg with a bid contributes
 
 
 def test_negrisk_no_edge():

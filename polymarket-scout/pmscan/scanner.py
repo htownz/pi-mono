@@ -120,7 +120,7 @@ def scan_negrisk(
     *,
     fee_per_share: float = 0.0,
     gas_usd: float = 0.01,
-    mass_band: tuple[float, float] = (0.90, 1.08),
+    mass_band: tuple[float, float] = (0.98, 1.02),
 ) -> NegRiskOpportunity | None:
     """Detect a buy-all-YES edge across a NegRisk event's outcomes.
 
@@ -128,13 +128,24 @@ def scan_negrisk(
     structural edge *iff* the set is exhaustive. We require ≥2 outcomes and a complete set of
     YES asks (a missing leg understates the sum → overstates the edge → we refuse to emit).
 
-    Exhaustiveness can't be proven from the API alone, so we attach a confidence flag instead
-    of silently trusting it:
-      - `has_other` (explicit Other/None bucket present)  → unverified, and
-      - implied probability mass Σ mid(YES_i) outside `mass_band` → the listed outcomes likely
-        don't form a clean partition (too low ⇒ missing outcomes; too high ⇒ overlap/dup).
-    Either condition sets exhaustive_verified=False with a reason; the edge is still reported
-    (per project policy: scan, flag as uncertain — never drop a candidate silently).
+    IMPORTANT — what a static snapshot can and cannot tell you. With only top-of-book bid/ask,
+    "missing probability mass" and "the edge" are the SAME quantity and cannot be separated:
+    since mid_i = (bid_i+ask_i)/2 ≤ ask_i, we always have mass = Σ mid_i ≤ Σ ask_i = ask_sum,
+    so 1 − mass ≥ 1 − ask_sum = edge. For fairly-priced two-sided books a *positive* edge
+    therefore implies the listed set is non-exhaustive (the gap below $1 exceeds the spread
+    only when probability is missing). A genuine arb comes from a transient ask *dislocation*;
+    distinguishing that from structural missing-mass needs a TIME SERIES (see persistence
+    logging), not a single frame.
+
+    So the confidence flag here is a deliberately conservative proxy, not proof:
+      - `has_other` (explicit Other/None bucket present)  → unverified;
+      - implied mass Σ mid(YES_i) outside `mass_band` (default tight: [0.98, 1.02]) → the set
+        is probably not a clean partition (too low ⇒ missing outcomes — which is also where
+        the larger "edges" live; too high ⇒ overlap/dup).
+    A verified flag means only "near-complete and small — still warrants structural/temporal
+    confirmation," never "confirmed arbitrage." The edge is always reported (scan, flag as
+    uncertain — never drop a candidate silently). bid_sum / spread / implied_other are exposed
+    for the downstream time-series detector.
 
     Returns None when there is no crossing or the data is incomplete.
     """
@@ -158,13 +169,21 @@ def scan_negrisk(
     # Implied probability mass: for a clean exhaustive partition the YES mids should sum ≈ 1.
     mids = [bk.mid() for _, bk in yes_books]
     implied_mass = sum(md for md in mids if md is not None)
+    implied_other = max(0.0, 1.0 - implied_mass)   # est. probability on unlisted/other outcomes
+
+    # bid_sum / spread expose the book width for the downstream time-series detector. bid_sum
+    # only counts legs that actually have a bid; spread is meaningful only when all legs do.
+    bids = [bk.best_bid() for _, bk in yes_books]
+    bid_sum = sum(b.price for b in bids if b is not None)
+    spread = (ask_sum - bid_sum) if all(b is not None for b in bids) else float("nan")
 
     reasons: list[str] = []
     if event.has_other:
         reasons.append("explicit Other/None bucket present")
     lo, hi = mass_band
     if implied_mass < lo:
-        reasons.append(f"implied mass {implied_mass:.3f} < {lo:.2f} (set likely not exhaustive)")
+        reasons.append(f"implied mass {implied_mass:.3f} < {lo:.2f} (set likely not exhaustive; "
+                       f"~{implied_other * 100:.1f}c of probability is on unlisted outcomes)")
     elif implied_mass > hi:
         reasons.append(f"implied mass {implied_mass:.3f} > {hi:.2f} (outcomes may overlap)")
     verified = not reasons
@@ -188,7 +207,10 @@ def scan_negrisk(
         legs=n,
         outcomes=[m.question for m, _ in yes_books],
         ask_sum=round(ask_sum, 6),
+        bid_sum=round(bid_sum, 6),
+        spread=round(spread, 6),
         implied_mass=round(implied_mass, 6),
+        implied_other=round(implied_other, 6),
         edge_cents=round(edge_per_set * 100.0, 4),
         capturable_sets=capturable,
         gross_profit_usd=round(gross, 6),

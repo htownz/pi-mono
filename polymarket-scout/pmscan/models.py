@@ -148,8 +148,11 @@ class NegRiskOpportunity:
     side: str                       # "buy_all_yes"
     legs: int                       # N outcomes in the basket
     outcomes: list[str]             # outcome labels / questions, index-aligned to legs
-    ask_sum: float                  # Σ best_ask(YES_i)
-    implied_mass: float             # Σ mid(YES_i) — should be ≈ 1.0 for an exhaustive set
+    ask_sum: float                  # Σ best_ask(YES_i) — cost to buy one YES per outcome
+    bid_sum: float                  # Σ best_bid(YES_i) over legs that have a bid
+    spread: float                   # ask_sum - bid_sum (NaN unless every leg has a bid)
+    implied_mass: float             # Σ mid(YES_i) — ≈ 1.0 for an exhaustive, fairly-priced set
+    implied_other: float            # max(0, 1 - implied_mass): est. prob on unlisted outcomes
     edge_cents: float               # gross per-basket edge in cents (1 - ask_sum) * 100
     capturable_sets: float          # min_i ask_size_i (top-of-book, conservative)
     gross_profit_usd: float

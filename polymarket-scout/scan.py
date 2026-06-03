@@ -107,9 +107,10 @@ def run_negrisk(args) -> int:
         hits += 1
         tag = "OK " if opp.exhaustive_verified else "??!"
         print(f"[negrisk {tag}] {opp.edge_cents:5.2f}c  N={opp.legs:>2}  "
-              f"ask_sum={opp.ask_sum:.3f} mass={opp.implied_mass:.3f}  "
+              f"ask_sum={opp.ask_sum:.3f} mass={opp.implied_mass:.3f} "
+              f"other={opp.implied_other * 100:4.1f}c  "
               f"x{opp.capturable_sets:>7.0f} sets  net=${opp.net_profit_usd:>9.2f}  "
-              f"{(opp.title or '')[:48]}")
+              f"{(opp.title or '')[:42]}")
         if not opp.exhaustive_verified:
             print(f"            ↳ uncertain: {opp.uncertainty_reason}")
         _log(opp.to_json(), args.out)
@@ -133,12 +134,22 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--max-events", type=int, default=1000,
                    help="NegRisk --complete-events: max events to pull from /events.")
     p.add_argument("--min-volume", type=float, default=0.0, help="24h USD volume filter.")
-    p.add_argument("--min-edge", type=float, default=0.0, help="min gross per-set edge, cents.")
-    p.add_argument("--min-sets", type=float, default=0.0, help="min capturable top-of-book sets.")
+    p.add_argument("--min-edge", type=float, default=None,
+                   help="min gross per-set edge, cents (loop default 1.0, single-pass 0).")
+    p.add_argument("--min-sets", type=float, default=None,
+                   help="min capturable top-of-book sets (loop default 5, single-pass 0).")
     p.add_argument("--fee", type=float, default=0.0, help="per-share per-leg fee (USD).")
     p.add_argument("--gas", type=float, default=0.01, help="round-trip gas (USD).")
     p.add_argument("--out", type=str, default=None, help="append matched opportunities as JSONL.")
     args = p.parse_args(argv)
+
+    # Loop (persistence) mode defaults to noise filters so 0-set / sub-cent crossings don't
+    # flood the log; a single pass shows everything. Explicit flags always win.
+    loop = bool(args.interval and not args.once)
+    if args.min_edge is None:
+        args.min_edge = 1.0 if loop else 0.0
+    if args.min_sets is None:
+        args.min_sets = 5.0 if loop else 0.0
 
     runner = run_negrisk if args.negrisk else run_binary
 

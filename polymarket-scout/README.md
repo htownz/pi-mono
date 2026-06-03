@@ -37,7 +37,7 @@ python scan.py --once                                  # binary, top 800 markets
 python scan.py --once --max-markets 1500 --min-edge 1.0 --out opportunities.jsonl
 python scan.py --negrisk --once                        # NegRisk, COMPLETE events via /events (default)
 python scan.py --negrisk --interval 30 --out neg.jsonl # watch loop (persistence measurement)
-python test_scanner.py                                 # synthetic self-tests (13, all passing)
+python test_scanner.py                                 # synthetic self-tests (14, all passing)
 ```
 
 No install needed — standard library only, Python 3.10+.
@@ -72,19 +72,41 @@ You cannot prove exhaustiveness from the public API alone, so rather than silent
 detector **scans and attaches a confidence flag**:
 
 1. **Explicit Other bucket** — any outcome flagged `negRiskOther` ⇒ `exhaustive_verified=False`.
-2. **Implied-probability-mass sanity check** *(innovation worth calling out).* For a clean
-   partition the YES **mid** prices should sum to ≈ $1 (they are the market's probabilities and
-   must total 1). We compute `implied_mass = Σ mid(YES_i)`:
-   - `mass` well **below** 1 ⇒ outcomes are missing (the set isn't complete) — the classic
-     cause of a fake "10c gap." Flagged uncertain.
-   - `mass` well **above** 1 ⇒ outcomes overlap/duplicate — also not a clean partition.
-   Default acceptance band is `[0.90, 1.08]`; outside it ⇒ `exhaustive_verified=False` with a
-   reason. This single cheap check kills the most common phantom-edge pattern for free.
+2. **Implied-probability-mass check.** For a clean partition the YES **mid** prices sum to ≈ $1
+   (they are the market's probabilities). We compute `implied_mass = Σ mid(YES_i)` and
+   `implied_other = max(0, 1 − mass)` (the probability the market puts on *unlisted* outcomes).
+   Default acceptance band is the **tight** `[0.98, 1.02]`; outside it ⇒ `exhaustive_verified=
+   False`. (See the hard limit below for why the band must be tight, not loose.)
 3. **Incomplete legs** — if any outcome's YES book is missing, we **refuse** to emit (return
    `None`) rather than under-sum the basket and overstate the edge.
 
-Verified hits print `[negrisk OK ]`; unverified-but-real-if-complete hits print `[negrisk ??!]`
-with the reason, and both are logged (the `exhaustive_verified` field is in the JSONL).
+Verified hits print `[negrisk OK ]`; everything else prints `[negrisk ??!]` with a reason. Both
+are logged with full transparency fields (`ask_sum, bid_sum, spread, implied_mass,
+implied_other, edge_cents, exhaustive_verified`) for the time-series detector below.
+
+### The hard limit: a static snapshot cannot separate "edge" from "missing mass"
+
+This is the central finding from the first complete-event live run, and it shapes everything
+after. With only top-of-book bid/ask, **the edge and the missing probability mass are the same
+quantity.** Per leg `mid = (bid+ask)/2 ≤ ask`, so `mass = Σ mid ≤ Σ ask = ask_sum`, hence:
+
+```
+implied_other = 1 − mass  ≥  1 − ask_sum = edge        (always)
+```
+
+For fairly-priced two-sided books a **positive** buy-all-YES edge therefore *implies* the listed
+set is non-exhaustive — the gap below $1 can exceed the spread only when probability is missing.
+A genuine arb instead comes from a **transient ask dislocation**. You cannot tell the two apart
+from one frame; the "risk-adjusted edge" `(1−ask_sum) − (1−mass) = mass − ask_sum` is `≤ 0` by
+construction. So:
+
+- `exhaustive_verified=True` here means only **"near-complete and small — still needs structural
+  or temporal confirmation,"** never "confirmed arbitrage." (Tight mass band ⇒ only tiny edges
+  qualify, which is the honest ceiling for a static check.)
+- **The real discriminator is time.** A structural/phantom edge sits at a *stable* depressed
+  `ask_sum` indefinitely; a real arb is a *brief dip* below the event's own rolling baseline.
+  That is what the persistence loop (and the planned temporal detector) is for — it is the
+  actual edge detector, not just a measuring tape.
 
 ## Live finding (Phase 1, first run, ~1,500 highest-volume markets)
 
@@ -96,14 +118,26 @@ single-condition markets flat, and the documented ~$39.6M Polymarket arbitrage p
 **~$29M of NegRisk *multi-condition* rebalancing**, not binary YES+NO. **That ~$29M is exactly
 what Phase 1b targets.**
 
-### Phase 1b first live run — the fragment lesson
+### Phase 1b run 1 — the fragment lesson
 
 The first NegRisk pass (grouping from a `/markets` sample) surfaced 5 "crossing edges," all
 2-leg, all with `mass ≈ 0.003` — e.g. *"Brazil Presidential Election, net=$713k."* Every one
-was correctly flagged `??!` (uncertain) by the mass check: they were **truncated fragments**,
-not edges. The fix is `--complete-events` (now default), which groups from `/events` so a
-basket reflects the whole event. Net verified edges so far: **zero** — consistent with the
-research, and exactly what an honest detector should report.
+was correctly flagged `??!` by the mass check: they were **truncated fragments**, not edges.
+Fix: `--complete-events` (now default) groups from `/events` so a basket reflects the whole
+event.
+
+### Phase 1b run 2 (complete events) — the structural lesson
+
+With correct grouping, events came back whole (`Presidential Election Winner 2028` → **N=36**,
+not N=2) and a handful of small `OK` hits appeared. But inspection killed them: the top one had
+a 3.6c gap against `mass=0.944` — i.e. **5.6c of probability sits on unlisted candidates**
+(write-ins). Buying all 36 YES for 96.4c does *not* guarantee $1. Subtract `1 − mass` from every
+`OK` and they all go negative — because, as proven above, `1 − mass ≥ edge` always. So the loose
+`0.90` floor was waving open-candidate elections through as `OK`. Tightening the band to
+`[0.98, 1.02]` reclassifies them as `??!`, leaving only tiny near-complete sets — the honest
+ceiling for a static check. **Net genuinely-confirmable edges from a snapshot: still zero**, and
+now we understand *why* it must be: a real arb is a temporal dislocation, invisible to one frame.
+Next: the time-series detector that flags `ask_sum` dipping below each event's rolling baseline.
 
 ## Strategy / ROI direction (where the edge actually is)
 
@@ -111,9 +145,12 @@ The honest read from Phase 1 is that latency-flat binary markets are competed ou
 is in three places, in order of effort:
 
 1. **NegRisk basket dislocations (this phase).** Multi-outcome events re-price unevenly during
-   news; the buy-all-YES basket transiently dips below $1 before bots rebalance. The
-   `--interval` watch loop exists to **measure how long those dips survive at our latency** —
-   that persistence number, not a single snapshot, is the real go/no-go for any capital.
+   news; the buy-all-YES basket transiently dips below $1 before bots rebalance. As shown above,
+   a snapshot can't tell that transient dip from structural missing-mass — so the next build is a
+   **temporal detector**: track each event's `ask_sum` over the `--interval` loop and flag a dip
+   below its own rolling baseline (a relative dislocation), not an absolute `< $1` test. The
+   loop defaults to `--min-sets 5 --min-edge 1.0` so 0-size / sub-cent noise stays out of the
+   log. That persistence/relative signal, not a single frame, is the real go/no-go for capital.
 2. **The convert/sell side** (flagged, not built). The on-chain NegRisk adapter
    `convertPositions` lets a holder of "NO on every outcome" redeem $1, opening the
    complementary `Σ bid(YES_i) > $1` short-the-basket edge. Detection-safe to *model*;
@@ -129,7 +166,7 @@ is in three places, in order of effort:
 ```
 polymarket-scout/
   scan.py              # CLI entry (detection + logging only): binary + --negrisk paths
-  test_scanner.py      # synthetic self-tests (4 binary + 9 NegRisk)
+  test_scanner.py      # synthetic self-tests (4 binary + 10 NegRisk)
   requirements.txt     # (stdlib only)
   pmscan/
     __init__.py        # package exports
