@@ -12,8 +12,8 @@ import argparse
 import sys
 import time
 
-from pmscan.client import ClobClient, GammaClient, parse_market
-from pmscan.models import Market
+from pmscan.client import ClobClient, GammaClient, parse_event, parse_market
+from pmscan.models import Market, NegRiskEvent
 from pmscan.scanner import group_negrisk, scan_market, scan_negrisk
 
 
@@ -26,6 +26,24 @@ def _discover(max_markets: int, min_volume: float) -> list[Market]:
             continue
         markets.append(m)
     return markets
+
+
+def _discover_events(max_events: int, min_volume: float) -> list[NegRiskEvent]:
+    """Pull complete NegRisk events (all outcomes) from Gamma /events.
+
+    min_volume filters on the event's summed outcome volume so a sparse, low-interest
+    event doesn't dilute the scan.
+    """
+    gamma = GammaClient()
+    events: list[NegRiskEvent] = []
+    for raw in gamma.iter_active_events(max_events=max_events):
+        ev = parse_event(raw)
+        if ev is None:
+            continue
+        if sum(m.volume_24hr for m in ev.outcomes) < min_volume:
+            continue
+        events.append(ev)
+    return events
 
 
 def _log(line: str, out_path: str | None) -> None:
@@ -58,8 +76,19 @@ def run_binary(args) -> int:
 
 
 def run_negrisk(args) -> int:
-    markets = _discover(args.max_markets, args.min_volume)
-    events = group_negrisk(markets)
+    if args.complete_events:
+        # Authoritative: each event carries its full outcome set (no truncation artifacts).
+        events = _discover_events(args.max_events, args.min_volume)
+        source = f"{len(events)} complete event(s) via /events"
+    else:
+        # Fallback: regroup a volume-truncated /markets sample. Fast, but baskets may be
+        # partial — only trust results whose implied mass lands near 1.0.
+        markets = _discover(args.max_markets, args.min_volume)
+        events = group_negrisk(markets)
+        source = (f"{len(events)} group(s) from a {args.max_markets}-market sample "
+                  f"(TRUNCATED — partial baskets expected; prefer --complete-events)")
+        print(f"-- negrisk: WARNING grouping from sample, not /events — "
+              f"sub-$1 baskets here are likely fragments, not edges.", file=sys.stderr)
     # one batched book fetch for every outcome's YES token across all events
     yes_tokens = [t for ev in events for m in ev.outcomes if (t := m.yes_token())]
     books = ClobClient().get_books(yes_tokens)
@@ -85,7 +114,7 @@ def run_negrisk(args) -> int:
             print(f"            ↳ uncertain: {opp.uncertainty_reason}")
         _log(opp.to_json(), args.out)
 
-    print(f"-- negrisk: {len(events)} event group(s), {hits} crossing edge(s), "
+    print(f"-- negrisk: {source}, {hits} crossing edge(s), "
           f"{skipped_incomplete} skipped (incomplete books)", file=sys.stderr)
     return hits
 
@@ -94,10 +123,15 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Read-only Polymarket sum-to-one scanner.")
     p.add_argument("--negrisk", action="store_true",
                    help="Phase 1b: scan NegRisk multi-outcome events (buy-all-YES).")
+    p.add_argument("--complete-events", action=argparse.BooleanOptionalAction, default=True,
+                   help="NegRisk: group full outcome sets via Gamma /events (default). "
+                        "Use --no-complete-events to regroup a truncated /markets sample.")
     p.add_argument("--once", action="store_true", help="single pass then exit (default).")
     p.add_argument("--interval", type=float, default=None,
                    help="loop every N seconds (persistence measurement).")
     p.add_argument("--max-markets", type=int, default=800)
+    p.add_argument("--max-events", type=int, default=1000,
+                   help="NegRisk --complete-events: max events to pull from /events.")
     p.add_argument("--min-volume", type=float, default=0.0, help="24h USD volume filter.")
     p.add_argument("--min-edge", type=float, default=0.0, help="min gross per-set edge, cents.")
     p.add_argument("--min-sets", type=float, default=0.0, help="min capturable top-of-book sets.")

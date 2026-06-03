@@ -35,17 +35,30 @@ cross-bracket arbitrage math is the direct analogue of the NegRisk detector here
 ```bash
 python scan.py --once                                  # binary, top 800 markets by 24h volume
 python scan.py --once --max-markets 1500 --min-edge 1.0 --out opportunities.jsonl
-python scan.py --negrisk --once                        # NegRisk multi-outcome (Phase 1b)
+python scan.py --negrisk --once                        # NegRisk, COMPLETE events via /events (default)
 python scan.py --negrisk --interval 30 --out neg.jsonl # watch loop (persistence measurement)
-python test_scanner.py                                 # synthetic self-tests (10, all passing)
+python test_scanner.py                                 # synthetic self-tests (13, all passing)
 ```
 
 No install needed — standard library only, Python 3.10+.
 
-Key flags: `--negrisk` (switch to multi-outcome mode), `--min-edge` (min gross per-set edge,
-cents), `--min-sets` (min capturable top-of-book sets), `--min-volume` (24h USD filter),
-`--fee` (per-share per-leg, default 0), `--gas` (round-trip USD, default 0.01), `--out`
-(append JSONL log), `--interval` (loop seconds), `--max-markets`.
+Key flags: `--negrisk` (switch to multi-outcome mode), `--complete-events` (default; pull full
+outcome sets from Gamma `/events` — see below), `--max-events` (cap for `/events`), `--min-edge`
+(min gross per-set edge, cents), `--min-sets` (min capturable top-of-book sets), `--min-volume`
+(24h USD filter), `--fee` (per-share per-leg, default 0), `--gas` (round-trip USD, default 0.01),
+`--out` (append JSONL log), `--interval` (loop seconds), `--max-markets`.
+
+### Why NegRisk grouping must come from `/events`
+
+A NegRisk basket is only an edge if you have **every** outcome of the event. If you reconstruct
+the group from a volume-ranked `/markets` sample (`--no-complete-events`), large events get
+**truncated** — you capture only their most-liquid couple of legs and miss the frontrunners.
+That produces baskets like *"Brazil Presidential Election, N=2, ask_sum=0.004"* — a 99.6¢
+"edge" worth six figures on paper that is pure artifact (you priced two longshots, not the
+event). `--complete-events` (the default) pulls each event with its full child-market set from
+Gamma `/events`, so `N` is the true outcome count and the basket is actually complete. The
+implied-mass check below is the backstop that catches any fragment that still slips through —
+in the truncated case `mass ≈ 0`, which can never read as verified.
 
 ## The NegRisk exhaustiveness problem (and how we handle it)
 
@@ -83,6 +96,15 @@ single-condition markets flat, and the documented ~$39.6M Polymarket arbitrage p
 **~$29M of NegRisk *multi-condition* rebalancing**, not binary YES+NO. **That ~$29M is exactly
 what Phase 1b targets.**
 
+### Phase 1b first live run — the fragment lesson
+
+The first NegRisk pass (grouping from a `/markets` sample) surfaced 5 "crossing edges," all
+2-leg, all with `mass ≈ 0.003` — e.g. *"Brazil Presidential Election, net=$713k."* Every one
+was correctly flagged `??!` (uncertain) by the mass check: they were **truncated fragments**,
+not edges. The fix is `--complete-events` (now default), which groups from `/events` so a
+basket reflects the whole event. Net verified edges so far: **zero** — consistent with the
+research, and exactly what an honest detector should report.
+
 ## Strategy / ROI direction (where the edge actually is)
 
 The honest read from Phase 1 is that latency-flat binary markets are competed out. The return
@@ -107,12 +129,12 @@ is in three places, in order of effort:
 ```
 polymarket-scout/
   scan.py              # CLI entry (detection + logging only): binary + --negrisk paths
-  test_scanner.py      # synthetic self-tests (4 binary + 6 NegRisk)
+  test_scanner.py      # synthetic self-tests (4 binary + 9 NegRisk)
   requirements.txt     # (stdlib only)
   pmscan/
     __init__.py        # package exports
     models.py          # Market / OrderBook / Opportunity / NegRiskEvent / NegRiskOpportunity
-    client.py          # Gamma + CLOB read-only clients, parse_market
+    client.py          # Gamma + CLOB read-only clients, parse_market, parse_event (/events)
     scanner.py         # scan_market (Phase 1) + group_negrisk / scan_negrisk (Phase 1b)
 ```
 
