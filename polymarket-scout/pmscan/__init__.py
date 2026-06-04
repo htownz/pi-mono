@@ -20,8 +20,9 @@ from .parity import (
     scan_parity,
     scan_parity_links,
 )
+from .kalshi import KalshiQuotes, market_to_quote
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 __all__ = [
     "BookLevel",
@@ -49,4 +50,6 @@ __all__ = [
     "kalshi_venue_quote",
     "scan_parity",
     "scan_parity_links",
+    "KalshiQuotes",
+    "market_to_quote",
 ]

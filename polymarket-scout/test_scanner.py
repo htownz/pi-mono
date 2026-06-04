@@ -16,6 +16,7 @@ from pmscan.parity import (
     ParityLink, VenueQuote, kalshi_venue_quote, pm_venue_quote, scan_parity, scan_parity_links,
 )
 from pmscan.parity_registry import REGISTRY, ParityCandidate, build_links
+from pmscan.kalshi import market_to_quote
 
 
 def _book(token_id: str, asks=(), bids=()) -> OrderBook:
@@ -461,6 +462,25 @@ def test_parity_registry_seed_is_wellformed():
         assert c.name and c.pm_match and c.kalshi_ticker
         # seed entries are templates — must never ship asserting verified settlement.
         assert c.settlement_verified is False
+
+
+def test_kalshi_bridge_parses_new_dollars_schema():
+    # 2026 schema: prices as dollar strings. Normalize to dollars in the VenueQuote.
+    raw = {"ticker": "KXFED-26JUN-X", "title": "Fed: no change?",
+           "yes_bid_dollars": "0.9100", "yes_ask_dollars": "0.9300",
+           "no_bid_dollars": "0.0700", "no_ask_dollars": "0.0900"}
+    q = market_to_quote(raw)
+    assert q is not None and q.venue == "kalshi" and q.market_key == "KXFED-26JUN-X"
+    assert abs(q.yes_ask - 0.93) < 1e-9 and abs(q.no_ask - 0.09) < 1e-9
+    assert abs(q.yes_bid - 0.91) < 1e-9 and abs(q.no_bid - 0.07) < 1e-9
+
+
+def test_kalshi_bridge_parses_legacy_cents_and_skips_tickerless():
+    raw = {"ticker": "KX-LEGACY", "title": "t", "yes_bid": 40, "yes_ask": 42,
+           "no_bid": 58, "no_ask": 60}
+    q = market_to_quote(raw)
+    assert abs(q.yes_ask - 0.42) < 1e-9 and abs(q.no_ask - 0.60) < 1e-9
+    assert market_to_quote({"title": "no ticker"}) is None
 
 
 # --------------------------------------------------------------------------- #

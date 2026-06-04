@@ -22,6 +22,7 @@ import json
 import sys
 
 from pmscan.client import ClobClient, GammaClient, parse_market
+from pmscan.kalshi import KalshiQuotes
 from pmscan.parity import VenueQuote, kalshi_venue_quote, pm_venue_quote, scan_parity_links
 from pmscan.parity_registry import REGISTRY, build_links
 
@@ -61,14 +62,27 @@ def _pm_quotes_for_registry(max_markets: int) -> list[VenueQuote]:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Cross-venue (Polymarket+Kalshi) parity runner.")
-    p.add_argument("--kalshi-quotes", required=True, help="JSON of Kalshi quotes in cents (see header).")
+    p.add_argument("--kalshi-live", action="store_true",
+                   help="auto-fetch Kalshi quotes for every registry ticker via the public API.")
+    p.add_argument("--kalshi-quotes", default=None,
+                   help="JSON of Kalshi quotes in cents (manual; supplements/overrides --kalshi-live).")
     p.add_argument("--max-markets", type=int, default=1500, help="Polymarket markets to scan for matches.")
     p.add_argument("--fee", type=float, default=0.0, help="per-leg fee (USD).")
     p.add_argument("--gas", type=float, default=0.0, help="per-lock settlement/gas (USD).")
     p.add_argument("--out", type=str, default=None, help="append crossing locks as JSONL.")
     args = p.parse_args(argv)
 
-    kalshi_quotes = _load_kalshi_quotes(args.kalshi_quotes)
+    if not args.kalshi_live and not args.kalshi_quotes:
+        p.error("provide a Kalshi source: --kalshi-live and/or --kalshi-quotes <file>")
+
+    kalshi_quotes: dict[str, VenueQuote] = {}
+    if args.kalshi_live:
+        tickers = sorted({c.kalshi_ticker for c in REGISTRY})
+        kalshi_quotes.update(KalshiQuotes().get_quotes(tickers))
+        print(f"-- parity: fetched {len(kalshi_quotes)}/{len(tickers)} Kalshi quotes live",
+              file=sys.stderr)
+    if args.kalshi_quotes:
+        kalshi_quotes.update(_load_kalshi_quotes(args.kalshi_quotes))  # manual wins
     pm_quotes = _pm_quotes_for_registry(args.max_markets)
     links, unmatched = build_links(REGISTRY, pm_quotes, kalshi_quotes)
 
