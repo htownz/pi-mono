@@ -38,7 +38,7 @@ python scan.py --once --max-markets 1500 --min-edge 1.0 --out opportunities.json
 python scan.py --negrisk --once                        # NegRisk, COMPLETE events via /events (default)
 python scan.py --negrisk --interval 30 --out neg.jsonl --snapshot snap.jsonl  # watch + baseline log
 python -m pmscan.temporal snap.jsonl --summary         # detect transient dips over the snapshot log
-python test_scanner.py                                 # synthetic self-tests (29, all passing)
+python test_scanner.py                                 # synthetic self-tests (31, all passing)
 ```
 
 No install needed — standard library only, Python 3.10+.
@@ -218,19 +218,33 @@ without it (scan-and-flag, same ethos as everywhere else).
 adapters (`pm_venue_quote` from Polymarket books, `kalshi_venue_quote` from Kalshi cents — no
 `kalshi_scout` import; a thin bridge is the integration seam), and synthetic self-tests.
 
-**What it deliberately does not have yet** (the genuinely hard part): the **cross-venue
-matching** layer — which Polymarket token corresponds to which Kalshi ticker. That is an
-entity-resolution problem of its own; v1 uses an explicit hand-curated registry of `ParityLink`s
-and treats auto-matching (fuzzy title/date/bucket alignment) as the next phase. No live Kalshi
-feed is wired in — populating `VenueQuote` from a live Kalshi adapter is the next integration
-step. **Detection-only, like everything else.**
+**What it deliberately does not have yet** (the genuinely hard part): an *automated* cross-venue
+**matching** layer — which Polymarket token corresponds to which Kalshi ticker. That is an
+entity-resolution problem of its own (fuzzy title/date/bucket alignment), left to a later phase.
+
+**Testing it against reality today** (`pmscan/parity_registry.py` + `parity_run.py`): v1 matching
+is a **hand-curated registry** of `ParityCandidate`s — each declares a Polymarket market (by
+question substring) and a Kalshi ticker for the same outcome, plus a `settlement_verified`
+assertion. Until a live Kalshi adapter exists, you supply Kalshi prices by hand in a small JSON
+(cents), and the runner pulls the Polymarket side live and computes the locks:
+
+```bash
+# 1. edit pmscan/parity_registry.py: point each candidate's pm_match + kalshi_ticker at the
+#    SAME outcome; set settlement_verified=True only after you confirm identical resolution.
+# 2. build kalshi_quotes.json from Kalshi's app (see kalshi_quotes.example.json), prices in cents.
+python parity_run.py --kalshi-quotes kalshi_quotes.json
+```
+
+Verified locks print `[parity OK ]`; unverified ones `[parity ??!]` with the settlement caveat.
+The seed registry entries are **templates** (`settlement_verified=False`, placeholder tickers) —
+replace them with verified live identifiers first. **Detection-only, like everything else.**
 
 ## Project layout
 
 ```
 polymarket-scout/
   scan.py              # CLI entry (detection + logging only): binary + --negrisk paths
-  test_scanner.py      # synthetic self-tests (4 binary + 12 NegRisk + 6 temporal + 7 parity)
+  test_scanner.py      # synthetic self-tests (4 binary + 12 NegRisk + 6 temporal + 9 parity)
   requirements.txt     # (stdlib only)
   pmscan/
     __init__.py        # package exports

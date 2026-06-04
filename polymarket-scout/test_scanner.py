@@ -15,6 +15,7 @@ from pmscan.temporal import detect_dips, group_by_event, robust_stats
 from pmscan.parity import (
     ParityLink, VenueQuote, kalshi_venue_quote, pm_venue_quote, scan_parity, scan_parity_links,
 )
+from pmscan.parity_registry import REGISTRY, ParityCandidate, build_links
 
 
 def _book(token_id: str, asks=(), bids=()) -> OrderBook:
@@ -437,6 +438,29 @@ def test_parity_pm_adapter_from_books():
     assert opps[0].side == "B_yes+A_no"
     assert abs(opps[0].cost_sum - 0.98) < 1e-9
     assert abs(opps[0].edge_cents - 2.0) < 1e-6
+
+
+def test_parity_registry_build_links_pairs_and_skips():
+    cands = [
+        ParityCandidate("Fed no change", "fed decision in june", "KXFED", settlement_verified=True),
+        ParityCandidate("Absent", "no such pm market", "KXNONE"),
+    ]
+    pm = [VenueQuote("polymarket", "tok", "Fed Decision in June?", yes_ask=0.91, no_ask=0.10)]
+    kal = {"KXFED": kalshi_venue_quote("KXFED", label="KXFED",
+                                       yes_bid_c=88, yes_ask_c=90, no_bid_c=10, no_ask_c=12)}
+    links, unmatched = build_links(cands, pm, kal)
+    assert len(links) == 1 and links[0].name == "Fed no change"
+    assert links[0].settlement_verified is True
+    assert links[0].a.venue == "polymarket" and links[0].b.venue == "kalshi"
+    assert unmatched == ["Absent"]   # missing on both PM and Kalshi → reported, not silently dropped
+
+
+def test_parity_registry_seed_is_wellformed():
+    assert REGISTRY
+    for c in REGISTRY:
+        assert c.name and c.pm_match and c.kalshi_ticker
+        # seed entries are templates — must never ship asserting verified settlement.
+        assert c.settlement_verified is False
 
 
 # --------------------------------------------------------------------------- #

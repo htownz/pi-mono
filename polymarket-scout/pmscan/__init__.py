@@ -21,7 +21,7 @@ from .parity import (
     scan_parity_links,
 )
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 __all__ = [
     "BookLevel",
