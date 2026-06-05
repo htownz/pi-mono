@@ -506,6 +506,17 @@ def test_kalshi_bridge_parses_legacy_cents_and_skips_tickerless():
     assert market_to_quote({"title": "no ticker"}) is None
 
 
+def test_kalshi_bridge_skips_closed_market():
+    # A settled/closed market still reports last prices — must NOT become a quote (phantom lock).
+    for status in ("closed", "settled", "finalized", "determined"):
+        raw = {"ticker": "KX-DONE", "title": "t", "status": status,
+               "yes_ask_dollars": "0.0100", "no_ask_dollars": "0.0100"}  # 0.02 < $1 → fake lock
+        assert market_to_quote(raw) is None, status
+    # active / open / unspecified status still quotes
+    assert market_to_quote({"ticker": "KX-LIVE", "status": "active",
+                            "yes_ask_dollars": "0.40", "no_ask_dollars": "0.62"}) is not None
+
+
 # --------------------------------------------------------------------------- #
 def _run_all() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

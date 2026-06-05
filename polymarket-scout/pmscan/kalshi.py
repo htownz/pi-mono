@@ -21,6 +21,11 @@ from .parity import VenueQuote
 KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 UA = "pmscan (read-only cross-venue parity)"   # no version — avoids drift from __version__
 
+# A non-tradable market still reports its last prices; quoting one (e.g. a dated game ticker
+# after the event settled) would manufacture a cross-venue "lock" that can't be entered. Skip.
+NON_TRADABLE_STATUSES = {"closed", "settled", "finalized", "determined", "expired",
+                         "inactive", "unopened"}
+
 
 def _dollar_price(raw: dict, dollars_key: str, cents_key: str) -> Optional[float]:
     """Price in dollars (0..1) from either the new `*_dollars` string or legacy cents int."""
@@ -40,9 +45,15 @@ def _dollar_price(raw: dict, dollars_key: str, cents_key: str) -> Optional[float
 
 
 def market_to_quote(raw: dict) -> VenueQuote | None:
-    """Build a venue-agnostic VenueQuote (prices in dollars) from a raw Kalshi market dict."""
+    """Build a venue-agnostic VenueQuote (prices in dollars) from a raw Kalshi market dict.
+
+    Returns None for a tickerless or non-tradable (closed/settled/...) market, so stale prices
+    on a finished market never become a phantom, unenterable cross-venue lock.
+    """
     ticker = raw.get("ticker")
     if not ticker:
+        return None
+    if (raw.get("status") or "").lower() in NON_TRADABLE_STATUSES:
         return None
     return VenueQuote(
         venue="kalshi",
