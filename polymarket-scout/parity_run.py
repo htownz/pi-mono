@@ -2,18 +2,17 @@
 """Cross-venue parity runner (DRAFT). DETECTION ONLY — read-only, no wallet, no orders.
 
 Pulls the Polymarket side live (Gamma + CLOB) and pairs it, via the hand-curated registry,
-against Kalshi quotes you supply in a small JSON file. Until a live Kalshi adapter exists,
-this lets you test the parity idea today by typing a handful of Kalshi prices by hand.
+against Kalshi quotes. Both venues can be pulled live; Kalshi prices may also be supplied (or
+overridden) by hand for tickers you can't resolve automatically.
 
-  1. Build kalshi_quotes.json from Kalshi's site/app (prices in CENTS):
-       {
-         "KXFED-26JUN-REPLACE": {"yes_bid": 91, "yes_ask": 93, "no_bid": 7, "no_ask": 9},
-         "KXDEMNOM28-REPLACE":  {"yes_bid": 18, "yes_ask": 20, "no_bid": 80, "no_ask": 82}
-       }
-  2. Edit pmscan/parity_registry.py so each candidate's pm_match + kalshi_ticker point at the
-     SAME real-world outcome, and set settlement_verified=True only once you've confirmed both
+  1. Edit pmscan/parity_registry.py so each candidate's pm_match + kalshi_ticker point at the
+     SAME real-world outcome; set settlement_verified=True only once you've confirmed both
      venues resolve it identically (source, date, bucket).
-  3. python parity_run.py --kalshi-quotes kalshi_quotes.json
+  2. Run it:
+       python parity_run.py --kalshi-live                       # auto-fetch both sides live
+       python parity_run.py --kalshi-quotes kalshi_quotes.json  # hand-entered Kalshi prices (cents)
+       python parity_run.py --kalshi-live --kalshi-quotes k.json # live + manual overrides
+     (manual JSON shape: {"TICKER": {"yes_bid": 91, "yes_ask": 93, "no_bid": 7, "no_ask": 9}})
 """
 from __future__ import annotations
 
@@ -28,7 +27,8 @@ from pmscan.parity_registry import REGISTRY, build_links
 
 
 def _load_kalshi_quotes(path: str) -> dict[str, VenueQuote]:
-    raw = json.load(open(path, encoding="utf-8"))
+    with open(path, encoding="utf-8") as f:
+        raw = json.load(f)
     out: dict[str, VenueQuote] = {}
     for ticker, q in raw.items():
         if not isinstance(q, dict) or not any(k in q for k in ("yes_ask", "no_ask", "yes_bid", "no_bid")):
@@ -49,8 +49,10 @@ def _pm_quotes_for_registry(max_markets: int) -> list[VenueQuote]:
     matched = []
     for raw in GammaClient().iter_active_markets(max_markets=max_markets):
         m = parse_market(raw)
-        if m is None or m.neg_risk:
+        if m is None:
             continue
+        # Keep NegRisk binary children too: most cross-venue candidates (team-winner / champion
+        # markets) ARE NegRisk children, and pm_venue_quote reads their YES/NO books fine.
         q = m.question.lower()
         if any(n in q for n in needles):
             matched.append(m)

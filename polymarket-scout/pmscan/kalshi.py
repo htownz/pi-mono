@@ -19,7 +19,7 @@ from typing import Optional
 from .parity import VenueQuote
 
 KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
-UA = "pmscan/0.8 (read-only cross-venue parity)"
+UA = "pmscan (read-only cross-venue parity)"   # no version — avoids drift from __version__
 
 
 def _dollar_price(raw: dict, dollars_key: str, cents_key: str) -> Optional[float]:

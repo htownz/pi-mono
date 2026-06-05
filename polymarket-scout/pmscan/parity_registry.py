@@ -75,18 +75,21 @@ def build_links(
 ) -> tuple[list[ParityLink], list[str]]:
     """Pair each candidate with a live Polymarket quote (substring match on label) and a Kalshi
     quote (by ticker). Returns (links, unmatched_names). A candidate is skipped (and reported)
-    when either side is missing."""
+    when the Kalshi quote is missing, the substring matches no PM market, OR — to avoid silently
+    linking the wrong market — it matches MORE THAN ONE (ambiguous: tighten pm_match)."""
     links: list[ParityLink] = []
     unmatched: list[str] = []
     for c in candidates:
         needle = c.pm_match.lower()
-        pm = next((q for q in pm_quotes if needle in q.label.lower()), None)
+        matches = [q for q in pm_quotes if needle in q.label.lower()]
         kal = kalshi_quotes.get(c.kalshi_ticker)
-        if pm is None or kal is None:
-            unmatched.append(c.name)
+        if len(matches) != 1 or kal is None:
+            reason = ("ambiguous: matches %d PM markets" % len(matches)) if len(matches) > 1 else (
+                "no PM match" if not matches else "no Kalshi quote")
+            unmatched.append(f"{c.name} [{reason}]")
             continue
         links.append(ParityLink(
-            name=c.name, a=pm, b=kal,
+            name=c.name, a=matches[0], b=kal,
             settlement_verified=c.settlement_verified, note=c.note,
         ))
     return links, unmatched

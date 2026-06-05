@@ -29,7 +29,7 @@ stdlib only; no dependency on kalshi_scout (a thin adapter bridges the two).
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -101,18 +101,26 @@ class ParityOpportunity:
 # Adapters — populate the venue-agnostic quote from each venue's native shape
 # --------------------------------------------------------------------------- #
 def pm_venue_quote(market: Market, books: dict[str, OrderBook], *, label: str = "") -> VenueQuote | None:
-    """Build a VenueQuote from a Polymarket binary Market + its YES/NO order books."""
+    """Build a VenueQuote from a Polymarket binary Market + its YES/NO order books.
+
+    Resolves the YES token by label via Market.yes_token() (not a hard index-0 assumption), so
+    markets whose outcomes aren't ordered ['Yes','No'] don't get their NO book read as YES.
+    """
     if not market.is_binary or len(market.token_ids) != 2:
         return None
-    yes_book = books.get(market.token_ids[0])
-    no_book = books.get(market.token_ids[1])
+    yes_tok = market.yes_token()
+    no_tok = next((t for t in market.token_ids if t != yes_tok), None)
+    if yes_tok is None or no_tok is None:
+        return None
+    yes_book = books.get(yes_tok)
+    no_book = books.get(no_tok)
     if yes_book is None or no_book is None:
         return None
     ya, yb = yes_book.best_ask(), yes_book.best_bid()
     na, nb = no_book.best_ask(), no_book.best_bid()
     return VenueQuote(
         venue="polymarket",
-        market_key=market.token_ids[0],
+        market_key=yes_tok,
         label=label or market.question,
         yes_bid=yb.price if yb else None,
         yes_ask=ya.price if ya else None,

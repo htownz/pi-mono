@@ -22,7 +22,7 @@ from .parity import (
 )
 from .kalshi import KalshiQuotes, market_to_quote
 
-__version__ = "0.9.0"
+__version__ = "0.9.1"
 
 __all__ = [
     "BookLevel",

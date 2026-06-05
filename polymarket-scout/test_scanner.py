@@ -453,7 +453,30 @@ def test_parity_registry_build_links_pairs_and_skips():
     assert len(links) == 1 and links[0].name == "Fed no change"
     assert links[0].settlement_verified is True
     assert links[0].a.venue == "polymarket" and links[0].b.venue == "kalshi"
-    assert unmatched == ["Absent"]   # missing on both PM and Kalshi → reported, not silently dropped
+    assert unmatched == ["Absent [no PM match]"]   # reported with reason, not silently dropped
+
+
+def test_parity_build_links_ambiguous_match_is_unmatched():
+    # Substring "twins" hits TWO Polymarket markets → don't guess; report ambiguous.
+    cands = [ParityCandidate("Twins game", "twins", "KX")]
+    pm = [VenueQuote("polymarket", "a", "Royals vs. Twins", yes_ask=0.5, no_ask=0.5),
+          VenueQuote("polymarket", "b", "Twins vs. Yankees", yes_ask=0.5, no_ask=0.5)]
+    kal = {"KX": kalshi_venue_quote("KX", label="KX", yes_bid_c=40, yes_ask_c=42,
+                                    no_bid_c=58, no_ask_c=60)}
+    links, unmatched = build_links(cands, pm, kal)
+    assert links == []
+    assert len(unmatched) == 1 and "ambiguous" in unmatched[0]
+
+
+def test_pm_venue_quote_resolves_yes_by_label_not_index():
+    # outcomes reversed: index 0 is "No". yes_ask must come from the Yes token, not token_ids[0].
+    m = Market(venue="polymarket", market_id="c", question="Spurs win?", slug="s",
+               outcomes=["No", "Yes"], token_ids=["NO_TOK", "YES_TOK"])
+    books = {"YES_TOK": _book("YES_TOK", asks=[(0.64, 100)], bids=[(0.62, 50)]),
+             "NO_TOK": _book("NO_TOK", asks=[(0.38, 80)], bids=[(0.36, 40)])}
+    q = pm_venue_quote(m, books)
+    assert q is not None and q.market_key == "YES_TOK"
+    assert abs(q.yes_ask - 0.64) < 1e-9 and abs(q.no_ask - 0.38) < 1e-9
 
 
 def test_parity_registry_seed_is_wellformed():
