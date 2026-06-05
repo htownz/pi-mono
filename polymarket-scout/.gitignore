@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 *.jsonl
 .pytest_cache/
+# your real curated Kalshi quotes — keep local; the tracked file is kalshi_quotes.example.json
+kalshi_quotes.json

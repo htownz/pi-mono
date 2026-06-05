@@ -1,4 +1,4 @@
-# pmscan — Polymarket sum-to-one scanner (Phase 0 + 1 + 1b + 1c)
+# pmscan — Polymarket sum-to-one scanner (Phase 0 + 1 + 1b + 1c, + Phase 2 parity draft)
 
 Read-only Polymarket **scanner**: detection and logging only. It never authenticates, signs,
 holds a wallet, or places an order. It is the Polymarket half of a planned unified
@@ -38,7 +38,7 @@ python scan.py --once --max-markets 1500 --min-edge 1.0 --out opportunities.json
 python scan.py --negrisk --once                        # NegRisk, COMPLETE events via /events (default)
 python scan.py --negrisk --interval 30 --out neg.jsonl --snapshot snap.jsonl  # watch + baseline log
 python -m pmscan.temporal snap.jsonl --summary         # detect transient dips over the snapshot log
-python test_scanner.py                                 # synthetic self-tests (22, all passing)
+python test_scanner.py                                 # synthetic self-tests (39, all passing)
 ```
 
 No install needed — standard library only, Python 3.10+.
@@ -193,14 +193,61 @@ is in three places, in order of effort:
    the venue-agnostic `Market`/`OrderBook` shapes, the same mutually-exclusive event priced on
    both venues becomes a cross-venue arbitrage surface — Polymarket NegRisk basket vs. the
    matching Kalshi event bracket. That is the structural, non-latency edge this codebase is
-   being shaped toward.
+   being shaped toward, and the first scaffold for it now exists (below).
+
+## Phase 2 (DRAFT) — cross-venue parity (`pmscan/parity.py`)
+
+The same real-world binary outcome priced on two venues is a *locked* arb that doesn't depend
+on latency: buy YES on the cheaper venue and the complementary NO on the other for < $1
+combined, and exactly one pays $1 regardless of how the event resolves.
+
+```
+construction 1:  buy YES@A + NO@B   cost = yes_ask_A + no_ask_B
+construction 2:  buy YES@B + NO@A   cost = yes_ask_B + no_ask_A
+edge = $1 − min(cost);   scan_parity() takes the cheaper basket
+```
+
+This is the cross-venue analogue of the within-market merge edge — but with one critical,
+non-mechanical precondition: **the lock is real only if both venues settle the identical event
+identically** (same resolution source, date, bucket boundaries). That settlement-equivalence is
+the parity analogue of NegRisk exhaustiveness — unprovable from prices — so each `ParityLink`
+carries a manually-asserted `settlement_verified` flag, and an opportunity is never trusted
+without it (scan-and-flag, same ethos as everywhere else).
+
+**What the scaffold has:** the venue-agnostic `VenueQuote`, the lock math, `ParityOpportunity`,
+adapters (`pm_venue_quote` from Polymarket books, `kalshi_venue_quote` from Kalshi cents — no
+`kalshi_scout` import; a thin bridge is the integration seam), and synthetic self-tests.
+
+**What it deliberately does not have yet** (the genuinely hard part): an *automated* cross-venue
+**matching** layer — which Polymarket token corresponds to which Kalshi ticker. That is an
+entity-resolution problem of its own (fuzzy title/date/bucket alignment), left to a later phase.
+
+**Testing it against reality** (`pmscan/parity_registry.py` + `pmscan/kalshi.py` + `parity_run.py`):
+v1 matching is a **hand-curated registry** of `ParityCandidate`s — each declares a Polymarket
+market (by question substring) and a Kalshi ticker for the same outcome, plus a
+`settlement_verified` assertion. Both venues' quotes are now pulled **live**: Polymarket via
+Gamma/CLOB, Kalshi via `pmscan/kalshi.py` — a stdlib read-only client over the public
+`/trade-api/v2/markets` endpoints (no `kalshi_scout` import, no auth, no orders).
+
+```bash
+# 1. edit pmscan/parity_registry.py: point each candidate's pm_match + kalshi_ticker at the
+#    SAME outcome; set settlement_verified=True only after you confirm identical resolution.
+python parity_run.py --kalshi-live                       # auto-fetch both sides live
+python parity_run.py --kalshi-quotes kalshi_quotes.json  # or hand-enter Kalshi prices (cents)
+python parity_run.py --kalshi-live --kalshi-quotes k.json  # live + manual overrides
+```
+
+Verified locks print `[parity OK ]`; unverified ones `[parity ??!]` with the settlement caveat.
+The seed registry entries are **templates** (`settlement_verified=False`, placeholder tickers) —
+replace them with verified live identifiers first. **Detection-only, like everything else.**
 
 ## Project layout
 
 ```
 polymarket-scout/
   scan.py              # CLI entry (detection + logging only): binary + --negrisk paths
-  test_scanner.py      # synthetic self-tests (4 binary + 12 NegRisk + 6 temporal)
+  parity_run.py        # cross-venue parity runner: live Polymarket + live/manual Kalshi  (Phase 2)
+  test_scanner.py      # synthetic self-tests (4 binary + 12 NegRisk + 6 temporal + 17 parity/kalshi)
   requirements.txt     # (stdlib only)
   pmscan/
     __init__.py        # package exports
@@ -208,6 +255,9 @@ polymarket-scout/
     client.py          # Gamma + CLOB read-only clients, parse_market, parse_event (/events)
     scanner.py         # scan_market (1) + group_negrisk / scan_negrisk / negrisk_snapshot (1b)
     temporal.py        # rolling-baseline dip detector over the snapshot log          (Phase 1c)
+    parity.py          # cross-venue (Polymarket + Kalshi) lock detector — DRAFT       (Phase 2)
+    parity_registry.py # hand-curated ParityCandidate registry + matching             (Phase 2)
+    kalshi.py          # stdlib read-only Kalshi market-data bridge (live quotes)      (Phase 2)
 ```
 
 ## Boundaries (by design)

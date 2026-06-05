@@ -1,0 +1,5 @@
+{
+  "_comment": "Hand-entered Kalshi quotes for parity_run.py. Prices in CENTS. Keys are Kalshi tickers; they must match kalshi_ticker in pmscan/parity_registry.py. Sizes optional. Delete this _comment line (or keep — the runner ignores keys with no price fields).",
+  "KXFED-26JUN-REPLACE": {"yes_bid": 91, "yes_ask": 93, "no_bid": 7, "no_ask": 9},
+  "KXDEMNOM28-REPLACE": {"yes_bid": 18, "yes_ask": 20, "no_bid": 80, "no_ask": 82, "yes_ask_size": 500, "no_ask_size": 500}
+}
