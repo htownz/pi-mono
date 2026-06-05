@@ -23,17 +23,21 @@ parity_run.py.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
-from .parity import ParityLink, VenueQuote
+from .models import Market, OrderBook
+from .parity import ParityLink, pm_venue_quote
 
 
 @dataclass(frozen=True)
 class ParityCandidate:
     name: str                  # human description of the shared outcome
-    pm_match: str              # case-insensitive substring to find the Polymarket market
+    pm_match: str              # case-insensitive substring to find the PM market (question OR slug)
     kalshi_ticker: str         # Kalshi market ticker for the same YES outcome
     settlement_verified: bool = False
     note: str = ""
+    pm_outcome: Optional[str] = None   # for categorical PM markets (['Royals','Twins']): the
+                                       # outcome label that is the shared YES. None for Yes/No.
 
 
 # Seed templates — recurring markets that exist on both venues. Identifiers are PLACEHOLDERS
@@ -47,9 +51,9 @@ REGISTRY: list[ParityCandidate] = [
         name="MLB 2026-06-04: Royals @ Twins (Twins win)",
         pm_match="twins",   # PM MLB game market for KC@MIN tonight; refine to the exact question
         kalshi_ticker="KXMLBGAME-26JUN041940KCMIN",   # VERIFIED real Kalshi market (Jun 4, 19:40, KC@MIN)
-        note="VERIFY which team is the Kalshi YES side and point pm_match at the SAME team's "
-             "Polymarket market. Same game's winner => settlement equivalent; flip verified once "
-             "team↔YES alignment is confirmed.",
+        note="VERIFY which team is the Kalshi YES side. If the PM market is categorical "
+             "(outcomes like ['Royals','Twins']), set pm_outcome='Twins' to the SAME team as the "
+             "Kalshi YES. Same game's winner => settlement equivalent; flip verified once aligned.",
     ),
     ParityCandidate(
         name="2026 NBA Champion: San Antonio Spurs",
@@ -70,26 +74,37 @@ REGISTRY: list[ParityCandidate] = [
 
 def build_links(
     candidates: list[ParityCandidate],
-    pm_quotes: list[VenueQuote],
+    pm_markets: list[Market],
+    books: dict[str, OrderBook],
     kalshi_quotes: dict[str, VenueQuote],
 ) -> tuple[list[ParityLink], list[str]]:
-    """Pair each candidate with a live Polymarket quote (substring match on label) and a Kalshi
-    quote (by ticker). Returns (links, unmatched_names). A candidate is skipped (and reported)
-    when the Kalshi quote is missing, the substring matches no PM market, OR — to avoid silently
-    linking the wrong market — it matches MORE THAN ONE (ambiguous: tighten pm_match)."""
+    """Pair each candidate with a live Polymarket market and a Kalshi quote.
+
+    Matching is by `pm_match` substring against the PM **question OR slug**. A candidate is
+    skipped — and reported with a reason, never silently dropped — when:
+      - the Kalshi quote is missing,
+      - the substring matches no PM market, or MORE THAN ONE (ambiguous → tighten pm_match), or
+      - the PM quote can't be built (e.g. a categorical market with no `pm_outcome` selector).
+    Returns (links, unmatched_with_reasons).
+    """
     links: list[ParityLink] = []
     unmatched: list[str] = []
     for c in candidates:
         needle = c.pm_match.lower()
-        matches = [q for q in pm_quotes if needle in q.label.lower()]
+        matches = [m for m in pm_markets
+                   if needle in m.question.lower() or needle in (m.slug or "").lower()]
         kal = kalshi_quotes.get(c.kalshi_ticker)
         if len(matches) != 1 or kal is None:
-            reason = ("ambiguous: matches %d PM markets" % len(matches)) if len(matches) > 1 else (
-                "no PM match" if not matches else "no Kalshi quote")
+            reason = (f"ambiguous: matches {len(matches)} PM markets" if len(matches) > 1
+                      else ("no PM match" if not matches else "no Kalshi quote"))
             unmatched.append(f"{c.name} [{reason}]")
             continue
+        pm = pm_venue_quote(matches[0], books, label=matches[0].question, yes_outcome=c.pm_outcome)
+        if pm is None:
+            unmatched.append(f"{c.name} [PM quote unbuildable — categorical market? set pm_outcome]")
+            continue
         links.append(ParityLink(
-            name=c.name, a=matches[0], b=kal,
+            name=c.name, a=pm, b=kal,
             settlement_verified=c.settlement_verified, note=c.note,
         ))
     return links, unmatched

@@ -22,7 +22,8 @@ import sys
 
 from pmscan.client import ClobClient, GammaClient, parse_market
 from pmscan.kalshi import KalshiQuotes
-from pmscan.parity import VenueQuote, kalshi_venue_quote, pm_venue_quote, scan_parity_links
+from pmscan.models import Market, OrderBook
+from pmscan.parity import VenueQuote, kalshi_venue_quote, scan_parity_links
 from pmscan.parity_registry import REGISTRY, build_links
 
 
@@ -42,24 +43,22 @@ def _load_kalshi_quotes(path: str) -> dict[str, VenueQuote]:
     return out
 
 
-def _pm_quotes_for_registry(max_markets: int) -> list[VenueQuote]:
-    """Fetch Polymarket markets, keep only those a registry candidate points at, and build
-    their venue-agnostic quotes (one batched book fetch for just the matched markets)."""
+def _pm_markets_for_registry(max_markets: int) -> tuple[list[Market], dict[str, OrderBook]]:
+    """Fetch Polymarket markets, keep only those a registry candidate points at (matched on
+    question OR slug), and fetch their books in one batch. NegRisk binary children are kept —
+    most cross-venue candidates (team-winner / champion markets) are exactly those."""
     needles = [c.pm_match.lower() for c in REGISTRY]
-    matched = []
+    matched: list[Market] = []
     for raw in GammaClient().iter_active_markets(max_markets=max_markets):
         m = parse_market(raw)
         if m is None:
             continue
-        # Keep NegRisk binary children too: most cross-venue candidates (team-winner / champion
-        # markets) ARE NegRisk children, and pm_venue_quote reads their YES/NO books fine.
-        q = m.question.lower()
-        if any(n in q for n in needles):
+        hay = f"{m.question} {m.slug or ''}".lower()
+        if any(n in hay for n in needles):
             matched.append(m)
     token_ids = [t for m in matched for t in m.token_ids]
     books = ClobClient().get_books(token_ids) if token_ids else {}
-    quotes = [vq for m in matched if (vq := pm_venue_quote(m, books, label=m.question)) is not None]
-    return quotes
+    return matched, books
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -85,8 +84,8 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
     if args.kalshi_quotes:
         kalshi_quotes.update(_load_kalshi_quotes(args.kalshi_quotes))  # manual wins
-    pm_quotes = _pm_quotes_for_registry(args.max_markets)
-    links, unmatched = build_links(REGISTRY, pm_quotes, kalshi_quotes)
+    pm_markets, books = _pm_markets_for_registry(args.max_markets)
+    links, unmatched = build_links(REGISTRY, pm_markets, books, kalshi_quotes)
 
     print(f"-- parity: {len(links)} linked outcome(s), {len(unmatched)} unmatched "
           f"(of {len(REGISTRY)} registry candidates)", file=sys.stderr)

@@ -38,7 +38,7 @@ python scan.py --once --max-markets 1500 --min-edge 1.0 --out opportunities.json
 python scan.py --negrisk --once                        # NegRisk, COMPLETE events via /events (default)
 python scan.py --negrisk --interval 30 --out neg.jsonl --snapshot snap.jsonl  # watch + baseline log
 python -m pmscan.temporal snap.jsonl --summary         # detect transient dips over the snapshot log
-python test_scanner.py                                 # synthetic self-tests (36, all passing)
+python test_scanner.py                                 # synthetic self-tests (39, all passing)
 ```
 
 No install needed — standard library only, Python 3.10+.
@@ -247,7 +247,7 @@ replace them with verified live identifiers first. **Detection-only, like everyt
 polymarket-scout/
   scan.py              # CLI entry (detection + logging only): binary + --negrisk paths
   parity_run.py        # cross-venue parity runner: live Polymarket + live/manual Kalshi  (Phase 2)
-  test_scanner.py      # synthetic self-tests (4 binary + 12 NegRisk + 6 temporal + 14 parity/kalshi)
+  test_scanner.py      # synthetic self-tests (4 binary + 12 NegRisk + 6 temporal + 17 parity/kalshi)
   requirements.txt     # (stdlib only)
   pmscan/
     __init__.py        # package exports

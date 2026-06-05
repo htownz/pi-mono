@@ -100,18 +100,34 @@ class ParityOpportunity:
 # --------------------------------------------------------------------------- #
 # Adapters — populate the venue-agnostic quote from each venue's native shape
 # --------------------------------------------------------------------------- #
-def pm_venue_quote(market: Market, books: dict[str, OrderBook], *, label: str = "") -> VenueQuote | None:
+def pm_venue_quote(market: Market, books: dict[str, OrderBook], *, label: str = "",
+                   yes_outcome: str | None = None) -> VenueQuote | None:
     """Build a VenueQuote from a Polymarket binary Market + its YES/NO order books.
 
-    Resolves the YES token by label via Market.yes_token() (not a hard index-0 assumption), so
-    markets whose outcomes aren't ordered ['Yes','No'] don't get their NO book read as YES.
+    The shared-YES leg is resolved by *label*, never by a bare index:
+      - `yes_outcome` given → use the token for that exact outcome label (the other is NO);
+      - else a literal "Yes"/"True" outcome → use it;
+      - else (a categorical market whose outcomes are team/candidate names, e.g.
+        ['Royals','Twins']) → return None. We REFUSE rather than guess index 0, which could
+        build the quote for the opponent and emit a phantom cross-venue lock. Pass yes_outcome
+        (via ParityCandidate.pm_outcome) to name the side that matches the Kalshi YES.
     """
     if not market.is_binary or len(market.token_ids) != 2:
         return None
-    yes_tok = market.yes_token()
-    no_tok = next((t for t in market.token_ids if t != yes_tok), None)
-    if yes_tok is None or no_tok is None:
-        return None
+    labels = [str(o).strip().lower() for o in market.outcomes]
+    if yes_outcome is not None:
+        key = yes_outcome.strip().lower()
+        if key not in labels:
+            return None
+        yi = labels.index(key)
+    elif "yes" in labels:
+        yi = labels.index("yes")
+    elif "true" in labels:
+        yi = labels.index("true")
+    else:
+        return None  # categorical market, no selector → don't guess the YES side
+    yes_tok = market.token_ids[yi]
+    no_tok = market.token_ids[1 - yi]
     yes_book = books.get(yes_tok)
     no_book = books.get(no_tok)
     if yes_book is None or no_book is None:

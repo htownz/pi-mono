@@ -441,15 +441,27 @@ def test_parity_pm_adapter_from_books():
     assert abs(opps[0].edge_cents - 2.0) < 1e-6
 
 
+def _pm_market(question, outcomes, toks, slug=""):
+    return Market(venue="polymarket", market_id=question, question=question, slug=slug,
+                  outcomes=outcomes, token_ids=toks)
+
+
+def _yn_books(toks, yes_ask, no_ask):
+    y, n = toks
+    return {y: _book(y, asks=[(yes_ask, 100)], bids=[(yes_ask - 0.02, 50)]),
+            n: _book(n, asks=[(no_ask, 100)], bids=[(no_ask - 0.02, 50)])}
+
+
 def test_parity_registry_build_links_pairs_and_skips():
     cands = [
         ParityCandidate("Fed no change", "fed decision in june", "KXFED", settlement_verified=True),
         ParityCandidate("Absent", "no such pm market", "KXNONE"),
     ]
-    pm = [VenueQuote("polymarket", "tok", "Fed Decision in June?", yes_ask=0.91, no_ask=0.10)]
+    m = _pm_market("Fed Decision in June?", ["Yes", "No"], ["FY", "FN"], slug="fed-decision-june")
+    books = _yn_books(("FY", "FN"), 0.91, 0.10)
     kal = {"KXFED": kalshi_venue_quote("KXFED", label="KXFED",
                                        yes_bid_c=88, yes_ask_c=90, no_bid_c=10, no_ask_c=12)}
-    links, unmatched = build_links(cands, pm, kal)
+    links, unmatched = build_links(cands, [m], books, kal)
     assert len(links) == 1 and links[0].name == "Fed no change"
     assert links[0].settlement_verified is True
     assert links[0].a.venue == "polymarket" and links[0].b.venue == "kalshi"
@@ -459,24 +471,54 @@ def test_parity_registry_build_links_pairs_and_skips():
 def test_parity_build_links_ambiguous_match_is_unmatched():
     # Substring "twins" hits TWO Polymarket markets → don't guess; report ambiguous.
     cands = [ParityCandidate("Twins game", "twins", "KX")]
-    pm = [VenueQuote("polymarket", "a", "Royals vs. Twins", yes_ask=0.5, no_ask=0.5),
-          VenueQuote("polymarket", "b", "Twins vs. Yankees", yes_ask=0.5, no_ask=0.5)]
+    m1 = _pm_market("Royals vs. Twins", ["Yes", "No"], ["a", "an"])
+    m2 = _pm_market("Twins vs. Yankees", ["Yes", "No"], ["b", "bn"])
+    books = {**_yn_books(("a", "an"), 0.5, 0.5), **_yn_books(("b", "bn"), 0.5, 0.5)}
     kal = {"KX": kalshi_venue_quote("KX", label="KX", yes_bid_c=40, yes_ask_c=42,
                                     no_bid_c=58, no_ask_c=60)}
-    links, unmatched = build_links(cands, pm, kal)
+    links, unmatched = build_links(cands, [m1, m2], books, kal)
     assert links == []
     assert len(unmatched) == 1 and "ambiguous" in unmatched[0]
 
 
+def test_parity_build_links_matches_on_slug():
+    # pm_match is a slug fragment NOT present in the question — must still match via slug.
+    cands = [ParityCandidate("Spurs champ", "2026-nba-champion-spurs", "KXNBA-SAS")]
+    m = _pm_market("Will San Antonio take the title?", ["Yes", "No"], ["y", "n"],
+                   slug="2026-nba-champion-spurs")
+    books = _yn_books(("y", "n"), 0.64, 0.38)
+    kal = {"KXNBA-SAS": kalshi_venue_quote("KXNBA-SAS", label="x", yes_bid_c=60, yes_ask_c=63,
+                                           no_bid_c=37, no_ask_c=40)}
+    links, unmatched = build_links(cands, [m], books, kal)
+    assert len(links) == 1 and links[0].name == "Spurs champ", unmatched
+
+
 def test_pm_venue_quote_resolves_yes_by_label_not_index():
     # outcomes reversed: index 0 is "No". yes_ask must come from the Yes token, not token_ids[0].
-    m = Market(venue="polymarket", market_id="c", question="Spurs win?", slug="s",
-               outcomes=["No", "Yes"], token_ids=["NO_TOK", "YES_TOK"])
+    m = _pm_market("Spurs win?", ["No", "Yes"], ["NO_TOK", "YES_TOK"])
     books = {"YES_TOK": _book("YES_TOK", asks=[(0.64, 100)], bids=[(0.62, 50)]),
              "NO_TOK": _book("NO_TOK", asks=[(0.38, 80)], bids=[(0.36, 40)])}
     q = pm_venue_quote(m, books)
     assert q is not None and q.market_key == "YES_TOK"
     assert abs(q.yes_ask - 0.64) < 1e-9 and abs(q.no_ask - 0.38) < 1e-9
+
+
+def test_pm_venue_quote_refuses_categorical_without_selector():
+    # outcomes are team names, no Yes/No, no selector → refuse rather than guess the YES side.
+    m = _pm_market("Royals vs. Twins", ["Royals", "Twins"], ["R", "T"])
+    books = {"R": _book("R", asks=[(0.55, 10)], bids=[(0.53, 10)]),
+             "T": _book("T", asks=[(0.47, 10)], bids=[(0.45, 10)])}
+    assert pm_venue_quote(m, books) is None
+
+
+def test_pm_venue_quote_categorical_with_outcome_selector():
+    # pm_outcome="Twins" → build the quote for the Twins token (the other is NO).
+    m = _pm_market("Royals vs. Twins", ["Royals", "Twins"], ["R", "T"])
+    books = {"R": _book("R", asks=[(0.55, 10)], bids=[(0.53, 10)]),
+             "T": _book("T", asks=[(0.47, 10)], bids=[(0.45, 10)])}
+    q = pm_venue_quote(m, books, yes_outcome="Twins")
+    assert q is not None and q.market_key == "T"
+    assert abs(q.yes_ask - 0.47) < 1e-9 and abs(q.no_ask - 0.55) < 1e-9
 
 
 def test_parity_registry_seed_is_wellformed():
