@@ -142,6 +142,16 @@ def parse_market(market: KalshiMarket) -> Optional[Contract]:
     )
 
 
+def parse_event_date(event_ticker: str) -> Optional[date]:
+    """Extract the market date from an event ticker, e.g. KXHIGHNYC-26JUN16 -> 2026-06-16.
+
+    Lets callers filter events by date cheaply, before any network fetch.
+    """
+    if not event_ticker or "-" not in event_ticker:
+        return None
+    return _parse_date_token(event_ticker.split("-", 1)[1].upper())
+
+
 def _parse_date_token(tok: str) -> Optional[date]:
     """`26MAY28` -> date(2026, 5, 28)."""
     m = _DATE_TOKEN_RE.match(tok)

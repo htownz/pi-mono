@@ -24,7 +24,7 @@ from weather_trader.kalshi import KalshiClient, iter_temperature_events
 from weather_trader.models import Evaluation, KalshiEvent, Metric, Station
 from weather_trader.nws import NWS_BASE_URL, NwsClient
 from weather_trader.openmeteo import OPENMETEO_ENSEMBLE_URL, OpenMeteoClient
-from weather_trader.parser import parse_market
+from weather_trader.parser import parse_event_date, parse_market
 from weather_trader.stations import all_cities, get_station
 from weather_trader.store import ForecastLog, backfill_residuals
 from weather_trader.kalshi import DEFAULT_BASE_URL as KALSHI_BASE_URL
@@ -289,6 +289,10 @@ def forecast(event_ticker: Optional[str], city: Optional[str], metric: Optional[
 
 @main.command()
 @click.option("--city", help="Filter to one city slug (e.g. HOUSTON, NYC).")
+@click.option("--date", "date_str", default=None,
+              help="Only this market date (YYYY-MM-DD). Use to focus on genuine "
+                   "forecast plays and skip near-settled same-day markets.")
+@click.option("--min-volume", type=int, default=0, help="Skip contracts with volume below this.")
 @click.option("--limit", type=int, default=None, help="Stop after N events.")
 @click.option("--min-grade", default="C", help=f"Skip results worse than this grade {GRADE_ORDER}.")
 @click.option("--no-ensemble", is_flag=True, help="Skip Open-Meteo; NWS + synthetic spread only.")
@@ -299,13 +303,14 @@ def forecast(event_ticker: Optional[str], city: Optional[str], metric: Optional[
 @click.option("--notify", "notify_specs", multiple=True,
               help="Alert sink: 'stdout' or 'jsonl:/path.jsonl'. May repeat.")
 @click.option("--notify-min-grade", default="B", help="Fire alerts at this grade or better.")
-def scan(city: Optional[str], limit: Optional[int], min_grade: str, no_ensemble: bool,
-         calibration_path: Optional[str], as_json: bool, log_path: Optional[str],
-         notify_specs: tuple[str, ...], notify_min_grade: str) -> None:
+def scan(city: Optional[str], date_str: Optional[str], min_volume: int, limit: Optional[int],
+         min_grade: str, no_ensemble: bool, calibration_path: Optional[str], as_json: bool,
+         log_path: Optional[str], notify_specs: tuple[str, ...], notify_min_grade: str) -> None:
     """Crawl all open Kalshi temperature markets, forecast + grade every contract."""
     if min_grade not in GRADE_ORDER:
         raise click.BadParameter(f"min-grade must be one of {GRADE_ORDER}")
     cutoff = GRADE_ORDER.index(min_grade)
+    only_date = _parse_date(date_str) if date_str else None
     calibration = Calibration.load_json(calibration_path) if calibration_path else None
     if calibration is not None:
         applied = sum(1 for e in calibration.iter_entries() if e.applied)
@@ -332,14 +337,19 @@ def scan(city: Optional[str], limit: Optional[int], min_grade: str, no_ensemble:
             for event in iter_temperature_events(kc):
                 if city and city.upper() not in event.event_ticker.upper():
                     continue
+                if only_date is not None and parse_event_date(event.event_ticker) != only_date:
+                    continue
                 evals, dist = _evaluate_event(nws, om, event, now_utc=now_utc, calibration=calibration)
                 if not evals:
                     continue
                 all_evals.extend(evals)
                 if flog is not None and dist is not None:
-                    for e in evals:
+                    for e in evals:  # log every forecast (volume doesn't affect forecast quality)
                         flog.append_evaluation(e, dist, now_utc=now_utc)
-                keep = [e for e in evals if GRADE_ORDER.index(e.grade) <= cutoff]
+                keep = [
+                    e for e in evals
+                    if GRADE_ORDER.index(e.grade) <= cutoff and e.market.volume >= min_volume
+                ]
                 if keep:
                     shown.append(keep)
                     count += 1
@@ -349,7 +359,8 @@ def scan(city: Optional[str], limit: Optional[int], min_grade: str, no_ensemble:
             if om is not None:
                 om.close()
 
-    fired = dispatcher.dispatch(all_evals, now_utc=now_utc) if dispatcher else []
+    alert_pool = [e for e in all_evals if e.market.volume >= min_volume]
+    fired = dispatcher.dispatch(alert_pool, now_utc=now_utc) if dispatcher else []
 
     if as_json:
         out = [{
