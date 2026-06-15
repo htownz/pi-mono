@@ -43,15 +43,26 @@ observed the distribution collapses to a single point (`locked`) and the fair
 probability is 0 or 1 — the same settlement-conclusive signal `kalshi-scout`
 grades A+, but now it's just the degenerate case of the forecast.
 
-### Hybrid: blend now, model later
+### Hybrid: blend now, learned correction on top
 
-The forecaster ships in **blend mode** today — it needs no training data and
-runs the moment the APIs are reachable. But every forecast is logged
-(`store.py`) with the inputs that produced it, and `backfill` joins those logs
-to realized observations to produce `(forecast, actual)` residual rows. That
-residual history is exactly the training set for a **learned correction
-model** that drops in later behind the same `bias_f` / scenario interface —
-no rewiring of the pricing or grading layers.
+The forecaster ships in **blend mode** (`bias_f = 0`) — it needs no training
+data and runs the moment the APIs are reachable. The **learned half** is the
+`calibrate` command (`calibration.py`): every forecast is logged (`store.py`),
+`backfill` joins those logs to realized observations to produce
+`(forecast, actual)` residual rows, and `calibrate` turns that history into a
+per-(station, metric) **bias model**:
+
+```
+bias_f = clamp( mean(actual − predicted) )      # applied only when n ≥ min_samples
+```
+
+Adding `bias_f` to the forecast is, to first order, the additive correction
+that minimizes the corrected prediction's squared error. The same residuals
+also yield a per-station spread (`sigma_f`) used to widen/narrow the synthetic
+fallback. Pass the resulting config to `scan`/`forecast` with `--calibration`
+and it flows through the *same* scenario interface — no rewiring of the
+pricing or grading layers. The unit of correction is (station, metric);
+lead-time / regime splits are a future refinement.
 
 ## Pipeline
 
@@ -126,6 +137,23 @@ weather-trader scan --log forecasts.jsonl --notify stdout --notify-min-grade B
 
 # After a day settles, join logged forecasts to realized highs/lows
 weather-trader backfill --log forecasts.jsonl --date 2026-06-15 --out residuals.jsonl
+
+# Learn per-station bias corrections from accumulated residuals
+weather-trader calibrate --residuals residuals.jsonl --out calibration.json
+
+# Apply the learned bias to future forecasts/scans
+weather-trader scan --calibration calibration.json --min-grade B
+weather-trader forecast KXHIGHNYC-26JUN16 --calibration calibration.json
+```
+
+### The calibration loop
+
+```
+scan --log ──► forecasts.jsonl
+                    │  (after each day settles)
+backfill --out ──► residuals.jsonl
+                    │
+calibrate --out ──► calibration.json ──► scan/forecast --calibration
 ```
 
 ## Grade ladder

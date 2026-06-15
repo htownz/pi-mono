@@ -280,6 +280,7 @@ def forecast_for_station(
     *,
     now_utc: Optional[datetime] = None,
     bias_f: float = 0.0,
+    forecast_sigma_f: Optional[float] = None,
 ) -> ForecastDistribution:
     """Network orchestration: fetch inputs for a station/metric/date, then build.
 
@@ -314,4 +315,5 @@ def forecast_for_station(
         metric=metric, market_date=market_date, station=station,
         observations=observations, nws_hourly=nws_hourly, ensemble=ensemble,
         bias_f=bias_f, now_utc=now_utc,
+        forecast_sigma_f=forecast_sigma_f if forecast_sigma_f is not None else DEFAULT_FORECAST_SIGMA_F,
     )
