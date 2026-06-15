@@ -131,6 +131,23 @@ def load_residuals(path: str) -> list[dict]:
     return out
 
 
+def _dedupe(residual_rows: list[dict]) -> list[dict]:
+    """Drop duplicate forecast/actual pairs by (station, metric, market_date,
+    ts_forecast). Rows missing any key part are kept as-is (never deduped)."""
+    seen: set[tuple] = set()
+    out: list[dict] = []
+    for r in residual_rows:
+        key = (r.get("station"), r.get("metric"), r.get("market_date"), r.get("ts_forecast"))
+        if None in key:
+            out.append(r)
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    return out
+
+
 def derive_calibration(
     residual_rows: list[dict],
     min_samples: int = DEFAULT_MIN_SAMPLES,
@@ -141,7 +158,12 @@ def derive_calibration(
     bias_f = clamp(mean(residual_f)), applied only when n >= min_samples.
     residual_f is `actual - predicted_q50`, so adding bias_f to the forecast
     pushes the prediction toward the realized value.
+
+    Residuals are deduped by (station, metric, market_date, ts_forecast) so a
+    daily `cycle` that re-backfills overlapping date windows can't inflate the
+    sample. Rows missing any of those keys (e.g. hand-built) are never deduped.
     """
+    residual_rows = _dedupe(residual_rows)
     groups: dict[tuple[str, str], list[float]] = {}
     for r in residual_rows:
         st, me, res = r.get("station"), r.get("metric"), r.get("residual_f")

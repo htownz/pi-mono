@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import sys
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 import click
@@ -77,6 +77,36 @@ def _evaluate_event(
     evals = [evaluate(contract, market, dist) for contract, market in parsed]
     evals.sort(key=sort_key)
     return evals, dist
+
+
+def _iter_event_evaluations(kc, nws, om, *, calibration, now_utc, city=None, only_date=None):
+    """Crawl open temperature events and yield (event, evals, dist) for each.
+
+    Shared by `scan` and `cycle`. Applies the city/date pre-filters before the
+    (network-heavy) forecast build, and skips events with no parseable contracts.
+    """
+    for event in iter_temperature_events(kc):
+        if city and city.upper() not in event.event_ticker.upper():
+            continue
+        if only_date is not None and parse_event_date(event.event_ticker) != only_date:
+            continue
+        evals, dist = _evaluate_event(nws, om, event, now_utc=now_utc, calibration=calibration)
+        if not evals:
+            continue
+        yield event, evals, dist
+
+
+def _build_sinks(notify_specs: tuple[str, ...]):
+    """Parse --notify specs ('stdout' / 'jsonl:PATH') into alert sinks."""
+    sinks = []
+    for spec in notify_specs:
+        if spec == "stdout":
+            sinks.append(StdoutSink())
+        elif spec.startswith("jsonl:"):
+            sinks.append(JsonlSink(spec[len("jsonl:"):]))
+        else:
+            raise click.BadParameter(f"--notify spec {spec!r}; use 'stdout' or 'jsonl:PATH'")
+    return sinks
 
 
 def _eval_to_dict(e: Evaluation) -> dict:
@@ -316,14 +346,7 @@ def scan(city: Optional[str], date_str: Optional[str], min_volume: int, limit: O
         applied = sum(1 for e in calibration.iter_entries() if e.applied)
         console.print(f"[dim]loaded calibration ({applied} station/metric corrections applied)[/dim]")
 
-    sinks = []
-    for spec in notify_specs:
-        if spec == "stdout":
-            sinks.append(StdoutSink())
-        elif spec.startswith("jsonl:"):
-            sinks.append(JsonlSink(spec[len("jsonl:"):]))
-        else:
-            raise click.BadParameter(f"--notify spec {spec!r}; use 'stdout' or 'jsonl:PATH'")
+    sinks = _build_sinks(notify_specs)
     dispatcher = AlertDispatcher(sinks, min_grade=notify_min_grade) if sinks else None
     flog = ForecastLog(log_path) if log_path else None
 
@@ -334,14 +357,9 @@ def scan(city: Optional[str], date_str: Optional[str], min_volume: int, limit: O
     with KalshiClient() as kc, NwsClient() as nws:
         om = None if no_ensemble else OpenMeteoClient()
         try:
-            for event in iter_temperature_events(kc):
-                if city and city.upper() not in event.event_ticker.upper():
-                    continue
-                if only_date is not None and parse_event_date(event.event_ticker) != only_date:
-                    continue
-                evals, dist = _evaluate_event(nws, om, event, now_utc=now_utc, calibration=calibration)
-                if not evals:
-                    continue
+            for event, evals, dist in _iter_event_evaluations(
+                kc, nws, om, calibration=calibration, now_utc=now_utc, city=city, only_date=only_date,
+            ):
                 all_evals.extend(evals)
                 if flog is not None and dist is not None:
                     for e in evals:  # log every forecast (volume doesn't affect forecast quality)
@@ -451,6 +469,94 @@ def calibrate(residuals_path: str, out_path: Optional[str], min_samples: int,
     console.print(table)
     if out_path:
         console.print(f"[dim]wrote calibration to {out_path}[/dim]")
+
+
+@main.command()
+@click.option("--dir", "data_dir", default="wx-data", type=click.Path(),
+              help="Working folder for forecasts.jsonl / residuals.jsonl / calibration.json.")
+@click.option("--backfill-days", type=int, default=3,
+              help="Settle forecasts up to N days back each run (covers reporting lag).")
+@click.option("--min-grade", default="B", help="Grade threshold for the run's pick summary.")
+@click.option("--min-volume", type=int, default=0, help="Volume floor for the pick summary + alerts.")
+@click.option("--no-ensemble", is_flag=True, help="Skip Open-Meteo; NWS + synthetic spread only.")
+@click.option("--notify", "notify_specs", multiple=True,
+              help="Alert sink: 'stdout' or 'jsonl:/path.jsonl'. May repeat.")
+@click.option("--notify-min-grade", default="B", help="Fire alerts at this grade or better.")
+def cycle(data_dir: str, backfill_days: int, min_grade: str, min_volume: int,
+          no_ensemble: bool, notify_specs: tuple[str, ...], notify_min_grade: str) -> None:
+    """Run one full daily loop, then schedule this once a day.
+
+    \b
+    1. settle recently-elapsed market dates  (backfill -> residuals.jsonl)
+    2. rebuild the bias model from all history (calibrate -> calibration.json)
+    3. scan everything open with the fresh calibration, logging every forecast
+       (-> forecasts.jsonl) so tomorrow's run can settle today's.
+
+    Self-bootstrapping (the first run just logs) and idempotent (re-runs don't
+    double-count residuals), so it's safe to schedule blindly.
+    """
+    if min_grade not in GRADE_ORDER:
+        raise click.BadParameter(f"min-grade must be one of {GRADE_ORDER}")
+    cutoff = GRADE_ORDER.index(min_grade)
+
+    d = Path(data_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    forecasts_path = str(d / "forecasts.jsonl")
+    residuals_path = str(d / "residuals.jsonl")
+    calibration_path = str(d / "calibration.json")
+
+    now_utc = datetime.now(timezone.utc)
+    today = now_utc.date()
+
+    # 1. Settle recently-elapsed market dates into residuals.
+    settled = 0
+    with NwsClient() as nws:
+        for delta in range(1, backfill_days + 1):
+            target = today - timedelta(days=delta)
+            settled += len(backfill_residuals(forecasts_path, target, nws, out_path=residuals_path))
+    console.print(f"[dim]settled {settled} forecast/actual pair(s) over the last {backfill_days} day(s)[/dim]")
+
+    # 2. Rebuild the bias model from all accumulated residuals.
+    calibration = derive_calibration(load_residuals(residuals_path))
+    calibration.save_json(calibration_path)
+    applied = sum(1 for e in calibration.iter_entries() if e.applied)
+    console.print(
+        f"[dim]calibration: {calibration.based_on_residuals} residual(s) -> "
+        f"{applied} correction(s) applied[/dim]"
+    )
+
+    # 3. Scan everything open with the fresh calibration, logging every forecast.
+    flog = ForecastLog(forecasts_path)
+    sinks = _build_sinks(notify_specs)
+    dispatcher = AlertDispatcher(sinks, min_grade=notify_min_grade) if sinks else None
+    all_evals: list[Evaluation] = []
+    n_logged = 0
+    with KalshiClient() as kc, NwsClient() as nws:
+        om = None if no_ensemble else OpenMeteoClient()
+        try:
+            for _event, evals, dist in _iter_event_evaluations(
+                kc, nws, om, calibration=calibration, now_utc=now_utc,
+            ):
+                all_evals.extend(evals)
+                if dist is not None:
+                    for e in evals:
+                        flog.append_evaluation(e, dist, now_utc=now_utc)
+                        n_logged += 1
+        finally:
+            if om is not None:
+                om.close()
+
+    alert_pool = [e for e in all_evals if e.market.volume >= min_volume]
+    fired = dispatcher.dispatch(alert_pool, now_utc=now_utc) if dispatcher else []
+    picks = sorted(
+        (e for e in all_evals if GRADE_ORDER.index(e.grade) <= cutoff and e.market.volume >= min_volume),
+        key=sort_key,
+    )
+    console.print(f"[green]logged {n_logged} forecast(s)[/green]; {len(picks)} pick(s) ≥ {min_grade}")
+    if fired:
+        console.print(f"[bold green]fired {len(fired)} alert(s)[/bold green]")
+    if picks:
+        _print_evals_table(picks[:20], f"cycle picks (≥{min_grade}, vol≥{min_volume})")
 
 
 def _parse_date(s: str) -> date:

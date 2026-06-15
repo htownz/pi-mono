@@ -158,6 +158,38 @@ backfill --out ──► residuals.jsonl
 calibrate --out ──► calibration.json ──► scan/forecast --calibration
 ```
 
+### Automate it: `cycle`
+
+`cycle` runs that whole loop in one command against a working folder — settle
+the last few days, rebuild the bias model, then scan + log today with the
+fresh calibration:
+
+```bash
+weather-trader cycle --dir ./wx-data --min-grade B --min-volume 500
+```
+
+It's **self-bootstrapping** (the first run just logs — nothing to settle yet)
+and **idempotent** (re-runs can't double-count residuals), so it's safe to
+schedule blindly once a day. Files land in `--dir`: `forecasts.jsonl`,
+`residuals.jsonl`, `calibration.json`.
+
+**Schedule it once a day:**
+
+```bash
+# Linux/macOS cron — 6:05am daily
+5 6 * * *  cd /path/to/weather-trader && .venv/bin/weather-trader cycle --dir ./wx-data
+```
+
+```powershell
+# Windows Task Scheduler — daily at 06:05, running inside the venv
+schtasks /Create /TN weather-trader-cycle /SC DAILY /ST 06:05 /TR ^
+  "C:\path\to\pi-mono\weather-trader\.venv\Scripts\weather-trader.exe cycle --dir C:\path\to\wx-data"
+```
+
+Give it a few days, then `calibrate --residuals wx-data/residuals.jsonl` (or
+just read `wx-data/calibration.json`) shows the per-station bias the model has
+learned, and you can judge realized skill before trusting any edge.
+
 ## Grade ladder
 
 Forecast-driven, so grades reflect **edge × forecast confidence × fillability**:
