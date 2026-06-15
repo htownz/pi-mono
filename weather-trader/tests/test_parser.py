@@ -1,7 +1,7 @@
 from datetime import date
 
 from weather_trader.models import BracketKind, KalshiMarket, Metric
-from weather_trader.parser import bracket_from_title, parse_market
+from weather_trader.parser import bracket_from_title, parse_event_date, parse_market
 
 
 def _mkt(ticker: str, event: str, sub: str) -> KalshiMarket:
@@ -47,6 +47,13 @@ def test_parse_market_low_and_threshold_suffix_uses_title():
     c = parse_market(m)
     assert c is not None and c.metric is Metric.LOW
     assert c.bracket.kind is BracketKind.LTE and c.bracket.hi == 68
+
+
+def test_parse_event_date():
+    assert parse_event_date("KXHIGHNYC-26JUN16") == date(2026, 6, 16)
+    assert parse_event_date("KXLOWTHOU-26JUN15") == date(2026, 6, 15)
+    assert parse_event_date("nodash") is None
+    assert parse_event_date("KXHIGHNYC-FOO") is None
 
 
 def test_parse_market_unknown_series_is_none():

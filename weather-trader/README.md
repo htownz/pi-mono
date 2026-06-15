@@ -130,6 +130,8 @@ weather-trader forecast KXHIGHNYC-26JUN16 --json
 weather-trader scan                      # grade C+ by default
 weather-trader scan --city HOUSTON
 weather-trader scan --min-grade B
+weather-trader scan --date 2026-06-16    # one market date — skip near-settled same-day markets
+weather-trader scan --min-volume 500     # ignore thin contracts
 weather-trader scan --json
 
 # Alert on strong edges and log every forecast for the model-later loop
@@ -169,6 +171,18 @@ Forecast-driven, so grades reflect **edge × forecast confidence × fillability*
 | C     | Edge 5–12c                                                              |
 | D     | Edge < 5c, or spread/liquidity makes it unfillable                      |
 | F     | No usable forecast or no price — never trade                            |
+
+### Humility guard
+
+A huge edge (≥ 40c) against a live quote is almost always the *model* being
+wrong — typically a near-settled same-day market whose high/low has already
+happened and that the forecast hasn't collapsed onto. Liquid markets don't
+leave 40c+ on the table. So such edges are **capped out of tradable grades**
+and flagged (`⚠ implausible edge … not backed by observed data`) — *unless*
+the observed extremum already forces the outcome (a real, path-locked edge,
+e.g. the high is already ≥ 80° for an "80°+" contract), which passes through
+untouched. To focus on genuine forecast plays, scan a future date
+(`--date`) and skip thin books (`--min-volume`).
 
 ## Execution safety
 

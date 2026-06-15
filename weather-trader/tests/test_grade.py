@@ -1,7 +1,7 @@
 from datetime import date
 
 from weather_trader.forecast import ForecastDistribution, Scenario
-from weather_trader.grade import _grade, evaluate, sort_key
+from weather_trader.grade import SUSPECT_EDGE, _grade, _observed_settles, evaluate, sort_key
 from weather_trader.models import Bracket, BracketKind, Contract, KalshiMarket, Metric, Station
 
 STATION = Station("KTST", "Test", "TEST", "UTC", 0.0, 0.0)
@@ -71,6 +71,53 @@ def test_evaluate_no_price_is_F():
     e = evaluate(_contract(bracket), _market(yes_ask=None, no_ask=None), _locked_dist(85.0))
     assert e.best_edge is None
     assert e.grade == "F"
+
+
+def _dist(scenarios_f, observed=None, locked=False, n_members=20):
+    from weather_trader.forecast import Scenario as _S
+    return ForecastDistribution(
+        Metric.HIGH, date(2026, 6, 16), STATION,
+        [_S(v, "ensemble", 1.0) for v in scenarios_f], observed, locked, 0.0, n_members, [],
+    )
+
+
+def test_humility_guard_caps_forecast_driven_phantom_edge():
+    # Model is sure it's NOT 80°+ (all scenarios at 70), but the market is sure
+    # it IS (No at 5c). Huge edge with no observed support -> capped, flagged.
+    bracket = Bracket(BracketKind.GTE, lo=80, hi=None)
+    dist = _dist([70.0] * 20, observed=None)
+    e = evaluate(_contract(bracket), _market(yes_ask=95, yes_bid=93, no_ask=5), dist)
+    assert e.best_edge is not None and e.best_edge >= SUSPECT_EDGE
+    assert e.grade == "D"
+    assert any("implausible edge" in n for n in e.notes)
+
+
+def test_humility_guard_spares_observation_locked_edge():
+    # Same size edge, but the observed high (85) already settles "80°+" YES.
+    # That's real path-locked alpha -> must NOT be capped.
+    bracket = Bracket(BracketKind.GTE, lo=80, hi=None)
+    dist = _dist([85.0] * 20, observed=85.0)
+    e = evaluate(_contract(bracket), _market(yes_ask=55, yes_bid=53, no_ask=45), dist)
+    assert e.best_edge is not None and e.best_edge >= SUSPECT_EDGE
+    assert e.grade != "D"
+    assert not any("implausible edge" in n for n in e.notes)
+
+
+def test_observed_settles_rules():
+    def c(kind, lo, hi, metric=Metric.HIGH):
+        return Contract("T", "T", "TEST", metric, date(2026, 6, 16), Bracket(kind, lo, hi))
+    # HIGH: running max
+    assert _observed_settles(c(BracketKind.GTE, 80, None), 85) is True   # already >= -> YES
+    assert _observed_settles(c(BracketKind.GTE, 80, None), 79) is False
+    assert _observed_settles(c(BracketKind.LTE, None, 80), 82) is True   # exceeded -> NO
+    assert _observed_settles(c(BracketKind.BETWEEN, 79, 80), 82) is True  # above bracket -> NO
+    assert _observed_settles(c(BracketKind.BETWEEN, 79, 80), 79.5) is False
+    # LOW: running min
+    assert _observed_settles(c(BracketKind.LTE, None, 60, Metric.LOW), 58) is True   # already <= -> YES
+    assert _observed_settles(c(BracketKind.GTE, 60, None, Metric.LOW), 58) is True   # below -> NO
+    assert _observed_settles(c(BracketKind.GTE, 60, None, Metric.LOW), 62) is False
+    # No observation -> never settled
+    assert _observed_settles(c(BracketKind.GTE, 80, None), None) is False
 
 
 def test_sort_key_orders_best_first():
