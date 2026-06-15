@@ -17,6 +17,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from weather_trader.alerts import AlertDispatcher, JsonlSink, StdoutSink
+from weather_trader.calibration import Calibration, derive_calibration, load_residuals
 from weather_trader.forecast import ForecastDistribution, forecast_for_station
 from weather_trader.grade import GRADE_ORDER, evaluate, sort_key
 from weather_trader.kalshi import KalshiClient, iter_temperature_events
@@ -41,7 +42,7 @@ def _evaluate_event(
     om: Optional[OpenMeteoClient],
     event: KalshiEvent,
     now_utc: Optional[datetime] = None,
-    bias_f: float = 0.0,
+    calibration: Optional[Calibration] = None,
 ) -> tuple[list[Evaluation], Optional[ForecastDistribution]]:
     """Evaluate every parseable contract in an event against one shared forecast.
 
@@ -66,9 +67,12 @@ def _evaluate_event(
             evals.append(e)
         return evals, None
 
+    metric = first_contract.metric
+    bias_f = calibration.bias_for(station.icao, metric.value) if calibration else 0.0
+    sigma_f = calibration.sigma_for(station.icao, metric.value) if calibration else None
     dist = forecast_for_station(
-        nws, om, station, first_contract.metric, first_contract.market_date,
-        now_utc=now_utc, bias_f=bias_f,
+        nws, om, station, metric, first_contract.market_date,
+        now_utc=now_utc, bias_f=bias_f, forecast_sigma_f=sigma_f,
     )
     evals = [evaluate(contract, market, dist) for contract, market in parsed]
     evals.sort(key=sort_key)
@@ -214,9 +218,12 @@ def doctor() -> None:
 @click.option("--metric", type=click.Choice(["high", "low"]), help="With --city.")
 @click.option("--date", "date_str", help="YYYY-MM-DD, with --city/--metric.")
 @click.option("--no-ensemble", is_flag=True, help="Skip Open-Meteo; NWS + synthetic spread only.")
+@click.option("--calibration", "calibration_path", type=click.Path(exists=True), default=None,
+              help="Apply a learned bias model (from `calibrate --out`).")
 @click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of tables.")
 def forecast(event_ticker: Optional[str], city: Optional[str], metric: Optional[str],
-             date_str: Optional[str], no_ensemble: bool, as_json: bool) -> None:
+             date_str: Optional[str], no_ensemble: bool, calibration_path: Optional[str],
+             as_json: bool) -> None:
     """Build and print the forecast distribution for an event (or a city/metric/date).
 
     \b
@@ -224,6 +231,7 @@ def forecast(event_ticker: Optional[str], city: Optional[str], metric: Optional[
     weather-trader forecast --city NYC --metric high --date 2026-06-16
     """
     now_utc = datetime.now(timezone.utc)
+    calibration = Calibration.load_json(calibration_path) if calibration_path else None
 
     # Market-less mode: forecast a station directly.
     if event_ticker is None:
@@ -233,10 +241,13 @@ def forecast(event_ticker: Optional[str], city: Optional[str], metric: Optional[
         if station is None:
             raise click.BadParameter(f"unknown city slug {city!r} (see `weather-trader cities`)")
         md = _parse_date(date_str)
+        bias_f = calibration.bias_for(station.icao, metric) if calibration else 0.0
+        sigma_f = calibration.sigma_for(station.icao, metric) if calibration else None
         with NwsClient() as nws:
             om = None if no_ensemble else OpenMeteoClient()
             try:
-                dist = forecast_for_station(nws, om, station, Metric(metric), md, now_utc=now_utc)
+                dist = forecast_for_station(nws, om, station, Metric(metric), md, now_utc=now_utc,
+                                            bias_f=bias_f, forecast_sigma_f=sigma_f)
             finally:
                 if om is not None:
                     om.close()
@@ -254,7 +265,7 @@ def forecast(event_ticker: Optional[str], city: Optional[str], metric: Optional[
                 event_ticker=event_ticker, series_ticker="", title="", sub_title="",
                 markets=list(kc.iter_markets(event_ticker=event_ticker)),
             )
-            evals, dist = _evaluate_event(nws, om, event, now_utc=now_utc)
+            evals, dist = _evaluate_event(nws, om, event, now_utc=now_utc, calibration=calibration)
         finally:
             if om is not None:
                 om.close()
@@ -281,18 +292,24 @@ def forecast(event_ticker: Optional[str], city: Optional[str], metric: Optional[
 @click.option("--limit", type=int, default=None, help="Stop after N events.")
 @click.option("--min-grade", default="C", help=f"Skip results worse than this grade {GRADE_ORDER}.")
 @click.option("--no-ensemble", is_flag=True, help="Skip Open-Meteo; NWS + synthetic spread only.")
+@click.option("--calibration", "calibration_path", type=click.Path(exists=True), default=None,
+              help="Apply a learned bias model (from `calibrate --out`).")
 @click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of tables.")
 @click.option("--log", "log_path", default=None, help="Append every graded forecast to a JSONL log.")
 @click.option("--notify", "notify_specs", multiple=True,
               help="Alert sink: 'stdout' or 'jsonl:/path.jsonl'. May repeat.")
 @click.option("--notify-min-grade", default="B", help="Fire alerts at this grade or better.")
 def scan(city: Optional[str], limit: Optional[int], min_grade: str, no_ensemble: bool,
-         as_json: bool, log_path: Optional[str], notify_specs: tuple[str, ...],
-         notify_min_grade: str) -> None:
+         calibration_path: Optional[str], as_json: bool, log_path: Optional[str],
+         notify_specs: tuple[str, ...], notify_min_grade: str) -> None:
     """Crawl all open Kalshi temperature markets, forecast + grade every contract."""
     if min_grade not in GRADE_ORDER:
         raise click.BadParameter(f"min-grade must be one of {GRADE_ORDER}")
     cutoff = GRADE_ORDER.index(min_grade)
+    calibration = Calibration.load_json(calibration_path) if calibration_path else None
+    if calibration is not None:
+        applied = sum(1 for e in calibration.iter_entries() if e.applied)
+        console.print(f"[dim]loaded calibration ({applied} station/metric corrections applied)[/dim]")
 
     sinks = []
     for spec in notify_specs:
@@ -315,7 +332,7 @@ def scan(city: Optional[str], limit: Optional[int], min_grade: str, no_ensemble:
             for event in iter_temperature_events(kc):
                 if city and city.upper() not in event.event_ticker.upper():
                     continue
-                evals, dist = _evaluate_event(nws, om, event, now_utc=now_utc)
+                evals, dist = _evaluate_event(nws, om, event, now_utc=now_utc, calibration=calibration)
                 if not evals:
                     continue
                 all_evals.extend(evals)
@@ -380,6 +397,49 @@ def backfill(log_path: str, date_str: str, out_path: Optional[str], as_json: boo
     console.print(table)
     if out_path:
         console.print(f"[dim]appended {len(residuals)} residual rows to {out_path}[/dim]")
+
+
+@main.command()
+@click.option("--residuals", "residuals_path", required=True, type=click.Path(exists=True),
+              help="Residuals JSONL to learn from (from `backfill --out`).")
+@click.option("--out", "out_path", default=None, help="Write the calibration JSON here.")
+@click.option("--min-samples", type=int, default=5, help="Min residuals per station/metric to apply a bias.")
+@click.option("--clamp", "clamp_f", type=float, default=8.0, help="Max |bias_f| in °F.")
+@click.option("--json", "as_json", is_flag=True, help="Emit the calibration as JSON.")
+def calibrate(residuals_path: str, out_path: Optional[str], min_samples: int,
+              clamp_f: float, as_json: bool) -> None:
+    """Derive per-station bias corrections from accumulated forecast residuals.
+
+    The closed loop: `scan --log` records forecasts, `backfill --out` joins them
+    to realized highs/lows, and `calibrate` turns that history into a bias model
+    that `scan --calibration` / `forecast --calibration` apply going forward.
+    """
+    rows = load_residuals(residuals_path)
+    calibration = derive_calibration(rows, min_samples=min_samples, clamp_f=clamp_f)
+    if out_path:
+        calibration.save_json(out_path)
+
+    if as_json:
+        click.echo(json.dumps(calibration.to_dict(), indent=2, default=str))
+        return
+
+    if not list(calibration.iter_entries()):
+        console.print("[yellow]no residuals to calibrate from[/yellow]")
+        return
+    table = Table(title=f"calibration ({calibration.based_on_residuals} residuals, "
+                        f"min_samples={min_samples}, clamp=±{clamp_f:g}°F)", header_style="bold cyan")
+    for col in ("station", "metric", "n", "mean res °F", "bias_f °F", "sigma °F", "note"):
+        table.add_column(col, justify="right" if "°F" in col or col == "n" else "left")
+    for e in sorted(calibration.iter_entries(), key=lambda x: (x.station, x.metric)):
+        color = "green" if e.applied else "dim"
+        table.add_row(
+            e.station, e.metric, str(e.n), f"{e.mean_residual_f:+g}",
+            f"[{color}]{e.bias_f:+g}[/{color}]",
+            _g(e.sigma_f), e.note,
+        )
+    console.print(table)
+    if out_path:
+        console.print(f"[dim]wrote calibration to {out_path}[/dim]")
 
 
 def _parse_date(s: str) -> date:
