@@ -55,6 +55,19 @@ def test_sigma_from_residual_spread():
     assert sigma is not None and sigma > 1.0          # but real spread
 
 
+def test_residuals_deduped_by_full_key():
+    # Re-running backfill over overlapping windows produces duplicate rows; the
+    # same (station, metric, market_date, ts_forecast) must count once.
+    base = {"station": "KNYC", "metric": "high", "market_date": "2026-06-16", "residual_f": 2.0}
+    rows = [
+        {**base, "ts_forecast": "t1"},
+        {**base, "ts_forecast": "t1"},   # exact duplicate -> dropped
+        {**base, "ts_forecast": "t2"},   # distinct forecast -> kept
+    ]
+    cal = derive_calibration(rows, min_samples=1)
+    assert cal._entry("KNYC", "high").n == 2
+
+
 def test_save_load_roundtrip(tmp_path):
     rows = [_res("KNYC", "high", 2.0) for _ in range(5)]
     cal = derive_calibration(rows, min_samples=5)
